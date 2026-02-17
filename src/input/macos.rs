@@ -7,7 +7,7 @@ use objc2_core_foundation::CGPoint;
 #[cfg(target_os = "macos")]
 use objc2_core_graphics::{
     CGDirectDisplayID, CGDisplayPixelsHigh, CGDisplayPixelsWide,
-    CGEvent, CGEventSourceStateID, CGEventTapLocation, CGEventType,
+    CGEvent, CGEventFlags, CGEventSourceStateID, CGEventTapLocation, CGEventType,
     CGMouseButton, CGEventSource, CGScrollEventUnit,
 };
 
@@ -87,11 +87,31 @@ impl InputCapture for MacOSCapturer {
     }
 }
 
+// Evdev keycodes for modifier keys
+#[cfg(target_os = "macos")]
+const EVDEV_KEY_LEFTCTRL: u32 = 29;
+#[cfg(target_os = "macos")]
+const EVDEV_KEY_LEFTSHIFT: u32 = 42;
+#[cfg(target_os = "macos")]
+const EVDEV_KEY_RIGHTSHIFT: u32 = 54;
+#[cfg(target_os = "macos")]
+const EVDEV_KEY_LEFTALT: u32 = 56;
+#[cfg(target_os = "macos")]
+const EVDEV_KEY_RIGHTCTRL: u32 = 97;
+#[cfg(target_os = "macos")]
+const EVDEV_KEY_RIGHTALT: u32 = 100;
+#[cfg(target_os = "macos")]
+const EVDEV_KEY_LEFTMETA: u32 = 125;
+#[cfg(target_os = "macos")]
+const EVDEV_KEY_RIGHTMETA: u32 = 126;
+
 /// macOS input injector using CoreGraphics.
 #[cfg(target_os = "macos")]
 pub struct MacOSInjector {
     screen_width: u32,
     screen_height: u32,
+    /// Tracked modifier flags for synthesized key events
+    modifier_flags: CGEventFlags,
 }
 
 #[cfg(target_os = "macos")]
@@ -104,7 +124,24 @@ impl MacOSInjector {
         Ok(Self {
             screen_width,
             screen_height,
+            modifier_flags: CGEventFlags::empty(),
         })
+    }
+
+    /// Update tracked modifier flags based on an evdev keycode press/release.
+    fn update_modifier_flags(&mut self, keycode: u32, pressed: bool) {
+        let flag = match keycode {
+            EVDEV_KEY_LEFTSHIFT | EVDEV_KEY_RIGHTSHIFT => CGEventFlags::MaskShift,
+            EVDEV_KEY_LEFTCTRL | EVDEV_KEY_RIGHTCTRL => CGEventFlags::MaskControl,
+            EVDEV_KEY_LEFTALT | EVDEV_KEY_RIGHTALT => CGEventFlags::MaskAlternate,
+            EVDEV_KEY_LEFTMETA | EVDEV_KEY_RIGHTMETA => CGEventFlags::MaskCommand,
+            _ => return,
+        };
+        if pressed {
+            self.modifier_flags |= flag;
+        } else {
+            self.modifier_flags -= flag;
+        }
     }
 
     fn post_mouse_event(
@@ -155,14 +192,17 @@ impl InputInjector for MacOSInjector {
                 self.post_mouse_event(event_type, cx as f64, cy as f64, cg_button)?;
             }
             Message::MouseScroll { dx, dy } => {
+                // Negate: scroll values arrive in traditional convention (positive=up)
+                // but CGEvent synthetic events bypass macOS natural scrolling, so we
+                // invert to match the default natural-scrolling direction.
                 let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
                 let event = CGEvent::new_scroll_wheel_event2(
                     Some(&source),
                     CGScrollEventUnit::Pixel,
                     1, // wheel_count
-                    *dy,
-                    *dx,
+                    -*dy,
+                    -*dx,
                     0,
                 )
                 .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create scroll event"))?;
@@ -171,6 +211,10 @@ impl InputInjector for MacOSInjector {
             Message::KeyEvent {
                 keycode, pressed, ..
             } => {
+                // Update modifier state BEFORE creating the event so that
+                // modifier key-down events carry their own flag.
+                self.update_modifier_flags(*keycode, *pressed);
+
                 let mac_keycode = match keymap::evdev_to_macos(*keycode) {
                     Some(k) => k,
                     None => {
@@ -182,6 +226,7 @@ impl InputInjector for MacOSInjector {
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
                 let event = CGEvent::new_keyboard_event(Some(&source), mac_keycode, *pressed)
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create key event"))?;
+                CGEvent::set_flags(Some(&event), self.modifier_flags);
                 CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
             }
             _ => {}

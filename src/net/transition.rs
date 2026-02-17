@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::cursor::edge;
 use crate::net::protocol::{Direction, Message, ScreenLayout};
@@ -10,12 +10,33 @@ const SERVER_EDGE_COOLDOWN: u32 = 125;
 const INSET: i32 = 20;
 const CLIENT_EDGE_DWELL: u32 = 8;
 
+/// Polls before first repeat fires (~500ms at 2ms poll interval)
+const KEY_REPEAT_DELAY: u32 = 250;
+/// Polls between subsequent repeats (~30ms ≈ 33 repeats/sec)
+const KEY_REPEAT_INTERVAL: u32 = 15;
+
 // Evdev keycodes for the safety escape combo (Ctrl+Alt+Escape)
 const KEY_ESC: u32 = 1;
 const KEY_LEFTCTRL: u32 = 29;
 const KEY_LEFTALT: u32 = 56;
 const KEY_RIGHTCTRL: u32 = 97;
 const KEY_RIGHTALT: u32 = 100;
+
+/// Modifier keys that should NOT generate repeat events.
+fn is_modifier(keycode: u32) -> bool {
+    matches!(
+        keycode,
+        29 |   // KEY_LEFTCTRL
+        42 |   // KEY_LEFTSHIFT
+        54 |   // KEY_RIGHTSHIFT
+        56 |   // KEY_LEFTALT
+        58 |   // KEY_CAPSLOCK
+        97 |   // KEY_RIGHTCTRL
+        100 |  // KEY_RIGHTALT
+        125 |  // KEY_LEFTMETA
+        126    // KEY_RIGHTMETA
+    )
+}
 
 // --- Server Transition ---
 
@@ -38,6 +59,8 @@ pub struct ServerTransition {
     edge_cooldown: u32,
     edge_dwell: u32,
     pressed_keys: HashSet<u32>,
+    /// Polls each non-modifier key has been held, for generating repeats.
+    key_hold_polls: HashMap<u32, u32>,
 }
 
 impl ServerTransition {
@@ -52,6 +75,7 @@ impl ServerTransition {
             edge_cooldown: 0,
             edge_dwell: 0,
             pressed_keys: HashSet::new(),
+            key_hold_polls: HashMap::new(),
         }
     }
 
@@ -95,6 +119,7 @@ impl ServerTransition {
         if self.active && self.is_escape_combo() {
             self.active = false;
             self.pressed_keys.clear();
+            self.key_hold_polls.clear();
             return ServerOutput::ForceRelease;
         }
 
@@ -170,9 +195,33 @@ impl ServerTransition {
                 self.last_buttons = buttons;
             }
 
-            // Keyboard events
+            // Keyboard events: forward originals and update hold counters
+            for key_msg in &key_events {
+                if let Message::KeyEvent { keycode, pressed, .. } = key_msg {
+                    if *pressed {
+                        self.key_hold_polls.entry(*keycode).or_insert(0);
+                    } else {
+                        self.key_hold_polls.remove(keycode);
+                    }
+                }
+            }
             for key_msg in key_events {
                 messages.push(key_msg);
+            }
+
+            // Generate repeat events for non-modifier keys held past the delay
+            for (&keycode, polls) in &mut self.key_hold_polls {
+                *polls += 1;
+                if !is_modifier(keycode)
+                    && *polls > KEY_REPEAT_DELAY
+                    && (*polls - KEY_REPEAT_DELAY) % KEY_REPEAT_INTERVAL == 0
+                {
+                    messages.push(Message::KeyEvent {
+                        keycode,
+                        pressed: true,
+                        modifiers: 0,
+                    });
+                }
             }
 
             ServerOutput::Forward { messages }
@@ -182,10 +231,12 @@ impl ServerTransition {
     pub fn on_switch_back(&mut self) {
         self.active = false;
         self.edge_cooldown = SERVER_EDGE_COOLDOWN;
+        self.key_hold_polls.clear();
     }
 
     pub fn deactivate(&mut self) {
         self.active = false;
+        self.key_hold_polls.clear();
     }
 }
 
@@ -803,5 +854,82 @@ mod tests {
             modifiers: 0,
         });
         assert!(matches!(out, ClientOutput::Forward(Message::KeyEvent { keycode: 42, pressed: true, modifiers: 0 })));
+    }
+
+    // ===== Key Repeat Tests =====
+
+    #[test]
+    fn server_key_repeat_after_delay() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        activate_server(&mut st);
+
+        // Press a non-modifier key (KEY_A = 30)
+        let key = vec![Message::KeyEvent { keycode: 30, pressed: true, modifiers: 0 }];
+        st.poll(1919, 500, 1920, 1080, 0, key);
+
+        // Hold until we see a repeat event (should happen within delay + interval polls)
+        let mut found_repeat = false;
+        for _ in 0..(KEY_REPEAT_DELAY + KEY_REPEAT_INTERVAL + 10) {
+            let out = st.poll(1919, 500, 1920, 1080, 0, vec![]);
+            if let ServerOutput::Forward { messages } = out {
+                if messages.iter().any(|m| matches!(m, Message::KeyEvent { keycode: 30, pressed: true, .. })) {
+                    found_repeat = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_repeat, "expected repeat event after delay + interval");
+    }
+
+    #[test]
+    fn server_modifier_keys_do_not_repeat() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        activate_server(&mut st);
+
+        // Press Shift (modifier, keycode 42)
+        let key = vec![Message::KeyEvent { keycode: 42, pressed: true, modifiers: 0 }];
+        st.poll(1919, 500, 1920, 1080, 0, key);
+
+        // Hold past the delay
+        for _ in 0..KEY_REPEAT_DELAY + KEY_REPEAT_INTERVAL + 10 {
+            let out = st.poll(1919, 500, 1920, 1080, 0, vec![]);
+            if let ServerOutput::Forward { messages } = out {
+                // Should never have a repeat for keycode 42
+                let repeats: Vec<_> = messages.iter().filter(|m| {
+                    matches!(m, Message::KeyEvent { keycode: 42, pressed: true, .. })
+                }).collect();
+                assert!(repeats.is_empty(), "modifier keys should not repeat");
+            }
+        }
+    }
+
+    #[test]
+    fn server_key_release_stops_repeat() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        activate_server(&mut st);
+
+        // Press KEY_A
+        let key = vec![Message::KeyEvent { keycode: 30, pressed: true, modifiers: 0 }];
+        st.poll(1919, 500, 1920, 1080, 0, key);
+
+        // Hold past the delay
+        for _ in 1..KEY_REPEAT_DELAY + 5 {
+            st.poll(1919, 500, 1920, 1080, 0, vec![]);
+        }
+
+        // Release the key
+        let key = vec![Message::KeyEvent { keycode: 30, pressed: false, modifiers: 0 }];
+        st.poll(1919, 500, 1920, 1080, 0, key);
+
+        // Further polls should NOT produce repeats for keycode 30
+        for _ in 0..KEY_REPEAT_INTERVAL * 3 {
+            let out = st.poll(1919, 500, 1920, 1080, 0, vec![]);
+            if let ServerOutput::Forward { messages } = out {
+                let repeats: Vec<_> = messages.iter().filter(|m| {
+                    matches!(m, Message::KeyEvent { keycode: 30, pressed: true, .. })
+                }).collect();
+                assert!(repeats.is_empty(), "released key should not repeat");
+            }
+        }
     }
 }
