@@ -80,6 +80,37 @@ pub fn trust_fingerprint(fp: &str) -> Result<()> {
     Ok(())
 }
 
+/// Check if a fingerprint is trusted.
+fn is_trusted(fp: &str) -> bool {
+    if let Ok(config) = NexdeskConfig::load() {
+        config.trusted_fingerprints.contains(&fp.to_uppercase())
+    } else {
+        false
+    }
+}
+
+/// Prompt the user to trust a fingerprint via stdin/stdout.
+fn prompt_trust(fp: &str) -> bool {
+    eprintln!("\n  Peer certificate fingerprint:");
+    eprintln!("  {}", fp);
+    eprintln!();
+    eprint!("  Trust this peer? [y/N] ");
+
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_ok() {
+        let answer = input.trim().to_lowercase();
+        if answer == "y" || answer == "yes" {
+            // Save to config
+            if let Ok(mut config) = NexdeskConfig::load() {
+                config.trusted_fingerprints.push(fp.to_uppercase());
+                config.save().ok();
+            }
+            return true;
+        }
+    }
+    false
+}
+
 /// Build a quinn server config with our self-signed cert.
 pub fn server_config() -> Result<quinn::ServerConfig> {
     let (cert_der, key_der) = load_or_generate_certs()?;
@@ -95,12 +126,11 @@ pub fn server_config() -> Result<quinn::ServerConfig> {
     Ok(server_config)
 }
 
-/// Build a quinn client config that accepts any certificate (for Phase 2).
-/// Phase 5 will add TOFU verification here.
+/// Build a quinn client config with TOFU certificate verification.
 pub fn client_config() -> Result<quinn::ClientConfig> {
     let client_crypto = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_custom_certificate_verifier(Arc::new(TofuVerifier))
         .with_no_client_auth();
 
     let client_config = quinn::ClientConfig::new(Arc::new(
@@ -109,21 +139,34 @@ pub fn client_config() -> Result<quinn::ClientConfig> {
     Ok(client_config)
 }
 
-/// A certificate verifier that accepts any certificate (insecure, for development).
-/// Phase 5 replaces this with TOFU verification.
+/// Trust-on-First-Use certificate verifier.
+/// On first connection to a peer, prompts the user to confirm the fingerprint.
+/// On subsequent connections, verifies against stored fingerprints.
 #[derive(Debug)]
-struct SkipServerVerification;
+struct TofuVerifier;
 
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
+        let fp = fingerprint(end_entity);
+
+        if is_trusted(&fp) {
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+
+        // First time seeing this peer — prompt user
+        if prompt_trust(&fp) {
+            info!("Peer trusted: {}", fp);
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("Peer fingerprint not trusted".to_string()))
+        }
     }
 
     fn verify_tls12_signature(
