@@ -40,10 +40,10 @@ pub enum Command {
         edge: Edge,
     },
 
-    /// Connect to a server as a client
+    /// Connect to a server as a client (discovers via mDNS if no address given)
     Connect {
-        /// Server address (IP:port)
-        addr: String,
+        /// Server address (IP:port). If omitted, discovers via mDNS.
+        addr: Option<String>,
     },
 
     /// Show this machine's certificate fingerprint

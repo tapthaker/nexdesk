@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
             net::quic::serve(port, Some(dir)).await?;
         }
         Command::Connect { addr } => {
-            net::quic::connect(&addr).await?;
+            net::quic::connect(addr.as_deref()).await?;
         }
         Command::Fingerprint => {
             net::tls::show_fingerprint()?;

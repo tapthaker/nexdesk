@@ -32,8 +32,13 @@ pub enum Message {
         version: u32,
         hostname: String,
         screen: ScreenLayout,
+        fingerprint: String,
     },
-    HelloAck { accepted: bool },
+    HelloAck {
+        accepted: bool,
+        otp: Option<String>,
+    },
+    PairingResult { success: bool },
 
     // Phase 3: Mouse
     MouseMove { x: i32, y: i32 },
@@ -58,7 +63,7 @@ pub enum Message {
 }
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Encode a message to bytes.
 pub fn encode(msg: &Message) -> color_eyre::eyre::Result<Vec<u8>> {

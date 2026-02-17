@@ -4,12 +4,14 @@ use std::time::{Duration, Instant};
 
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use quinn::{Endpoint, RecvStream, SendStream};
+use rand::Rng;
 use tokio::sync::Mutex;
 use tokio::time;
 use tracing::{info, debug, warn, error};
 
 use crate::net::protocol::{self, Message, PROTOCOL_VERSION, ScreenLayout};
 use crate::net::tls;
+use crate::net::discovery;
 use crate::net::transition::{ServerTransition, ServerOutput, ClientTransition, ClientOutput};
 
 const DEFAULT_PORT: u16 = 4242;
@@ -24,7 +26,15 @@ pub async fn serve(port: u16, trigger_edge: Option<crate::net::protocol::Directi
     info!("QUIC server listening on {}", addr);
 
     let (cert, _) = tls::load_or_generate_certs()?;
-    info!("Fingerprint: {}", tls::fingerprint(&cert));
+    let server_fingerprint = tls::fingerprint(&cert);
+    info!("Fingerprint: {}", server_fingerprint);
+
+    // Start mDNS advertisement (held for server lifetime)
+    let _mdns_handle = discovery::start_advertising(port)?;
+
+    // Generate a 6-digit OTP for pairing
+    let otp = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000u32));
+    println!("\n  Pairing code: {}\n", otp);
 
     while let Some(incoming) = endpoint.accept().await {
         let connection = incoming.await?;
@@ -32,8 +42,10 @@ pub async fn serve(port: u16, trigger_edge: Option<crate::net::protocol::Directi
         info!("New connection from {}", remote);
 
         let edge = trigger_edge;
+        let otp = otp.clone();
+        let fp = server_fingerprint.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_server_connection(connection, edge).await {
+            if let Err(e) = handle_server_connection(connection, edge, &otp, &fp).await {
                 error!("Connection from {} error: {}", remote, e);
             }
         });
@@ -42,7 +54,12 @@ pub async fn serve(port: u16, trigger_edge: Option<crate::net::protocol::Directi
     Ok(())
 }
 
-async fn handle_server_connection(connection: quinn::Connection, trigger_edge: Option<crate::net::protocol::Direction>) -> Result<()> {
+async fn handle_server_connection(
+    connection: quinn::Connection,
+    trigger_edge: Option<crate::net::protocol::Direction>,
+    server_otp: &str,
+    server_fingerprint: &str,
+) -> Result<()> {
     let remote = connection.remote_address();
 
     // Create input capturer
@@ -61,16 +78,37 @@ async fn handle_server_connection(connection: quinn::Connection, trigger_edge: O
             width: screen_w,
             height: screen_h,
         },
+        fingerprint: server_fingerprint.to_string(),
     };
     send_message(&mut control_send, &hello).await?;
 
+    // Receive HelloAck with optional OTP
     let peer_screen = match recv_message(&mut control_recv).await? {
-        Some(Message::HelloAck { accepted: true }) => {
-            info!("Peer {} accepted connection", remote);
-            // For now use a default; the client sends its screen info separately
+        Some(Message::HelloAck { accepted: true, otp }) => {
+            // Validate OTP if provided
+            match otp {
+                Some(code) => {
+                    if code == server_otp {
+                        info!("Peer {} paired successfully via OTP", remote);
+                        let result = Message::PairingResult { success: true };
+                        send_message(&mut control_send, &result).await?;
+                    } else {
+                        warn!("Peer {} provided invalid OTP", remote);
+                        let result = Message::PairingResult { success: false };
+                        send_message(&mut control_send, &result).await?;
+                        return Err(eyre!("Invalid pairing code from {}", remote));
+                    }
+                }
+                None => {
+                    // Client already trusts us (fingerprint stored from previous pairing)
+                    info!("Peer {} reconnected (already paired)", remote);
+                    let result = Message::PairingResult { success: true };
+                    send_message(&mut control_send, &result).await?;
+                }
+            }
             ScreenLayout { width: 1920, height: 1080 }
         }
-        Some(Message::HelloAck { accepted: false }) => {
+        Some(Message::HelloAck { accepted: false, .. }) => {
             return Err(eyre!("Peer rejected connection"));
         }
         other => {
@@ -221,8 +259,52 @@ async fn handle_server_connection(connection: quinn::Connection, trigger_edge: O
 }
 
 /// Connect to a QUIC server as a client (receives and injects input).
-pub async fn connect(addr: &str) -> Result<()> {
-    let addr = resolve_addr(addr)?;
+/// If `addr` is None, discovers the server via mDNS.
+/// Automatically reconnects with exponential backoff on disconnection.
+pub async fn connect(addr: Option<&str>) -> Result<()> {
+    let resolved_addr = match addr {
+        Some(a) => Some(resolve_addr(a)?),
+        None => None,
+    };
+
+    let mut backoff = Duration::from_secs(1);
+    let max_backoff = Duration::from_secs(30);
+
+    loop {
+        let target_addr = match resolved_addr {
+            Some(a) => a,
+            None => {
+                match discovery::discover_one(Duration::from_secs(10)).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!("Discovery failed: {}. Retrying in {:?}...", e, backoff);
+                        time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(max_backoff);
+                        continue;
+                    }
+                }
+            }
+        };
+
+        match connect_once(target_addr).await {
+            Ok(()) => {
+                info!("Connection closed cleanly");
+                backoff = Duration::from_secs(1);
+            }
+            Err(e) => {
+                warn!("Connection error: {}", e);
+            }
+        }
+
+        info!("Reconnecting in {:?}...", backoff);
+        time::sleep(backoff).await;
+        backoff = (backoff * 2).min(max_backoff);
+    }
+}
+
+/// Perform a single client connection to the server, handling handshake with
+/// OTP pairing and then running the input/clipboard loop until disconnection.
+async fn connect_once(addr: SocketAddr) -> Result<()> {
     let endpoint = make_client_endpoint()?;
     let connection = connect_with_retry(&endpoint, addr).await?;
 
@@ -232,13 +314,49 @@ pub async fn connect(addr: &str) -> Result<()> {
     let (mut control_send, mut control_recv) = connection.accept_bi().await?;
 
     let _server_screen = match recv_message(&mut control_recv).await? {
-        Some(Message::Hello { version, hostname, screen }) => {
+        Some(Message::Hello { version, hostname, screen, fingerprint }) => {
             info!(
                 "Server: {} (v{}, screen: {}x{})",
                 hostname, version, screen.width, screen.height
             );
-            let ack = Message::HelloAck { accepted: true };
+
+            // Check if we already trust this server's fingerprint
+            let otp = if tls::is_fingerprint_trusted(&fingerprint) {
+                info!("Server fingerprint already trusted");
+                None
+            } else {
+                // Prompt user for pairing code
+                let code = tokio::task::spawn_blocking(|| {
+                    eprint!("Enter pairing code: ");
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).ok();
+                    input.trim().to_string()
+                })
+                .await
+                .wrap_err("Failed to read pairing code")?;
+                Some(code)
+            };
+
+            let ack = Message::HelloAck { accepted: true, otp: otp.clone() };
             send_message(&mut control_send, &ack).await?;
+
+            // Wait for PairingResult
+            match recv_message(&mut control_recv).await? {
+                Some(Message::PairingResult { success: true }) => {
+                    if otp.is_some() {
+                        // First time pairing succeeded — store fingerprint
+                        tls::trust_fingerprint(&fingerprint)?;
+                        info!("Paired successfully. Fingerprint stored.");
+                    }
+                }
+                Some(Message::PairingResult { success: false }) => {
+                    return Err(eyre!("Pairing failed: invalid code"));
+                }
+                other => {
+                    return Err(eyre!("Expected PairingResult, got: {:?}", other));
+                }
+            }
+
             screen
         }
         other => {
@@ -390,13 +508,45 @@ pub async fn ping(addr: &str) -> Result<()> {
 
     let hello = recv_message(&mut recv).await?;
     match hello {
-        Some(Message::Hello { version, hostname, screen }) => {
+        Some(Message::Hello { version, hostname, screen, fingerprint }) => {
             info!(
                 "Server: {} (v{}, screen: {}x{})",
                 hostname, version, screen.width, screen.height
             );
-            let ack = Message::HelloAck { accepted: true };
+
+            // Check if we already trust this server
+            let otp = if tls::is_fingerprint_trusted(&fingerprint) {
+                None
+            } else {
+                let code = tokio::task::spawn_blocking(|| {
+                    eprint!("Enter pairing code: ");
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).ok();
+                    input.trim().to_string()
+                })
+                .await
+                .wrap_err("Failed to read pairing code")?;
+                Some(code)
+            };
+
+            let ack = Message::HelloAck { accepted: true, otp: otp.clone() };
             send_message(&mut send, &ack).await?;
+
+            // Wait for PairingResult
+            match recv_message(&mut recv).await? {
+                Some(Message::PairingResult { success: true }) => {
+                    if otp.is_some() {
+                        tls::trust_fingerprint(&fingerprint)?;
+                        info!("Paired successfully. Fingerprint stored.");
+                    }
+                }
+                Some(Message::PairingResult { success: false }) => {
+                    return Err(eyre!("Pairing failed: invalid code"));
+                }
+                other => {
+                    return Err(eyre!("Expected PairingResult, got: {:?}", other));
+                }
+            }
         }
         other => {
             return Err(eyre!("Expected Hello, got: {:?}", other));
