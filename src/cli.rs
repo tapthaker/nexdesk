@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "nexdesk", version, about = "Cross-platform KVM sharing tool")]
@@ -34,6 +34,10 @@ pub enum Command {
         /// Port to listen on
         #[arg(short, long, default_value_t = 4242)]
         port: u16,
+
+        /// Screen edge where the remote machine is located
+        #[arg(short, long, default_value = "right")]
+        edge: Edge,
     },
 
     /// Connect to a server as a client
@@ -56,4 +60,12 @@ pub enum Command {
 
     /// Test input capture (prints mouse position for 10 seconds)
     TestInput,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum Edge {
+    Left,
+    Right,
+    Up,
+    Down,
 }

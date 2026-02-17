@@ -98,6 +98,20 @@ impl MacOSInjector {
         let screen_width = CGDisplayPixelsWide(MAIN_DISPLAY) as u32;
         let screen_height = CGDisplayPixelsHigh(MAIN_DISPLAY) as u32;
         debug!("macOS injector: screen {}x{}", screen_width, screen_height);
+
+        // Check accessibility permissions (required for CGEvent posting)
+        let trusted = unsafe {
+            extern "C" {
+                fn AXIsProcessTrusted() -> bool;
+            }
+            AXIsProcessTrusted()
+        };
+        if trusted {
+            tracing::info!("Accessibility: granted");
+        } else {
+            tracing::warn!("Accessibility: NOT granted — mouse/keyboard injection will not work! Grant access in System Settings > Privacy & Security > Accessibility");
+        }
+
         Ok(Self {
             screen_width,
             screen_height,
@@ -135,6 +149,7 @@ impl InputInjector for MacOSInjector {
     fn inject(&mut self, event: &Message) -> Result<()> {
         match event {
             Message::MouseMove { x, y } => {
+                debug!("Injecting mouse move to ({}, {})", x, y);
                 self.move_mouse(*x, *y)?;
             }
             Message::MouseButton { button, pressed } => {

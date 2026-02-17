@@ -16,6 +16,12 @@ pub trait InputCapture: Send {
 
     /// Poll for keyboard state changes. Returns key events since last call.
     fn poll_key_events(&mut self) -> Result<Vec<Message>>;
+
+    /// Grab or ungrab input devices. When grabbed, the local desktop
+    /// does not receive the events (exclusive access for remote sharing).
+    fn set_grab(&mut self, _grab: bool) -> Result<()> {
+        Ok(()) // default no-op for platforms that don't need it
+    }
 }
 
 /// Create a platform-appropriate input capturer.

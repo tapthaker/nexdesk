@@ -11,22 +11,26 @@ use crate::input::capture::InputCapture;
 use crate::input::inject::InputInjector;
 use crate::net::protocol::Message;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum PointerKind {
     /// Mouse — uses REL_X/REL_Y relative deltas
     Relative,
-    /// Touchpad/trackpad — uses ABS_X/ABS_Y absolute coordinates
+    /// Touchpad/trackpad — uses ABS_X/ABS_Y absolute coordinates,
+    /// converted to relative deltas based on finger movement.
     Absolute {
-        abs_x_min: i32,
-        abs_x_max: i32,
-        abs_y_min: i32,
-        abs_y_max: i32,
+        abs_x_range: f64,
+        abs_y_range: f64,
     },
 }
 
 struct PointerDevice {
     device: Device,
     kind: PointerKind,
+    /// Last ABS_X/ABS_Y seen (for computing deltas on touchpads)
+    last_abs_x: Option<i32>,
+    last_abs_y: Option<i32>,
+    /// Whether a finger is currently touching the pad
+    touching: bool,
 }
 
 /// Find pointer devices: mice (REL_X/REL_Y) and touchpads (ABS_X/ABS_Y + BTN_TOUCH).
@@ -76,13 +80,13 @@ fn find_pointer_devices() -> Result<Vec<(PathBuf, PointerKind)>> {
                     }).ok().flatten();
 
                     if let (Some(ax), Some(ay)) = (abs_info_x, abs_info_y) {
+                        let x_range = (ax.maximum - ax.minimum).max(1) as f64;
+                        let y_range = (ay.maximum - ay.minimum).max(1) as f64;
                         debug!("Found absolute pointer: {} ({}) x:[{}..{}] y:[{}..{}]",
                                name, path.display(), ax.minimum, ax.maximum, ay.minimum, ay.maximum);
                         found.push((path, PointerKind::Absolute {
-                            abs_x_min: ax.minimum,
-                            abs_x_max: ax.maximum,
-                            abs_y_min: ay.minimum,
-                            abs_y_max: ay.maximum,
+                            abs_x_range: x_range,
+                            abs_y_range: y_range,
                         }));
                         continue;
                     }
@@ -144,16 +148,10 @@ impl WaylandCapturer {
             }
             devices.push(PointerDevice {
                 device,
-                kind: match kind {
-                    PointerKind::Relative => PointerKind::Relative,
-                    PointerKind::Absolute { abs_x_min, abs_x_max, abs_y_min, abs_y_max } =>
-                        PointerKind::Absolute {
-                            abs_x_min: *abs_x_min,
-                            abs_x_max: *abs_x_max,
-                            abs_y_min: *abs_y_min,
-                            abs_y_max: *abs_y_max,
-                        },
-                },
+                kind: kind.clone(),
+                last_abs_x: None,
+                last_abs_y: None,
+                touching: false,
             });
         }
 
@@ -176,17 +174,14 @@ impl WaylandCapturer {
         })
     }
 
-    /// Map an absolute axis value to screen coordinates.
-    fn map_abs(val: i32, abs_min: i32, abs_max: i32, screen_max: u32) -> i32 {
-        let range = (abs_max - abs_min).max(1) as f64;
-        let normalized = (val - abs_min) as f64 / range;
-        (normalized * screen_max as f64) as i32
-    }
+    /// Touchpad-to-screen speed multiplier.
+    /// A full swipe across the pad moves the cursor this fraction of screen width.
+    const TOUCHPAD_SPEED: f64 = 1.8;
 
     /// Process all pending events from all devices.
     fn drain_events(&mut self) {
-        let sw = self.screen_width;
-        let sh = self.screen_height;
+        let sw = self.screen_width as f64;
+        let sh = self.screen_height as f64;
 
         for pdev in &mut self.devices {
             loop {
@@ -209,13 +204,26 @@ impl WaylandCapturer {
                                     }
                                 }
                                 InputEventKind::AbsAxis(axis) => {
-                                    if let PointerKind::Absolute { abs_x_min, abs_x_max, abs_y_min, abs_y_max } = &pdev.kind {
+                                    if let PointerKind::Absolute { abs_x_range, abs_y_range } = &pdev.kind {
+                                        // Only track movement while finger is touching
+                                        if !pdev.touching {
+                                            continue;
+                                        }
+                                        let val = event.value();
                                         match axis {
                                             AbsoluteAxisType::ABS_X => {
-                                                self.cursor_x = Self::map_abs(event.value(), *abs_x_min, *abs_x_max, sw);
+                                                if let Some(prev) = pdev.last_abs_x {
+                                                    let delta = (val - prev) as f64 / abs_x_range * sw * Self::TOUCHPAD_SPEED;
+                                                    self.cursor_x += delta as i32;
+                                                }
+                                                pdev.last_abs_x = Some(val);
                                             }
                                             AbsoluteAxisType::ABS_Y => {
-                                                self.cursor_y = Self::map_abs(event.value(), *abs_y_min, *abs_y_max, sh);
+                                                if let Some(prev) = pdev.last_abs_y {
+                                                    let delta = (val - prev) as f64 / abs_y_range * sh * Self::TOUCHPAD_SPEED;
+                                                    self.cursor_y += delta as i32;
+                                                }
+                                                pdev.last_abs_y = Some(val);
                                             }
                                             _ => {}
                                         }
@@ -225,9 +233,16 @@ impl WaylandCapturer {
                                     let code = key.code() as u32;
                                     let pressed = event.value() != 0;
 
-                                    // Track mouse buttons (including touchpad taps)
                                     match key {
-                                        Key::BTN_LEFT | Key::BTN_TOUCH => {
+                                        Key::BTN_TOUCH => {
+                                            // Finger down/up on touchpad — reset tracking
+                                            pdev.touching = pressed;
+                                            if !pressed {
+                                                pdev.last_abs_x = None;
+                                                pdev.last_abs_y = None;
+                                            }
+                                        }
+                                        Key::BTN_LEFT => {
                                             if pressed { self.buttons |= 1; }
                                             else { self.buttons &= !1; }
                                         }
@@ -262,9 +277,9 @@ impl WaylandCapturer {
             }
         }
 
-        // Clamp cursor to screen bounds
-        self.cursor_x = self.cursor_x.clamp(0, self.screen_width as i32 - 1);
-        self.cursor_y = self.cursor_y.clamp(0, self.screen_height as i32 - 1);
+        // No clamping here — the raw position is used to compute deltas
+        // when sharing to a remote screen. The server loop clamps as needed
+        // for local edge detection.
     }
 }
 
@@ -281,6 +296,18 @@ impl InputCapture for WaylandCapturer {
 
     fn mouse_buttons(&self) -> Result<u8> {
         Ok(self.buttons)
+    }
+
+    fn set_grab(&mut self, grab: bool) -> Result<()> {
+        for pdev in &mut self.devices {
+            if grab {
+                pdev.device.grab().wrap_err("Failed to grab device")?;
+            } else {
+                pdev.device.ungrab().wrap_err("Failed to ungrab device")?;
+            }
+        }
+        debug!("Input devices {}", if grab { "grabbed" } else { "ungrabbed" });
+        Ok(())
     }
 
     fn poll_key_events(&mut self) -> Result<Vec<Message>> {

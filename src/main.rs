@@ -38,8 +38,14 @@ async fn main() -> Result<()> {
         Command::Ping { addr } => {
             net::quic::ping(&addr).await?;
         }
-        Command::Serve { port } => {
-            net::quic::serve(port).await?;
+        Command::Serve { port, edge } => {
+            let dir = match edge {
+                cli::Edge::Left => net::protocol::Direction::Left,
+                cli::Edge::Right => net::protocol::Direction::Right,
+                cli::Edge::Up => net::protocol::Direction::Up,
+                cli::Edge::Down => net::protocol::Direction::Down,
+            };
+            net::quic::serve(port, Some(dir)).await?;
         }
         Command::Connect { addr } => {
             net::quic::connect(&addr).await?;
