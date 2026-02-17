@@ -58,7 +58,7 @@ impl InputCapture for MacOSCapturer {
     }
 
     fn screen_size(&self) -> Result<(u32, u32)> {
-        Ok((self.screen_width, self.screen_height))
+        Ok((CGDisplayPixelsWide(MAIN_DISPLAY) as u32, CGDisplayPixelsHigh(MAIN_DISPLAY) as u32))
     }
 
     fn mouse_buttons(&self) -> Result<u8> {
@@ -235,8 +235,10 @@ impl InputInjector for MacOSInjector {
     }
 
     fn move_mouse(&mut self, x: i32, y: i32) -> Result<()> {
-        let x = x.clamp(0, self.screen_width as i32 - 1) as f64;
-        let y = y.clamp(0, self.screen_height as i32 - 1) as f64;
+        let sw = CGDisplayPixelsWide(MAIN_DISPLAY) as i32;
+        let sh = CGDisplayPixelsHigh(MAIN_DISPLAY) as i32;
+        let x = x.clamp(0, sw - 1) as f64;
+        let y = y.clamp(0, sh - 1) as f64;
         self.post_mouse_event(
             CGEventType::MouseMoved,
             x,
@@ -247,6 +249,6 @@ impl InputInjector for MacOSInjector {
     }
 
     fn screen_size(&self) -> Result<(u32, u32)> {
-        Ok((self.screen_width, self.screen_height))
+        Ok((CGDisplayPixelsWide(MAIN_DISPLAY) as u32, CGDisplayPixelsHigh(MAIN_DISPLAY) as u32))
     }
 }

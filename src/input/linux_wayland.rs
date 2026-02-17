@@ -441,7 +441,7 @@ impl InputCapture for WaylandCapturer {
     }
 
     fn screen_size(&self) -> Result<(u32, u32)> {
-        Ok((self.screen_width, self.screen_height))
+        Ok(get_screen_size())
     }
 
     fn mouse_buttons(&self) -> Result<u8> {

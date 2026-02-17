@@ -129,7 +129,7 @@ pub fn client_config() -> Result<quinn::ClientConfig> {
 fn keep_alive_transport() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-    transport.max_idle_timeout(None);
+    transport.max_idle_timeout(Some(std::time::Duration::from_secs(15).try_into().unwrap()));
     transport
 }
 

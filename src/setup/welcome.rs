@@ -11,12 +11,7 @@ pub fn render(frame: &mut Frame, area: Rect) {
         Line::from("  Nexdesk lets you share your mouse, keyboard, and clipboard"),
         Line::from("  between macOS and Linux machines on your local network."),
         Line::from(""),
-        Line::from("  This wizard will guide you through:"),
-        Line::from("    1. Choosing your role (server or client)"),
-        Line::from("    2. Network configuration"),
-        Line::from("    3. Screen edge arrangement"),
-        Line::from("    4. Certificate generation"),
-        Line::from("    5. Installing as a background service"),
+        Line::from("  This wizard will guide you through setting up nexdesk."),
         Line::from(""),
         Line::from(Span::styled(
             "  Press → or Enter to continue.",

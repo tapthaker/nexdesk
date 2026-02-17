@@ -1,4 +1,8 @@
 use std::io;
+#[cfg(unix)]
+use std::io::IsTerminal;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 use color_eyre::eyre::Result;
 use crossterm::{
@@ -24,11 +28,14 @@ pub enum Step {
 }
 
 impl Step {
-    fn next(self) -> Self {
+    fn next(self, role: Option<&str>) -> Self {
         match self {
             Step::Welcome => Step::Role,
-            Step::Role => Step::Network,
-            Step::Network => Step::Screens,
+            Step::Role => match role {
+                Some("server") => Step::Screens,
+                _ => Step::Network,
+            },
+            Step::Network => Step::Certificates,
             Step::Screens => Step::Certificates,
             Step::Certificates => Step::Service,
             Step::Service => Step::Done,
@@ -36,13 +43,16 @@ impl Step {
         }
     }
 
-    fn prev(self) -> Self {
+    fn prev(self, role: Option<&str>) -> Self {
         match self {
             Step::Welcome => Step::Welcome,
             Step::Role => Step::Welcome,
             Step::Network => Step::Role,
-            Step::Screens => Step::Network,
-            Step::Certificates => Step::Screens,
+            Step::Screens => Step::Role,
+            Step::Certificates => match role {
+                Some("server") => Step::Screens,
+                _ => Step::Network,
+            },
             Step::Service => Step::Certificates,
             Step::Done => Step::Service,
         }
@@ -60,15 +70,16 @@ impl Step {
         }
     }
 
-    fn number(self) -> usize {
+    fn number(self, _role: Option<&str>) -> usize {
         match self {
             Step::Welcome => 1,
             Step::Role => 2,
-            Step::Network => 3,
-            Step::Screens => 4,
-            Step::Certificates => 5,
-            Step::Service => 6,
-            Step::Done => 7,
+            // Both server and client have 5 steps total (+ Done)
+            Step::Network => 3,   // client only
+            Step::Screens => 3,   // server only
+            Step::Certificates => 4,
+            Step::Service => 5,
+            Step::Done => 6,
         }
     }
 }
@@ -103,6 +114,16 @@ impl SetupState {
 }
 
 pub async fn run() -> Result<()> {
+    // When invoked via `curl | sh`, stdin is the pipe from curl.
+    // Reopen /dev/tty over fd 0 so crossterm reads from the real terminal.
+    #[cfg(unix)]
+    {
+        if !io::stdin().is_terminal() {
+            let tty = std::fs::File::open("/dev/tty")?;
+            unsafe { libc::dup2(tty.as_raw_fd(), libc::STDIN_FILENO); }
+        }
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -126,9 +147,10 @@ pub async fn run() -> Result<()> {
                 .split(area);
 
             // Title bar
+            let role = state.config.role.as_deref();
             let title = format!(
-                " Nexdesk Setup - Step {}/6: {} ",
-                state.step.number(),
+                " Nexdesk Setup - Step {}/5: {} ",
+                state.step.number(role),
                 state.step.title()
             );
             let header = Block::default()
@@ -152,6 +174,8 @@ pub async fn run() -> Result<()> {
             // Footer
             let nav = if state.step == Step::Done {
                 " Press 'q' to exit "
+            } else if state.step == Step::Screens {
+                " ←↑↓→ Select edge | Enter: Next | Backspace: Back | q: Quit "
             } else {
                 " ←/→ Navigate | Enter: Next | q: Quit "
             };
@@ -168,16 +192,30 @@ pub async fn run() -> Result<()> {
                 }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Right | KeyCode::Enter => {
+                    KeyCode::Enter => {
                         if state.step == Step::Done {
                             break;
                         }
-                        // Apply current step
                         apply_step(&mut state)?;
-                        state.step = state.step.next();
+                        let role = state.config.role.as_deref().map(String::from);
+                        state.step = state.step.next(role.as_deref());
+                    }
+                    KeyCode::Right => {
+                        if state.step == Step::Screens {
+                            state.edge_selection = 1; // right
+                        } else {
+                            apply_step(&mut state)?;
+                            let role = state.config.role.as_deref().map(String::from);
+                            state.step = state.step.next(role.as_deref());
+                        }
                     }
                     KeyCode::Left => {
-                        state.step = state.step.prev();
+                        if state.step == Step::Screens {
+                            state.edge_selection = 0; // left
+                        } else {
+                            let role = state.config.role.as_deref().map(String::from);
+                            state.step = state.step.prev(role.as_deref());
+                        }
                     }
                     KeyCode::Up => {
                         match state.step {
@@ -185,7 +223,7 @@ pub async fn run() -> Result<()> {
                                 state.role_selection = state.role_selection.saturating_sub(1);
                             }
                             Step::Screens => {
-                                state.edge_selection = state.edge_selection.saturating_sub(1);
+                                state.edge_selection = 2; // top
                             }
                             _ => {}
                         }
@@ -196,7 +234,7 @@ pub async fn run() -> Result<()> {
                                 state.role_selection = (state.role_selection + 1).min(1);
                             }
                             Step::Screens => {
-                                state.edge_selection = (state.edge_selection + 1).min(3);
+                                state.edge_selection = 3; // bottom
                             }
                             _ => {}
                         }
@@ -209,6 +247,9 @@ pub async fn run() -> Result<()> {
                     KeyCode::Backspace => {
                         if state.step == Step::Network && !state.use_discovery {
                             state.manual_addr.pop();
+                        } else {
+                            let role = state.config.role.as_deref().map(String::from);
+                            state.step = state.step.prev(role.as_deref());
                         }
                     }
                     KeyCode::Tab => {
@@ -255,7 +296,14 @@ fn apply_step(state: &mut SetupState) -> Result<()> {
             state.fingerprint = Some(crate::net::tls::fingerprint(&cert));
         }
         Step::Service => {
-            if let Err(e) = crate::daemon::install_service() {
+            let args: Vec<&str> = match state.config.role.as_deref() {
+                Some("server") => vec!["serve"],
+                _ => match &state.config.server_addr {
+                    Some(addr) => vec!["connect", addr],
+                    None => vec!["connect"],
+                },
+            };
+            if let Err(e) = crate::daemon::install_service(&args) {
                 tracing::warn!("Failed to install service: {}", e);
             } else {
                 state.service_installed = true;

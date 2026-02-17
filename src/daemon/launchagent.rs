@@ -13,9 +13,15 @@ fn plist_path() -> PathBuf {
         .join(format!("{}.plist", LABEL))
 }
 
-fn plist_content() -> String {
+fn plist_content(args: &[&str]) -> String {
     let exe = std::env::current_exe()
         .unwrap_or_else(|_| PathBuf::from("nexdesk"));
+
+    let arg_entries: String = args
+        .iter()
+        .map(|a| format!("        <string>{}</string>", a))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -27,7 +33,7 @@ fn plist_content() -> String {
     <key>ProgramArguments</key>
     <array>
         <string>{exe}</string>
-        <string>serve</string>
+{arg_entries}
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -41,17 +47,18 @@ fn plist_content() -> String {
 </plist>
 "#,
         label = LABEL,
-        exe = exe.display()
+        exe = exe.display(),
+        arg_entries = arg_entries,
     )
 }
 
-pub fn install() -> Result<()> {
+pub fn install(args: &[&str]) -> Result<()> {
     let path = plist_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .wrap_err("Failed to create LaunchAgents directory")?;
     }
-    std::fs::write(&path, plist_content())
+    std::fs::write(&path, plist_content(args))
         .wrap_err("Failed to write LaunchAgent plist")?;
 
     info!("Installed LaunchAgent at {}", path.display());

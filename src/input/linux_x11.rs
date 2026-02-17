@@ -24,8 +24,6 @@ fn root_window(screen: &Screen) -> xproto::Window {
 pub struct X11Capturer {
     conn: RustConnection,
     root: xproto::Window,
-    screen_width: u32,
-    screen_height: u32,
     prev_keymap: [u8; 32],
 }
 
@@ -35,16 +33,12 @@ impl X11Capturer {
             .wrap_err("Failed to connect to X11 display")?;
         let screen = &conn.setup().roots[screen_num];
         let root = root_window(screen);
-        let screen_width = screen.width_in_pixels as u32;
-        let screen_height = screen.height_in_pixels as u32;
 
-        debug!("X11 capturer: screen {}x{}", screen_width, screen_height);
+        debug!("X11 capturer: screen {}x{}", screen.width_in_pixels, screen.height_in_pixels);
 
         Ok(Self {
             conn,
             root,
-            screen_width,
-            screen_height,
             prev_keymap: [0u8; 32],
         })
     }
@@ -58,7 +52,9 @@ impl InputCapture for X11Capturer {
     }
 
     fn screen_size(&self) -> Result<(u32, u32)> {
-        Ok((self.screen_width, self.screen_height))
+        let reply = self.conn.get_geometry(self.root)?.reply()
+            .wrap_err("Failed to query screen geometry")?;
+        Ok((reply.width as u32, reply.height as u32))
     }
 
     fn mouse_buttons(&self) -> Result<u8> {
@@ -105,8 +101,6 @@ impl InputCapture for X11Capturer {
 pub struct X11Injector {
     conn: RustConnection,
     root: xproto::Window,
-    screen_width: u32,
-    screen_height: u32,
 }
 
 impl X11Injector {
@@ -119,16 +113,12 @@ impl X11Injector {
 
         let screen = &conn.setup().roots[screen_num];
         let root = root_window(screen);
-        let screen_width = screen.width_in_pixels as u32;
-        let screen_height = screen.height_in_pixels as u32;
 
-        debug!("X11 injector: screen {}x{}, XTest available", screen_width, screen_height);
+        debug!("X11 injector: screen {}x{}, XTest available", screen.width_in_pixels, screen.height_in_pixels);
 
         Ok(Self {
             conn,
             root,
-            screen_width,
-            screen_height,
         })
     }
 }
@@ -178,14 +168,17 @@ impl InputInjector for X11Injector {
     }
 
     fn move_mouse(&mut self, x: i32, y: i32) -> Result<()> {
-        let x = x.clamp(0, self.screen_width as i32 - 1) as i16;
-        let y = y.clamp(0, self.screen_height as i32 - 1) as i16;
+        let (sw, sh) = self.screen_size()?;
+        let x = x.clamp(0, sw as i32 - 1) as i16;
+        let y = y.clamp(0, sh as i32 - 1) as i16;
         self.conn.xtest_fake_input(MOTION_NOTIFY, 0, 0, self.root, x, y, 0)?;
         self.conn.flush()?;
         Ok(())
     }
 
     fn screen_size(&self) -> Result<(u32, u32)> {
-        Ok((self.screen_width, self.screen_height))
+        let reply = self.conn.get_geometry(self.root)?.reply()
+            .wrap_err("Failed to query screen geometry")?;
+        Ok((reply.width as u32, reply.height as u32))
     }
 }
