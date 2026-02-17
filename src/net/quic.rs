@@ -133,21 +133,31 @@ async fn handle_server_connection(connection: quinn::Connection) -> Result<()> {
     let mut last_buttons: u8 = 0;
 
     info!("Server ready. Move mouse to screen edge to start sharing.");
+    info!("Screen size: {}x{}", screen_w, screen_h);
 
     let mut poll_interval = time::interval(MOUSE_POLL_INTERVAL);
+    let mut debug_counter: u64 = 0;
 
     loop {
         tokio::select! {
             _ = poll_interval.tick() => {
-                // Query input state while holding lock briefly
+                // Query input state while holding lock briefly.
+                // poll_key_events() is called first because on Wayland (evdev)
+                // it drains pending events and updates the cursor position.
                 let (mx, my, sw, sh, buttons, key_events) = {
                     let mut cap = capturer.lock().unwrap();
+                    let keys = cap.poll_key_events().unwrap_or_default();
                     let pos = cap.mouse_position().unwrap_or((0, 0));
                     let size = cap.screen_size().unwrap_or((1920, 1080));
                     let btns = cap.mouse_buttons().unwrap_or(0);
-                    let keys = cap.poll_key_events().unwrap_or_default();
                     (pos.0, pos.1, size.0, size.1, btns, keys)
                 };
+
+                // Log position every 500 polls (~1 second)
+                debug_counter += 1;
+                if debug_counter % 500 == 0 {
+                    debug!("Mouse: ({}, {}) screen: {}x{}", mx, my, sw, sh);
+                }
 
                 if !active {
                     if let Some(dir) = edge::detect_edge(mx, my, sw, sh) {
