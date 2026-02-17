@@ -5,8 +5,8 @@ use crate::net::protocol::{Direction, Message, ScreenLayout};
 
 // --- Constants ---
 
-const EDGE_DWELL_THRESHOLD: u32 = 100;
-const SERVER_EDGE_COOLDOWN: u32 = 250;
+const EDGE_DWELL_THRESHOLD: u32 = 50;
+const SERVER_EDGE_COOLDOWN: u32 = 125;
 const INSET: i32 = 20;
 const CLIENT_EDGE_DWELL: u32 = 8;
 
@@ -347,8 +347,8 @@ mod tests {
     #[test]
     fn server_dwell_resets_on_move_away() {
         let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
-        // Partial dwell
-        for _ in 0..50 {
+        // Partial dwell (half the threshold)
+        for _ in 0..EDGE_DWELL_THRESHOLD / 2 {
             st.poll(1919, 500, 1920, 1080, 0, vec![]);
         }
         // Move away from edge
