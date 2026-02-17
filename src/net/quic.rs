@@ -171,8 +171,8 @@ async fn handle_server_connection(
     ).ok().flatten();
     #[cfg(not(target_os = "linux"))]
     let layer_shell: Option<(
-        tokio::sync::mpsc::UnboundedReceiver<()>,
-        tokio::sync::mpsc::UnboundedSender<()>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::input::wayland_layer_shell::LayerShellEvent>,
+        tokio::sync::mpsc::UnboundedSender<crate::input::wayland_layer_shell::LayerShellCommand>,
         u32, u32,
     )> = None;
 

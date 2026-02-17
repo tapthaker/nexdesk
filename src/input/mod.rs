@@ -11,6 +11,27 @@ pub mod linux_wayland;
 #[cfg(target_os = "linux")]
 pub mod wayland_layer_shell;
 
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub mod wayland_layer_shell {
+    /// Stub types for non-Linux platforms (never instantiated at runtime).
+    #[derive(Debug)]
+    pub enum LayerShellEvent {
+        EdgeEnter { direction: crate::net::protocol::Direction },
+        MouseMove { dx: f64, dy: f64 },
+        MouseButton { button: u32, pressed: bool },
+        MouseScroll { dx: f64, dy: f64 },
+        KeyEvent { keycode: u32, pressed: bool },
+        KeyModifiers { depressed: u32, latched: u32, locked: u32, group: u32 },
+    }
+
+    #[derive(Debug)]
+    pub enum LayerShellCommand {
+        Release,
+        Shutdown,
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub mod macos;
 
