@@ -35,20 +35,25 @@ struct PointerDevice {
     finger_count: u32,
 }
 
-/// Find pointer devices: mice (REL_X/REL_Y) and touchpads (ABS_X/ABS_Y + BTN_TOUCH).
-fn find_pointer_devices() -> Result<Vec<(PathBuf, PointerKind)>> {
-    let mut found = Vec::new();
-    let entries: Vec<_> = std::fs::read_dir("/dev/input")
+/// Collect all /dev/input/event* entries once for reuse.
+fn input_event_entries() -> Result<Vec<PathBuf>> {
+    let entries: Vec<PathBuf> = std::fs::read_dir("/dev/input")
         .wrap_err("Cannot read /dev/input")?
         .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().contains("event"))
         .collect();
+    Ok(entries)
+}
 
-    for entry in entries {
-        let path = entry.path();
-        if !path.to_string_lossy().contains("event") {
-            continue;
-        }
-        let device = match Device::open(&path) {
+/// Find pointer devices: mice (REL_X/REL_Y) and touchpads (ABS_X/ABS_Y + BTN_TOUCH).
+/// Returns (path, kind) pairs and also collects the paths that were claimed as pointers.
+fn find_pointer_devices(entries: &[PathBuf]) -> Result<(Vec<(PathBuf, PointerKind)>, HashSet<PathBuf>)> {
+    let mut found = Vec::new();
+    let mut claimed = HashSet::new();
+
+    for path in entries {
+        let device = match Device::open(path) {
             Ok(d) => d,
             Err(_) => continue,
         };
@@ -59,7 +64,8 @@ fn find_pointer_devices() -> Result<Vec<(PathBuf, PointerKind)>> {
         if let Some(axes) = device.supported_relative_axes() {
             if axes.contains(RelativeAxisType::REL_X) && axes.contains(RelativeAxisType::REL_Y) {
                 debug!("Found relative pointer: {} ({})", name, path.display());
-                found.push((path, PointerKind::Relative));
+                found.push((path.clone(), PointerKind::Relative));
+                claimed.insert(path.clone());
                 continue;
             }
         }
@@ -86,10 +92,11 @@ fn find_pointer_devices() -> Result<Vec<(PathBuf, PointerKind)>> {
                         let y_range = (ay.maximum - ay.minimum).max(1) as f64;
                         debug!("Found absolute pointer: {} ({}) x:[{}..{}] y:[{}..{}]",
                                name, path.display(), ax.minimum, ax.maximum, ay.minimum, ay.maximum);
-                        found.push((path, PointerKind::Absolute {
+                        found.push((path.clone(), PointerKind::Absolute {
                             abs_x_range: x_range,
                             abs_y_range: y_range,
                         }));
+                        claimed.insert(path.clone());
                         continue;
                     }
                 }
@@ -103,7 +110,30 @@ fn find_pointer_devices() -> Result<Vec<(PathBuf, PointerKind)>> {
         ));
     }
 
-    Ok(found)
+    Ok((found, claimed))
+}
+
+/// Find keyboard devices: devices with KEY_A support that are not already
+/// claimed as pointer devices.
+fn find_keyboard_devices(entries: &[PathBuf], pointer_paths: &HashSet<PathBuf>) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for path in entries {
+        if pointer_paths.contains(path) {
+            continue;
+        }
+        let device = match Device::open(path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let has_key_a = device.supported_keys()
+            .map_or(false, |k| k.contains(Key::KEY_A));
+        if has_key_a {
+            let name = device.name().unwrap_or("unknown");
+            debug!("Found keyboard: {} ({})", name, path.display());
+            found.push(path.clone());
+        }
+    }
+    found
 }
 
 /// Get screen size from X11 (XWayland provides correct screen dimensions)
@@ -128,6 +158,7 @@ fn get_screen_size() -> (u32, u32) {
 /// forwards deltas to the remote when grabbed (active sharing).
 pub struct WaylandCapturer {
     devices: Vec<PointerDevice>,
+    keyboard_devices: Vec<Device>,
     cursor_x: i32,
     cursor_y: i32,
     grabbed: bool,
@@ -142,7 +173,8 @@ pub struct WaylandCapturer {
 
 impl WaylandCapturer {
     pub fn new() -> Result<Self> {
-        let found = find_pointer_devices()?;
+        let entries = input_event_entries()?;
+        let (found, pointer_paths) = find_pointer_devices(&entries)?;
         let mut devices = Vec::new();
         for (path, kind) in &found {
             let device = Device::open(path)
@@ -163,9 +195,23 @@ impl WaylandCapturer {
             });
         }
 
+        // Open keyboard devices (separate from pointer devices)
+        let kb_paths = find_keyboard_devices(&entries, &pointer_paths);
+        let mut keyboard_devices = Vec::new();
+        for path in &kb_paths {
+            let device = Device::open(path)
+                .wrap_err_with(|| format!("Failed to open keyboard {}", path.display()))?;
+            let fd = device.as_raw_fd();
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            keyboard_devices.push(device);
+        }
+
         let (screen_width, screen_height) = get_screen_size();
-        debug!("Wayland evdev capturer: screen {}x{}, {} device(s)",
-               screen_width, screen_height, devices.len());
+        debug!("Wayland evdev capturer: screen {}x{}, {} pointer(s), {} keyboard(s)",
+               screen_width, screen_height, devices.len(), keyboard_devices.len());
 
         // Start cursor at center of screen
         let cursor_x = screen_width as i32 / 2;
@@ -173,6 +219,7 @@ impl WaylandCapturer {
 
         Ok(Self {
             devices,
+            keyboard_devices,
             cursor_x,
             cursor_y,
             grabbed: false,
@@ -357,6 +404,34 @@ impl WaylandCapturer {
         // No clamping here — the raw position is used to compute deltas
         // when sharing to a remote screen. The server loop clamps as needed
         // for local edge detection.
+
+        // Drain keyboard devices for key events
+        for kdev in &mut self.keyboard_devices {
+            loop {
+                match kdev.fetch_events() {
+                    Ok(events) => {
+                        let mut got_any = false;
+                        for event in events {
+                            got_any = true;
+                            if let InputEventKind::Key(key) = event.kind() {
+                                let code = key.code() as u32;
+                                let pressed = event.value() != 0;
+                                if pressed {
+                                    self.pressed_keys.insert(code);
+                                } else {
+                                    self.pressed_keys.remove(&code);
+                                }
+                            }
+                        }
+                        if !got_any {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
     }
 }
 
@@ -376,13 +451,22 @@ impl InputCapture for WaylandCapturer {
     fn set_grab(&mut self, grab: bool) -> Result<()> {
         for pdev in &mut self.devices {
             if grab {
-                pdev.device.grab().wrap_err("Failed to grab device")?;
+                pdev.device.grab().wrap_err("Failed to grab pointer device")?;
             } else {
-                pdev.device.ungrab().wrap_err("Failed to ungrab device")?;
+                pdev.device.ungrab().wrap_err("Failed to ungrab pointer device")?;
+            }
+        }
+        for kdev in &mut self.keyboard_devices {
+            if grab {
+                kdev.grab().wrap_err("Failed to grab keyboard device")?;
+            } else {
+                kdev.ungrab().wrap_err("Failed to ungrab keyboard device")?;
             }
         }
         self.grabbed = grab;
-        debug!("Input devices {}", if grab { "grabbed" } else { "ungrabbed" });
+        debug!("Input devices {} ({} pointers, {} keyboards)",
+               if grab { "grabbed" } else { "ungrabbed" },
+               self.devices.len(), self.keyboard_devices.len());
         Ok(())
     }
 

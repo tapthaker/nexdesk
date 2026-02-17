@@ -12,12 +12,14 @@ use objc2_core_graphics::{
 };
 
 #[cfg(target_os = "macos")]
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[cfg(target_os = "macos")]
 use crate::input::capture::InputCapture;
 #[cfg(target_os = "macos")]
 use crate::input::inject::InputInjector;
+#[cfg(target_os = "macos")]
+use crate::input::keymap;
 #[cfg(target_os = "macos")]
 use crate::net::protocol::Message;
 
@@ -182,9 +184,16 @@ impl InputInjector for MacOSInjector {
             Message::KeyEvent {
                 keycode, pressed, ..
             } => {
+                let mac_keycode = match keymap::evdev_to_macos(*keycode) {
+                    Some(k) => k,
+                    None => {
+                        debug!("Unmapped evdev keycode: {}", keycode);
+                        return Ok(());
+                    }
+                };
                 let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
-                let event = CGEvent::new_keyboard_event(Some(&source), *keycode as u16, *pressed)
+                let event = CGEvent::new_keyboard_event(Some(&source), mac_keycode, *pressed)
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create key event"))?;
                 CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
             }
