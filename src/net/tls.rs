@@ -120,9 +120,13 @@ pub fn server_config() -> Result<quinn::ServerConfig> {
         .with_single_cert(vec![cert_der], key_der)
         .wrap_err("Failed to build TLS server config")?;
 
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
     ));
+
+    let transport = keep_alive_transport();
+    server_config.transport_config(Arc::new(transport));
+
     Ok(server_config)
 }
 
@@ -133,10 +137,22 @@ pub fn client_config() -> Result<quinn::ClientConfig> {
         .with_custom_certificate_verifier(Arc::new(TofuVerifier))
         .with_no_client_auth();
 
-    let client_config = quinn::ClientConfig::new(Arc::new(
+    let mut client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
     ));
+
+    let transport = keep_alive_transport();
+    client_config.transport_config(Arc::new(transport));
+
     Ok(client_config)
+}
+
+/// Build transport config with keep-alive to prevent idle timeouts.
+fn keep_alive_transport() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    transport.max_idle_timeout(None);
+    transport
 }
 
 /// Trust-on-First-Use certificate verifier.

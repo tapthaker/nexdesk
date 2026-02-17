@@ -77,14 +77,22 @@ async fn handle_server_connection(connection: quinn::Connection) -> Result<()> {
         }
     };
 
-    // Open unidirectional input stream (server → client)
-    let input_send = connection.open_uni().await?;
-    let input_send = Arc::new(Mutex::new(input_send));
-    debug!("Input stream opened");
+    // Open clipboard stream (bidirectional) — must be before uni stream
+    // so client accept_bi() picks it up in order
+    let (mut clip_send, mut clip_recv) = connection.open_bi().await?;
+    // Send a Heartbeat as a "stream ready" marker so the client's accept_bi()
+    // actually sees this stream (QUIC may not push an empty stream).
+    let marker = Message::Heartbeat { timestamp: 0 };
+    send_message(&mut clip_send, &marker).await?;
+    debug!("Clipboard stream opened and marker sent");
 
-    // Open clipboard stream (bidirectional)
-    let (clip_send, mut clip_recv) = connection.open_bi().await?;
-    debug!("Clipboard stream opened");
+    // Open unidirectional input stream (server → client)
+    let mut input_send = connection.open_uni().await?;
+    // Send a marker so QUIC pushes the stream creation to the client
+    let input_marker = Message::Heartbeat { timestamp: 0 };
+    send_message(&mut input_send, &input_marker).await?;
+    let input_send = Arc::new(Mutex::new(input_send));
+    debug!("Input stream opened and marker sent");
 
     // Spawn clipboard polling task
     let clip_send = Arc::new(Mutex::new(clip_send));
@@ -271,7 +279,15 @@ pub async fn connect(addr: &str) -> Result<()> {
     let mut active = false;
 
     // Accept clipboard stream (bidirectional, second bi-stream from server)
-    let (clip_send, mut clip_recv) = connection.accept_bi().await?;
+    let (clip_send, mut clip_recv) = tokio::time::timeout(
+        Duration::from_secs(10),
+        connection.accept_bi(),
+    )
+    .await
+    .wrap_err("Timeout waiting for clipboard stream from server")?
+    .wrap_err("Failed to accept clipboard stream")?;
+    // Read and discard the stream-ready marker
+    let _marker = recv_message(&mut clip_recv).await?;
     debug!("Clipboard stream accepted");
 
     // Spawn clipboard polling task (client → server)
@@ -308,7 +324,15 @@ pub async fn connect(addr: &str) -> Result<()> {
     info!("Client ready. Waiting for server to share mouse...");
 
     // Accept the unidirectional input stream from the server
-    let mut input_recv = connection.accept_uni().await?;
+    let mut input_recv = tokio::time::timeout(
+        Duration::from_secs(10),
+        connection.accept_uni(),
+    )
+    .await
+    .wrap_err("Timeout waiting for input stream from server")?
+    .wrap_err("Failed to accept input stream")?;
+    // Read and discard the stream-ready marker
+    let _marker = recv_message_uni(&mut input_recv).await?;
     debug!("Input stream accepted");
 
     loop {
