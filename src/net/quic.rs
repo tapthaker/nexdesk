@@ -8,9 +8,9 @@ use tokio::sync::Mutex;
 use tokio::time;
 use tracing::{info, debug, warn, error};
 
-use crate::cursor::edge;
 use crate::net::protocol::{self, Message, PROTOCOL_VERSION, ScreenLayout};
 use crate::net::tls;
+use crate::net::transition::{ServerTransition, ServerOutput, ClientTransition, ClientOutput};
 
 const DEFAULT_PORT: u16 = 4242;
 const MOUSE_POLL_INTERVAL: Duration = Duration::from_millis(2);
@@ -128,14 +128,7 @@ async fn handle_server_connection(connection: quinn::Connection, trigger_edge: O
 
     // Input polling + edge detection + forwarding
     let capturer = Arc::new(std::sync::Mutex::new(capturer));
-    let mut active = false;
-    let mut last_x: i32 = 0;
-    let mut last_y: i32 = 0;
-    let mut last_buttons: u8 = 0;
-    let mut server_edge_cooldown: u32 = 0;
-    /// Consecutive polls at the edge before triggering (~200ms at 2ms poll)
-    let mut edge_dwell: u32 = 0;
-    const EDGE_DWELL_THRESHOLD: u32 = 100;
+    let mut transition = ServerTransition::new(trigger_edge, peer_screen);
 
     info!("Server ready. Move mouse to screen edge to start sharing.");
     info!("Screen size: {}x{}", screen_w, screen_h);
@@ -158,91 +151,34 @@ async fn handle_server_connection(connection: quinn::Connection, trigger_edge: O
                     (pos.0, pos.1, size.0, size.1, btns, keys)
                 };
 
-                // Clamp for edge detection (raw position may exceed screen bounds)
-                let clamped_x = mx.clamp(0, sw as i32 - 1);
-                let clamped_y = my.clamp(0, sh as i32 - 1);
-
                 // Log position every 500 polls (~1 second)
                 debug_counter += 1;
                 if debug_counter % 500 == 0 {
+                    let clamped_x = mx.clamp(0, sw as i32 - 1);
+                    let clamped_y = my.clamp(0, sh as i32 - 1);
                     debug!("Mouse: ({}, {}) raw: ({}, {}) screen: {}x{}", clamped_x, clamped_y, mx, my, sw, sh);
                 }
 
-                if !active {
-                    let at_edge = edge::detect_edge(clamped_x, clamped_y, sw, sh)
-                        .filter(|d| trigger_edge.map_or(true, |e| std::mem::discriminant(d) == std::mem::discriminant(&e)));
-
-                    if server_edge_cooldown > 0 {
-                        server_edge_cooldown -= 1;
-                        edge_dwell = 0;
-                    } else if let Some(dir) = at_edge {
-                        edge_dwell += 1;
-                        if edge_dwell < EDGE_DWELL_THRESHOLD {
-                            continue;
-                        }
-                        edge_dwell = 0;
-                        info!("Edge detected: {:?} — switching to remote", dir);
-                        active = true;
-                        last_buttons = buttons;
-                        // Grab input devices so local desktop stops receiving events
-                        { capturer.lock().unwrap().set_grab(true).ok(); }
-                        let msg = Message::SwitchScreen { direction: dir };
+                match transition.poll(mx, my, sw, sh, buttons, key_events) {
+                    ServerOutput::Idle => {}
+                    ServerOutput::Activate { messages, .. } => {
+                        info!("Edge detected — switching to remote");
+                        capturer.lock().unwrap().set_grab(true).ok();
                         let mut sender = input_send.lock().await;
-                        send_message_uni(&mut sender, &msg).await.ok();
-
-                        // Place the remote cursor slightly inward from the entry edge
-                        // and clamp away from ALL edges to avoid immediate bounce-back.
-                        const INSET: i32 = 20;
-                        let pw = peer_screen.width as i32;
-                        let ph = peer_screen.height as i32;
-                        let (rx, ry) = match dir {
-                            crate::net::protocol::Direction::Right => (INSET, my.clamp(INSET, ph - 1 - INSET)),
-                            crate::net::protocol::Direction::Left => (pw - 1 - INSET, my.clamp(INSET, ph - 1 - INSET)),
-                            crate::net::protocol::Direction::Down => (mx.clamp(INSET, pw - 1 - INSET), INSET),
-                            crate::net::protocol::Direction::Up => (mx.clamp(INSET, pw - 1 - INSET), ph - 1 - INSET),
-                        };
-                        let move_msg = Message::MouseMove { x: rx, y: ry };
-                        send_message_uni(&mut sender, &move_msg).await.ok();
-                        last_x = mx;
-                        last_y = my;
-                    } else {
-                        // Cursor moved away from edge — reset dwell counter
-                        edge_dwell = 0;
-                    }
-                } else {
-                    let mut sender = input_send.lock().await;
-
-                    // Mouse movement (relative deltas)
-                    let dx = mx - last_x;
-                    let dy = my - last_y;
-                    if dx != 0 || dy != 0 {
-                        let msg = Message::MouseMove { x: dx, y: dy };
-                        if let Err(e) = send_message_uni(&mut sender, &msg).await {
-                            warn!("Failed to send mouse move: {}", e);
-                            active = false;
-                            { capturer.lock().unwrap().set_grab(false).ok(); }
-                            continue;
+                        for msg in messages {
+                            send_message_uni(&mut sender, &msg).await.ok();
                         }
-                        last_x = mx;
-                        last_y = my;
                     }
-
-                    // Mouse button changes
-                    if buttons != last_buttons {
-                        for bit in 0..3u8 {
-                            let was = (last_buttons >> bit) & 1 != 0;
-                            let now = (buttons >> bit) & 1 != 0;
-                            if was != now {
-                                let msg = Message::MouseButton { button: bit, pressed: now };
-                                send_message_uni(&mut sender, &msg).await.ok();
+                    ServerOutput::Forward { messages } => {
+                        let mut sender = input_send.lock().await;
+                        for msg in messages {
+                            if let Err(e) = send_message_uni(&mut sender, &msg).await {
+                                warn!("Failed to send: {}", e);
+                                transition.deactivate();
+                                capturer.lock().unwrap().set_grab(false).ok();
+                                break;
                             }
                         }
-                        last_buttons = buttons;
-                    }
-
-                    // Keyboard events
-                    for key_msg in key_events {
-                        send_message_uni(&mut sender, &key_msg).await.ok();
                     }
                 }
             }
@@ -254,9 +190,8 @@ async fn handle_server_connection(connection: quinn::Connection, trigger_edge: O
                     }
                     Ok(Some(Message::SwitchScreen { direction })) => {
                         info!("Client requested switch back: {:?}", direction);
-                        active = false;
-                        server_edge_cooldown = 250; // ~500ms at 2ms poll
-                        { capturer.lock().unwrap().set_grab(false).ok(); }
+                        transition.on_switch_back();
+                        capturer.lock().unwrap().set_grab(false).ok();
                     }
                     Ok(Some(other)) => {
                         debug!("Received message: {:?}", other);
@@ -308,13 +243,7 @@ pub async fn connect(addr: &str) -> Result<()> {
     let (my_w, my_h) = injector.screen_size()?;
     info!("Local screen: {}x{}", my_w, my_h);
 
-    // Track absolute cursor position on our screen
-    let mut cursor_x: i32 = my_w as i32 / 2;
-    let mut cursor_y: i32 = my_h as i32 / 2;
-    let mut active = false;
-    let mut first_move = false;
-    /// Number of moves to skip edge detection after switch (cooldown)
-    let mut edge_cooldown: u32 = 0;
+    let mut transition = ClientTransition::new(my_w, my_h);
 
     // Accept clipboard stream (bidirectional, second bi-stream from server)
     let (clip_send, mut clip_recv) = tokio::time::timeout(
@@ -378,59 +307,30 @@ pub async fn connect(addr: &str) -> Result<()> {
             msg = recv_message_uni(&mut input_recv) => {
                 match msg {
                     Ok(Some(message)) => {
-                        match &message {
-                            Message::SwitchScreen { direction } => {
-                                info!("Server sharing mouse (direction: {:?})", direction);
-                                active = true;
-                                first_move = true;
-                                edge_cooldown = 50; // ~100ms at 2ms poll rate
+                        match transition.handle(message) {
+                            ClientOutput::Ignore => {}
+                            ClientOutput::Activate => {
+                                info!("Server sharing mouse");
                             }
-                            Message::MouseMove { x, y } if active => {
-                                if first_move {
-                                    // First move after switch: absolute position (initial placement)
-                                    cursor_x = *x;
-                                    cursor_y = *y;
-                                    first_move = false;
-                                } else {
-                                    // Subsequent moves: relative deltas
-                                    cursor_x += x;
-                                    cursor_y += y;
-                                }
-                                cursor_x = cursor_x.clamp(0, my_w as i32 - 1);
-                                cursor_y = cursor_y.clamp(0, my_h as i32 - 1);
-
-                                // Check if cursor hit edge on client side (switch back)
-                                // Skip during cooldown to avoid immediate bounce
-                                if edge_cooldown > 0 {
-                                    edge_cooldown -= 1;
-                                } else if let Some(dir) = edge::detect_edge(cursor_x, cursor_y, my_w, my_h) {
-                                    info!("Edge on client: {:?} — requesting switch back", dir);
-                                    active = false;
-                                    let switch_msg = Message::SwitchScreen { direction: dir };
-                                    send_message(&mut control_send, &switch_msg).await.ok();
-                                    continue;
-                                }
-
-                                let move_msg = Message::MouseMove { x: cursor_x, y: cursor_y };
-                                if let Err(e) = injector.inject(&move_msg) {
+                            ClientOutput::InjectMove { x, y } => {
+                                let msg = Message::MouseMove { x, y };
+                                if let Err(e) = injector.inject(&msg) {
                                     warn!("Inject mouse move error: {}", e);
                                 }
                             }
-                            Message::MouseButton { .. } if active => {
-                                if let Err(e) = injector.inject(&message) {
-                                    warn!("Inject button error: {}", e);
+                            ClientOutput::Forward(msg) => {
+                                if let Err(e) = injector.inject(&msg) {
+                                    warn!("Inject error: {}", e);
                                 }
                             }
-                            Message::MouseScroll { .. } if active => {
-                                if let Err(e) = injector.inject(&message) {
-                                    warn!("Inject scroll error: {}", e);
+                            ClientOutput::SwitchBack { direction, inject } => {
+                                if let Some((x, y)) = inject {
+                                    let msg = Message::MouseMove { x, y };
+                                    injector.inject(&msg).ok();
                                 }
-                            }
-                            Message::KeyEvent { .. } if active => {
-                                injector.inject(&message).ok();
-                            }
-                            _ => {
-                                debug!("Received (inactive): {:?}", message);
+                                info!("Edge on client: {:?} — requesting switch back", direction);
+                                let switch_msg = Message::SwitchScreen { direction };
+                                send_message(&mut control_send, &switch_msg).await.ok();
                             }
                         }
                     }
