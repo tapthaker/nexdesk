@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::cursor::edge;
 use crate::net::protocol::{Direction, Message, ScreenLayout};
 
@@ -8,6 +10,13 @@ const SERVER_EDGE_COOLDOWN: u32 = 250;
 const INSET: i32 = 20;
 const CLIENT_EDGE_DWELL: u32 = 8;
 
+// Evdev keycodes for the safety escape combo (Ctrl+Alt+Escape)
+const KEY_ESC: u32 = 1;
+const KEY_LEFTCTRL: u32 = 29;
+const KEY_LEFTALT: u32 = 56;
+const KEY_RIGHTCTRL: u32 = 97;
+const KEY_RIGHTALT: u32 = 100;
+
 // --- Server Transition ---
 
 #[derive(Debug)]
@@ -15,6 +24,8 @@ pub enum ServerOutput {
     Idle,
     Activate { messages: Vec<Message>, grab: bool },
     Forward { messages: Vec<Message> },
+    /// Safety escape: Ctrl+Alt+Escape pressed, force-release grab
+    ForceRelease,
 }
 
 pub struct ServerTransition {
@@ -26,6 +37,7 @@ pub struct ServerTransition {
     last_buttons: u8,
     edge_cooldown: u32,
     edge_dwell: u32,
+    pressed_keys: HashSet<u32>,
 }
 
 impl ServerTransition {
@@ -39,11 +51,33 @@ impl ServerTransition {
             last_buttons: 0,
             edge_cooldown: 0,
             edge_dwell: 0,
+            pressed_keys: HashSet::new(),
         }
     }
 
     pub fn is_active(&self) -> bool {
         self.active
+    }
+
+    fn update_pressed_keys(&mut self, key_events: &[Message]) {
+        for msg in key_events {
+            if let Message::KeyEvent { keycode, pressed, .. } = msg {
+                if *pressed {
+                    self.pressed_keys.insert(*keycode);
+                } else {
+                    self.pressed_keys.remove(keycode);
+                }
+            }
+        }
+    }
+
+    fn is_escape_combo(&self) -> bool {
+        let has_ctrl = self.pressed_keys.contains(&KEY_LEFTCTRL)
+            || self.pressed_keys.contains(&KEY_RIGHTCTRL);
+        let has_alt = self.pressed_keys.contains(&KEY_LEFTALT)
+            || self.pressed_keys.contains(&KEY_RIGHTALT);
+        let has_esc = self.pressed_keys.contains(&KEY_ESC);
+        has_ctrl && has_alt && has_esc
     }
 
     pub fn poll(
@@ -55,6 +89,15 @@ impl ServerTransition {
         buttons: u8,
         key_events: Vec<Message>,
     ) -> ServerOutput {
+        self.update_pressed_keys(&key_events);
+
+        // Safety escape: Ctrl+Alt+Escape always force-releases
+        if self.active && self.is_escape_combo() {
+            self.active = false;
+            self.pressed_keys.clear();
+            return ServerOutput::ForceRelease;
+        }
+
         let clamped_x = mx.clamp(0, sw as i32 - 1);
         let clamped_y = my.clamp(0, sh as i32 - 1);
 
@@ -468,6 +511,56 @@ mod tests {
         }
         let out = st.poll(1919, 500, 1920, 1080, 0, vec![]);
         assert!(matches!(out, ServerOutput::Activate { .. }));
+    }
+
+    // ===== Safety Escape Tests =====
+
+    fn activate_server(st: &mut ServerTransition) {
+        for _ in 0..EDGE_DWELL_THRESHOLD - 1 {
+            st.poll(1919, 500, 1920, 1080, 0, vec![]);
+        }
+        st.poll(1919, 500, 1920, 1080, 0, vec![]);
+        assert!(st.is_active());
+    }
+
+    #[test]
+    fn server_ctrl_alt_escape_force_releases() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        activate_server(&mut st);
+
+        let keys = vec![
+            Message::KeyEvent { keycode: KEY_LEFTCTRL, pressed: true, modifiers: 0 },
+            Message::KeyEvent { keycode: KEY_LEFTALT, pressed: true, modifiers: 0 },
+            Message::KeyEvent { keycode: KEY_ESC, pressed: true, modifiers: 0 },
+        ];
+        let out = st.poll(1919, 500, 1920, 1080, 0, keys);
+        assert!(matches!(out, ServerOutput::ForceRelease));
+        assert!(!st.is_active());
+    }
+
+    #[test]
+    fn server_escape_alone_does_not_force_release() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        activate_server(&mut st);
+
+        let keys = vec![
+            Message::KeyEvent { keycode: KEY_ESC, pressed: true, modifiers: 0 },
+        ];
+        let out = st.poll(1919, 500, 1920, 1080, 0, keys);
+        assert!(matches!(out, ServerOutput::Forward { .. }));
+        assert!(st.is_active());
+    }
+
+    #[test]
+    fn server_escape_combo_ignored_when_inactive() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        let keys = vec![
+            Message::KeyEvent { keycode: KEY_LEFTCTRL, pressed: true, modifiers: 0 },
+            Message::KeyEvent { keycode: KEY_LEFTALT, pressed: true, modifiers: 0 },
+            Message::KeyEvent { keycode: KEY_ESC, pressed: true, modifiers: 0 },
+        ];
+        let out = st.poll(500, 500, 1920, 1080, 0, keys);
+        assert!(matches!(out, ServerOutput::Idle));
     }
 
     // ===== Client Tests =====

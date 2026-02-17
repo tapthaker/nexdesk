@@ -180,6 +180,10 @@ async fn handle_server_connection(connection: quinn::Connection, trigger_edge: O
                             }
                         }
                     }
+                    ServerOutput::ForceRelease => {
+                        warn!("Safety escape (Ctrl+Alt+Escape) — releasing grab");
+                        capturer.lock().unwrap().set_grab(false).ok();
+                    }
                 }
             }
             msg = recv_message(&mut control_recv) => {
@@ -208,6 +212,10 @@ async fn handle_server_connection(connection: quinn::Connection, trigger_edge: O
             }
         }
     }
+
+    // Always release grab when connection ends (client crash, disconnect, etc.)
+    info!("Connection ended, releasing input grab");
+    capturer.lock().unwrap().set_grab(false).ok();
 
     Ok(())
 }
