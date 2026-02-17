@@ -82,11 +82,48 @@ async fn handle_server_connection(connection: quinn::Connection) -> Result<()> {
     let input_send = Arc::new(Mutex::new(input_send));
     debug!("Input stream opened");
 
-    // Mouse polling + edge detection + forwarding
+    // Open clipboard stream (bidirectional)
+    let (clip_send, mut clip_recv) = connection.open_bi().await?;
+    debug!("Clipboard stream opened");
+
+    // Spawn clipboard polling task
+    let clip_send = Arc::new(Mutex::new(clip_send));
+    let clip_send_clone = clip_send.clone();
+    tokio::spawn(async move {
+        let mut clipboard = crate::clipboard::sync::ClipboardSync::new();
+        let interval = crate::clipboard::sync::ClipboardSync::poll_interval();
+        loop {
+            tokio::time::sleep(interval).await;
+            if let Ok(Some(msg)) = clipboard.poll_change() {
+                let mut sender = clip_send_clone.lock().await;
+                if send_message(&mut sender, &msg).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // Spawn clipboard receive task
+    tokio::spawn(async move {
+        let mut clipboard = crate::clipboard::sync::ClipboardSync::new();
+        loop {
+            match recv_message(&mut clip_recv).await {
+                Ok(Some(Message::ClipboardUpdate { content })) => {
+                    clipboard.apply_update(&content).ok();
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+    });
+
+    // Input polling + edge detection + forwarding
     let capturer = Arc::new(std::sync::Mutex::new(capturer));
-    let mut active = false; // Whether we're controlling the remote machine
+    let mut active = false;
     let mut last_x: i32 = 0;
     let mut last_y: i32 = 0;
+    let mut last_buttons: u8 = 0;
+
     info!("Server ready. Move mouse to screen edge to start sharing.");
 
     let mut poll_interval = time::interval(MOUSE_POLL_INTERVAL);
@@ -94,18 +131,21 @@ async fn handle_server_connection(connection: quinn::Connection) -> Result<()> {
     loop {
         tokio::select! {
             _ = poll_interval.tick() => {
-                // Query mouse position while holding lock briefly, then drop
-                let (mx, my, sw, sh) = {
-                    let cap = capturer.lock().unwrap();
+                // Query input state while holding lock briefly
+                let (mx, my, sw, sh, buttons, key_events) = {
+                    let mut cap = capturer.lock().unwrap();
                     let pos = cap.mouse_position().unwrap_or((0, 0));
                     let size = cap.screen_size().unwrap_or((1920, 1080));
-                    (pos.0, pos.1, size.0, size.1)
+                    let btns = cap.mouse_buttons().unwrap_or(0);
+                    let keys = cap.poll_key_events().unwrap_or_default();
+                    (pos.0, pos.1, size.0, size.1, btns, keys)
                 };
 
                 if !active {
                     if let Some(dir) = edge::detect_edge(mx, my, sw, sh) {
                         info!("Edge detected: {:?} — switching to remote", dir);
                         active = true;
+                        last_buttons = buttons;
                         let msg = Message::SwitchScreen { direction: dir };
                         let mut sender = input_send.lock().await;
                         send_message_uni(&mut sender, &msg).await.ok();
@@ -122,12 +162,13 @@ async fn handle_server_connection(connection: quinn::Connection) -> Result<()> {
                         last_y = my;
                     }
                 } else {
+                    let mut sender = input_send.lock().await;
+
+                    // Mouse movement
                     let dx = mx - last_x;
                     let dy = my - last_y;
-
                     if dx != 0 || dy != 0 {
                         let msg = Message::MouseMove { x: dx, y: dy };
-                        let mut sender = input_send.lock().await;
                         if let Err(e) = send_message_uni(&mut sender, &msg).await {
                             warn!("Failed to send mouse move: {}", e);
                             active = false;
@@ -137,6 +178,27 @@ async fn handle_server_connection(connection: quinn::Connection) -> Result<()> {
                         last_y = my;
                     }
 
+                    // Mouse button changes
+                    if buttons != last_buttons {
+                        for bit in 0..3u8 {
+                            let was = (last_buttons >> bit) & 1 != 0;
+                            let now = (buttons >> bit) & 1 != 0;
+                            if was != now {
+                                let msg = Message::MouseButton { button: bit, pressed: now };
+                                send_message_uni(&mut sender, &msg).await.ok();
+                            }
+                        }
+                        last_buttons = buttons;
+                    }
+
+                    // Keyboard events
+                    for key_msg in key_events {
+                        send_message_uni(&mut sender, &key_msg).await.ok();
+                    }
+
+                    drop(sender);
+
+                    // Edge detection to switch back
                     if let Some(dir) = edge::detect_edge(mx, my, sw, sh) {
                         info!("Edge detected while active: {:?} — switching back to local", dir);
                         active = false;
@@ -207,6 +269,41 @@ pub async fn connect(addr: &str) -> Result<()> {
     let mut cursor_x: i32 = my_w as i32 / 2;
     let mut cursor_y: i32 = my_h as i32 / 2;
     let mut active = false;
+
+    // Accept clipboard stream (bidirectional, second bi-stream from server)
+    let (clip_send, mut clip_recv) = connection.accept_bi().await?;
+    debug!("Clipboard stream accepted");
+
+    // Spawn clipboard polling task (client → server)
+    let clip_send = Arc::new(Mutex::new(clip_send));
+    let clip_send_clone = clip_send.clone();
+    tokio::spawn(async move {
+        let mut clipboard = crate::clipboard::sync::ClipboardSync::new();
+        let interval = crate::clipboard::sync::ClipboardSync::poll_interval();
+        loop {
+            tokio::time::sleep(interval).await;
+            if let Ok(Some(msg)) = clipboard.poll_change() {
+                let mut sender = clip_send_clone.lock().await;
+                if send_message(&mut sender, &msg).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // Spawn clipboard receive task (server → client)
+    tokio::spawn(async move {
+        let mut clipboard = crate::clipboard::sync::ClipboardSync::new();
+        loop {
+            match recv_message(&mut clip_recv).await {
+                Ok(Some(Message::ClipboardUpdate { content })) => {
+                    clipboard.apply_update(&content).ok();
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+    });
 
     info!("Client ready. Waiting for server to share mouse...");
 

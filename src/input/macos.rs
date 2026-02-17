@@ -46,14 +46,6 @@ impl MacOSCapturer {
 
 #[cfg(target_os = "macos")]
 impl InputCapture for MacOSCapturer {
-    fn start(&mut self, _callback: Box<dyn Fn(Message) + Send>) -> Result<()> {
-        Ok(())
-    }
-
-    fn stop(&mut self) -> Result<()> {
-        Ok(())
-    }
-
     fn mouse_position(&self) -> Result<(i32, i32)> {
         let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
@@ -65,6 +57,31 @@ impl InputCapture for MacOSCapturer {
 
     fn screen_size(&self) -> Result<(u32, u32)> {
         Ok((self.screen_width, self.screen_height))
+    }
+
+    fn mouse_buttons(&self) -> Result<u8> {
+        // CGEventSource button state
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
+        let mut buttons: u8 = 0;
+        if CGEventSource::button_state(CGEventSourceStateID::HIDSystemState, CGMouseButton::Left) {
+            buttons |= 1;
+        }
+        if CGEventSource::button_state(CGEventSourceStateID::HIDSystemState, CGMouseButton::Right) {
+            buttons |= 2;
+        }
+        if CGEventSource::button_state(CGEventSourceStateID::HIDSystemState, CGMouseButton::Center) {
+            buttons |= 4;
+        }
+        let _ = source; // keep source alive
+        Ok(buttons)
+    }
+
+    fn poll_key_events(&mut self) -> Result<Vec<Message>> {
+        // macOS doesn't have a simple keymap query like X11.
+        // Key events will be captured via CGEventTap in a future enhancement.
+        // For now, keyboard forwarding works when macOS is the client (injector).
+        Ok(Vec::new())
     }
 }
 
