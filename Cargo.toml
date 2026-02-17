@@ -1,0 +1,47 @@
+[package]
+name = "nexdesk"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform KVM sharing tool with QUIC transport"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Error handling
+color-eyre = "0.6"
+eyre = "0.6"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Config / serialization
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+directories = "5"
+
+# Hostname
+gethostname = "0.5"
+
+# mDNS (Phase 1)
+mdns-sd = "0.11"
+
+# QUIC transport (Phase 2)
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+ring = "0.17"
+
+# Clipboard (Phase 4b)
+arboard = "3"
+
+# TUI (Phase 6)
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Protocol serialization
+bincode = "1"
