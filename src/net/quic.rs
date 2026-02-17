@@ -71,44 +71,23 @@ async fn handle_server_connection(connection: quinn::Connection) -> Result<()> {
         }
     }
 
-    // Heartbeat loop
-    let mut interval = time::interval(Duration::from_secs(5));
+    // Message loop: respond to heartbeats, handle other messages
     loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_millis() as u64;
-                let hb = Message::Heartbeat { timestamp: ts };
-                if let Err(e) = send_message(&mut control_send, &hb).await {
-                    warn!("Failed to send heartbeat: {}", e);
-                    break;
-                }
+        match recv_message(&mut control_recv).await {
+            Ok(Some(Message::Heartbeat { timestamp })) => {
+                let ack = Message::HeartbeatAck { timestamp };
+                send_message(&mut control_send, &ack).await?;
             }
-            msg = recv_message(&mut control_recv) => {
-                match msg {
-                    Ok(Some(Message::HeartbeatAck { timestamp })) => {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)?
-                            .as_millis() as u64;
-                        debug!("Heartbeat RTT: {}ms", now.saturating_sub(timestamp));
-                    }
-                    Ok(Some(Message::Heartbeat { timestamp })) => {
-                        let ack = Message::HeartbeatAck { timestamp };
-                        send_message(&mut control_send, &ack).await?;
-                    }
-                    Ok(Some(other)) => {
-                        debug!("Received message: {:?}", other);
-                    }
-                    Ok(None) => {
-                        info!("Peer {} disconnected", remote);
-                        break;
-                    }
-                    Err(e) => {
-                        warn!("Error reading from {}: {}", remote, e);
-                        break;
-                    }
-                }
+            Ok(Some(other)) => {
+                debug!("Received message: {:?}", other);
+            }
+            Ok(None) => {
+                info!("Peer {} disconnected", remote);
+                break;
+            }
+            Err(e) => {
+                warn!("Error reading from {}: {}", remote, e);
+                break;
             }
         }
     }
@@ -183,9 +162,25 @@ pub async fn ping(addr: &str) -> Result<()> {
     info!("Connecting to {}...", addr);
     let connection = connect_with_retry(&endpoint, addr).await?;
 
-    info!("Connected. Sending pings...\n");
+    // Accept the server's control stream and do the handshake
+    let (mut send, mut recv) = connection.accept_bi().await?;
 
-    let (mut send, mut recv) = connection.open_bi().await?;
+    let hello = recv_message(&mut recv).await?;
+    match hello {
+        Some(Message::Hello { version, hostname, screen }) => {
+            info!(
+                "Server: {} (v{}, screen: {}x{})",
+                hostname, version, screen.width, screen.height
+            );
+            let ack = Message::HelloAck { accepted: true };
+            send_message(&mut send, &ack).await?;
+        }
+        other => {
+            return Err(eyre!("Expected Hello, got: {:?}", other));
+        }
+    }
+
+    info!("Sending pings...\n");
 
     for seq in 0..10 {
         let ts = std::time::SystemTime::now()
