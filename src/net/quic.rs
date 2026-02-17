@@ -164,6 +164,29 @@ async fn handle_server_connection(
         }
     });
 
+    // Try layer-shell capture first (wlroots compositors only)
+    #[cfg(target_os = "linux")]
+    let layer_shell = crate::input::wayland_layer_shell::try_create(
+        trigger_edge.unwrap_or(crate::net::protocol::Direction::Right),
+    ).ok().flatten();
+    #[cfg(not(target_os = "linux"))]
+    let layer_shell: Option<(
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        tokio::sync::mpsc::UnboundedSender<()>,
+        u32, u32,
+    )> = None;
+
+    let (mut capture_rx, capture_tx, use_layer_shell) = match layer_shell {
+        Some((rx, tx, _sw, _sh)) => {
+            info!("Using layer-shell capture (zero-latency edge detection)");
+            (Some(rx), Some(tx), true)
+        }
+        None => {
+            info!("Using evdev polling capture");
+            (None, None, false)
+        }
+    };
+
     // Input polling + edge detection + forwarding
     let capturer = Arc::new(std::sync::Mutex::new(capturer));
     let mut transition = ServerTransition::new(trigger_edge, peer_screen);
@@ -176,7 +199,8 @@ async fn handle_server_connection(
 
     loop {
         tokio::select! {
-            _ = poll_interval.tick() => {
+            // Branch: evdev polling (disabled when layer-shell is active)
+            _ = poll_interval.tick(), if !use_layer_shell => {
                 // Query input state while holding lock briefly.
                 // poll_key_events() is called first because on Wayland (evdev)
                 // it drains pending events and updates the cursor position.
@@ -224,6 +248,80 @@ async fn handle_server_connection(
                     }
                 }
             }
+            // Branch: Layer-shell events (only when layer-shell is active)
+            Some(event) = async {
+                match &mut capture_rx {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if use_layer_shell => {
+                use crate::input::wayland_layer_shell::{LayerShellEvent, LayerShellCommand};
+                match event {
+                    LayerShellEvent::EdgeEnter { direction } => {
+                        let messages = transition.activate_instant(direction);
+                        info!("Layer-shell edge enter ({:?}) — switching to remote", direction);
+                        let mut sender = input_send.lock().await;
+                        for msg in messages {
+                            send_message_uni(&mut sender, &msg).await.ok();
+                        }
+                    }
+                    LayerShellEvent::MouseMove { dx, dy } => {
+                        if transition.is_active() {
+                            let msg = Message::MouseMove { x: dx as i32, y: dy as i32 };
+                            let mut sender = input_send.lock().await;
+                            if let Err(e) = send_message_uni(&mut sender, &msg).await {
+                                warn!("Failed to send mouse move: {}", e);
+                                transition.deactivate();
+                                if let Some(ref tx) = capture_tx {
+                                    tx.send(LayerShellCommand::Release).ok();
+                                }
+                            }
+                        }
+                    }
+                    LayerShellEvent::MouseButton { button, pressed } => {
+                        if transition.is_active() {
+                            // Map evdev button codes to protocol button IDs
+                            // evdev: BTN_LEFT=0x110, BTN_RIGHT=0x111, BTN_MIDDLE=0x112
+                            let btn_id = match button {
+                                0x110 => 0u8, // left
+                                0x111 => 1,   // right
+                                0x112 => 2,   // middle
+                                _ => button as u8,
+                            };
+                            let msg = Message::MouseButton { button: btn_id, pressed };
+                            let mut sender = input_send.lock().await;
+                            send_message_uni(&mut sender, &msg).await.ok();
+                        }
+                    }
+                    LayerShellEvent::MouseScroll { dx, dy } => {
+                        if transition.is_active() {
+                            let msg = Message::MouseScroll { dx: dx as i32, dy: dy as i32 };
+                            let mut sender = input_send.lock().await;
+                            send_message_uni(&mut sender, &msg).await.ok();
+                        }
+                    }
+                    LayerShellEvent::KeyEvent { keycode, pressed } => {
+                        if transition.is_active() {
+                            transition.update_key(keycode, pressed);
+                            if transition.is_escape_combo() {
+                                warn!("Safety escape (Ctrl+Alt+Escape) — releasing layer-shell grab");
+                                transition.deactivate();
+                                if let Some(ref tx) = capture_tx {
+                                    tx.send(LayerShellCommand::Release).ok();
+                                }
+                            } else {
+                                let msg = Message::KeyEvent { keycode, pressed, modifiers: 0 };
+                                let mut sender = input_send.lock().await;
+                                send_message_uni(&mut sender, &msg).await.ok();
+                            }
+                        }
+                    }
+                    LayerShellEvent::KeyModifiers { .. } => {
+                        // Modifier state is tracked via KeyEvent; modifiers event is informational
+                    }
+                }
+            }
+            // Branch: Control stream messages
             msg = recv_message(&mut control_recv) => {
                 match msg {
                     Ok(Some(Message::Heartbeat { timestamp })) => {
@@ -233,7 +331,15 @@ async fn handle_server_connection(
                     Ok(Some(Message::SwitchScreen { direction })) => {
                         info!("Client requested switch back: {:?}", direction);
                         transition.on_switch_back();
-                        capturer.lock().unwrap().set_grab(false).ok();
+                        if use_layer_shell {
+                            #[cfg(target_os = "linux")]
+                            if let Some(ref tx) = capture_tx {
+                                use crate::input::wayland_layer_shell::LayerShellCommand;
+                                tx.send(LayerShellCommand::Release).ok();
+                            }
+                        } else {
+                            capturer.lock().unwrap().set_grab(false).ok();
+                        }
                     }
                     Ok(Some(other)) => {
                         debug!("Received message: {:?}", other);
@@ -253,7 +359,15 @@ async fn handle_server_connection(
 
     // Always release grab when connection ends (client crash, disconnect, etc.)
     info!("Connection ended, releasing input grab");
-    capturer.lock().unwrap().set_grab(false).ok();
+    if use_layer_shell {
+        #[cfg(target_os = "linux")]
+        if let Some(ref tx) = capture_tx {
+            use crate::input::wayland_layer_shell::LayerShellCommand;
+            tx.send(LayerShellCommand::Shutdown).ok();
+        }
+    } else {
+        capturer.lock().unwrap().set_grab(false).ok();
+    }
 
     Ok(())
 }

@@ -95,13 +95,46 @@ impl ServerTransition {
         }
     }
 
-    fn is_escape_combo(&self) -> bool {
+    pub fn is_escape_combo(&self) -> bool {
         let has_ctrl = self.pressed_keys.contains(&KEY_LEFTCTRL)
             || self.pressed_keys.contains(&KEY_RIGHTCTRL);
         let has_alt = self.pressed_keys.contains(&KEY_LEFTALT)
             || self.pressed_keys.contains(&KEY_RIGHTALT);
         let has_esc = self.pressed_keys.contains(&KEY_ESC);
         has_ctrl && has_alt && has_esc
+    }
+
+    /// Activate immediately (layer-shell: edge detection is instant, no dwell needed).
+    pub fn activate_instant(&mut self, direction: Direction) -> Vec<Message> {
+        self.active = true;
+        self.last_buttons = 0;
+        self.last_x = 0;
+        self.last_y = 0;
+        self.edge_dwell = 0;
+        self.edge_cooldown = 0;
+
+        let pw = self.peer_screen.width as i32;
+        let ph = self.peer_screen.height as i32;
+        let (rx, ry) = match direction {
+            Direction::Right => (INSET, ph / 2),
+            Direction::Left => (pw - 1 - INSET, ph / 2),
+            Direction::Down => (pw / 2, INSET),
+            Direction::Up => (pw / 2, ph - 1 - INSET),
+        };
+
+        vec![
+            Message::SwitchScreen { direction },
+            Message::MouseMove { x: rx, y: ry },
+        ]
+    }
+
+    /// Update key state from a single event (for event-driven mode).
+    pub fn update_key(&mut self, keycode: u32, pressed: bool) {
+        if pressed {
+            self.pressed_keys.insert(keycode);
+        } else {
+            self.pressed_keys.remove(&keycode);
+        }
     }
 
     pub fn poll(
@@ -931,5 +964,102 @@ mod tests {
                 assert!(repeats.is_empty(), "released key should not repeat");
             }
         }
+    }
+
+    // ===== activate_instant Tests =====
+
+    #[test]
+    fn server_activate_instant_right() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        let messages = st.activate_instant(Direction::Right);
+        assert!(st.is_active());
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(messages[0], Message::SwitchScreen { direction: Direction::Right }));
+        if let Message::MouseMove { x, y } = messages[1] {
+            assert_eq!(x, INSET);
+            assert_eq!(y, 1440 / 2); // peer_screen height / 2
+        } else {
+            panic!("Expected MouseMove");
+        }
+    }
+
+    #[test]
+    fn server_activate_instant_left() {
+        let mut st = ServerTransition::new(Some(Direction::Left), peer_screen());
+        let messages = st.activate_instant(Direction::Left);
+        assert!(st.is_active());
+        if let Message::MouseMove { x, y } = messages[1] {
+            assert_eq!(x, 2560 - 1 - INSET);
+            assert_eq!(y, 1440 / 2);
+        } else {
+            panic!("Expected MouseMove");
+        }
+    }
+
+    #[test]
+    fn server_activate_instant_down() {
+        let mut st = ServerTransition::new(Some(Direction::Down), peer_screen());
+        let messages = st.activate_instant(Direction::Down);
+        assert!(st.is_active());
+        if let Message::MouseMove { x, y } = messages[1] {
+            assert_eq!(x, 2560 / 2);
+            assert_eq!(y, INSET);
+        } else {
+            panic!("Expected MouseMove");
+        }
+    }
+
+    #[test]
+    fn server_activate_instant_up() {
+        let mut st = ServerTransition::new(Some(Direction::Up), peer_screen());
+        let messages = st.activate_instant(Direction::Up);
+        assert!(st.is_active());
+        if let Message::MouseMove { x, y } = messages[1] {
+            assert_eq!(x, 2560 / 2);
+            assert_eq!(y, 1440 - 1 - INSET);
+        } else {
+            panic!("Expected MouseMove");
+        }
+    }
+
+    #[test]
+    fn server_activate_instant_resets_state() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        // Simulate some accumulated state
+        st.edge_dwell = 25;
+        st.edge_cooldown = 50;
+        st.last_x = 500;
+        st.last_y = 300;
+        st.last_buttons = 3;
+
+        st.activate_instant(Direction::Right);
+        assert_eq!(st.edge_dwell, 0);
+        assert_eq!(st.edge_cooldown, 0);
+        assert_eq!(st.last_x, 0);
+        assert_eq!(st.last_y, 0);
+        assert_eq!(st.last_buttons, 0);
+    }
+
+    // ===== update_key Tests =====
+
+    #[test]
+    fn server_update_key_tracks_state() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        st.update_key(30, true); // KEY_A pressed
+        assert!(st.pressed_keys.contains(&30));
+
+        st.update_key(30, false); // KEY_A released
+        assert!(!st.pressed_keys.contains(&30));
+    }
+
+    #[test]
+    fn server_update_key_escape_combo() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        st.update_key(KEY_LEFTCTRL, true);
+        st.update_key(KEY_LEFTALT, true);
+        assert!(!st.is_escape_combo());
+
+        st.update_key(KEY_ESC, true);
+        assert!(st.is_escape_combo());
     }
 }
