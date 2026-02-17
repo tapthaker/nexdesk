@@ -31,6 +31,8 @@ struct PointerDevice {
     last_abs_y: Option<i32>,
     /// Whether a finger is currently touching the pad
     touching: bool,
+    /// Number of fingers on the touchpad (1 = move, 2 = scroll)
+    finger_count: u32,
 }
 
 /// Find pointer devices: mice (REL_X/REL_Y) and touchpads (ABS_X/ABS_Y + BTN_TOUCH).
@@ -133,6 +135,9 @@ pub struct WaylandCapturer {
     screen_height: u32,
     pressed_keys: HashSet<u32>,
     buttons: u8,
+    /// Accumulated scroll deltas (pixels) since last poll
+    scroll_acc_x: f64,
+    scroll_acc_y: f64,
 }
 
 impl WaylandCapturer {
@@ -154,6 +159,7 @@ impl WaylandCapturer {
                 last_abs_x: None,
                 last_abs_y: None,
                 touching: false,
+                finger_count: 0,
             });
         }
 
@@ -174,6 +180,8 @@ impl WaylandCapturer {
             screen_height,
             pressed_keys: HashSet::new(),
             buttons: 0,
+            scroll_acc_x: 0.0,
+            scroll_acc_y: 0.0,
         })
     }
 
@@ -181,6 +189,12 @@ impl WaylandCapturer {
     /// Slightly below compositor speed so edge detection triggers
     /// close to when the real cursor reaches the edge.
     const TOUCHPAD_SPEED: f64 = 1.2;
+
+    /// Pixels per scroll-wheel notch for REL_WHEEL/REL_HWHEEL events.
+    const WHEEL_PIXELS: f64 = 15.0;
+
+    /// Touchpad scroll sensitivity (fraction of screen per full-pad swipe).
+    const TOUCHPAD_SCROLL_SPEED: f64 = 0.8;
 
     /// Process all pending events from all devices.
     fn drain_events(&mut self) {
@@ -204,6 +218,14 @@ impl WaylandCapturer {
                                         RelativeAxisType::REL_Y => {
                                             self.cursor_y += val;
                                         }
+                                        RelativeAxisType::REL_WHEEL => {
+                                            // Vertical scroll: positive = up
+                                            self.scroll_acc_y += val as f64 * Self::WHEEL_PIXELS;
+                                        }
+                                        RelativeAxisType::REL_HWHEEL => {
+                                            // Horizontal scroll: positive = right
+                                            self.scroll_acc_x += val as f64 * Self::WHEEL_PIXELS;
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -214,22 +236,46 @@ impl WaylandCapturer {
                                             continue;
                                         }
                                         let val = event.value();
-                                        match axis {
-                                            AbsoluteAxisType::ABS_X => {
-                                                if let Some(prev) = pdev.last_abs_x {
-                                                    let delta = (val - prev) as f64 / abs_x_range * sw * Self::TOUCHPAD_SPEED;
-                                                    self.cursor_x += delta as i32;
+
+                                        if pdev.finger_count >= 2 {
+                                            // Two-finger scroll mode: ABS deltas → scroll
+                                            match axis {
+                                                AbsoluteAxisType::ABS_X => {
+                                                    if let Some(prev) = pdev.last_abs_x {
+                                                        let delta = (val - prev) as f64 / abs_x_range * sw * Self::TOUCHPAD_SCROLL_SPEED;
+                                                        self.scroll_acc_x += delta;
+                                                    }
+                                                    pdev.last_abs_x = Some(val);
                                                 }
-                                                pdev.last_abs_x = Some(val);
-                                            }
-                                            AbsoluteAxisType::ABS_Y => {
-                                                if let Some(prev) = pdev.last_abs_y {
-                                                    let delta = (val - prev) as f64 / abs_y_range * sh * Self::TOUCHPAD_SPEED;
-                                                    self.cursor_y += delta as i32;
+                                                AbsoluteAxisType::ABS_Y => {
+                                                    if let Some(prev) = pdev.last_abs_y {
+                                                        let delta = (val - prev) as f64 / abs_y_range * sh * Self::TOUCHPAD_SCROLL_SPEED;
+                                                        // Negate: finger moving down → content scrolls up (natural scrolling)
+                                                        self.scroll_acc_y -= delta;
+                                                    }
+                                                    pdev.last_abs_y = Some(val);
                                                 }
-                                                pdev.last_abs_y = Some(val);
+                                                _ => {}
                                             }
-                                            _ => {}
+                                        } else {
+                                            // Single-finger cursor movement
+                                            match axis {
+                                                AbsoluteAxisType::ABS_X => {
+                                                    if let Some(prev) = pdev.last_abs_x {
+                                                        let delta = (val - prev) as f64 / abs_x_range * sw * Self::TOUCHPAD_SPEED;
+                                                        self.cursor_x += delta as i32;
+                                                    }
+                                                    pdev.last_abs_x = Some(val);
+                                                }
+                                                AbsoluteAxisType::ABS_Y => {
+                                                    if let Some(prev) = pdev.last_abs_y {
+                                                        let delta = (val - prev) as f64 / abs_y_range * sh * Self::TOUCHPAD_SPEED;
+                                                        self.cursor_y += delta as i32;
+                                                    }
+                                                    pdev.last_abs_y = Some(val);
+                                                }
+                                                _ => {}
+                                            }
                                         }
                                     }
                                 }
@@ -244,7 +290,34 @@ impl WaylandCapturer {
                                             if !pressed {
                                                 pdev.last_abs_x = None;
                                                 pdev.last_abs_y = None;
+                                                pdev.finger_count = 0;
                                             }
+                                        }
+                                        Key::BTN_TOOL_FINGER => {
+                                            // Single finger on pad
+                                            if pressed {
+                                                pdev.finger_count = 1;
+                                            }
+                                        }
+                                        Key::BTN_TOOL_DOUBLETAP => {
+                                            // Two fingers on pad — switch to scroll mode
+                                            if pressed {
+                                                pdev.finger_count = 2;
+                                            } else if pdev.finger_count == 2 {
+                                                pdev.finger_count = 1;
+                                            }
+                                            // Reset position tracking to avoid jump
+                                            pdev.last_abs_x = None;
+                                            pdev.last_abs_y = None;
+                                        }
+                                        Key::BTN_TOOL_TRIPLETAP => {
+                                            if pressed {
+                                                pdev.finger_count = 3;
+                                            } else if pdev.finger_count == 3 {
+                                                pdev.finger_count = 1;
+                                            }
+                                            pdev.last_abs_x = None;
+                                            pdev.last_abs_y = None;
                                         }
                                         Key::BTN_LEFT => {
                                             if pressed { self.buttons |= 1; }
@@ -314,7 +387,7 @@ impl InputCapture for WaylandCapturer {
     }
 
     fn poll_key_events(&mut self) -> Result<Vec<Message>> {
-        // Drain all pending events first — this updates cursor position, buttons, and keys
+        // Drain all pending events first — this updates cursor position, buttons, keys, and scroll
         let old_keys: HashSet<u32> = self.pressed_keys.clone();
         self.drain_events();
 
@@ -337,6 +410,15 @@ impl InputCapture for WaylandCapturer {
                     modifiers: 0,
                 });
             }
+        }
+
+        // Emit accumulated scroll events
+        let sx = self.scroll_acc_x as i32;
+        let sy = self.scroll_acc_y as i32;
+        if sx != 0 || sy != 0 {
+            events.push(Message::MouseScroll { dx: sx, dy: sy });
+            self.scroll_acc_x = 0.0;
+            self.scroll_acc_y = 0.0;
         }
 
         Ok(events)

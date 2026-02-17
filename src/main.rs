@@ -71,8 +71,14 @@ async fn main() -> Result<()> {
                 let btns = cap.mouse_buttons()?;
                 print!("\rMouse: ({:5}, {:5})  buttons: {:03b}", x, y, btns);
                 for k in &keys {
-                    if let net::protocol::Message::KeyEvent { keycode, pressed, .. } = k {
-                        print!("  key:{} {}", keycode, if *pressed { "dn" } else { "up" });
+                    match k {
+                        net::protocol::Message::KeyEvent { keycode, pressed, .. } => {
+                            print!("  key:{} {}", keycode, if *pressed { "dn" } else { "up" });
+                        }
+                        net::protocol::Message::MouseScroll { dx, dy } => {
+                            print!("  scroll:({}, {})", dx, dy);
+                        }
+                        _ => {}
                     }
                 }
                 std::io::stdout().flush().ok();
