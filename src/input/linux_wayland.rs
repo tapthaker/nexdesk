@@ -3,7 +3,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
 use color_eyre::eyre::{Result, WrapErr, eyre};
-use evdev::{Device, InputEventKind, Key, RelativeAxisType};
+use evdev::{AbsoluteAxisType, Device, InputEventKind, Key, RelativeAxisType};
 use tracing::{debug, warn};
 use x11rb::connection::Connection;
 
@@ -11,9 +11,27 @@ use crate::input::capture::InputCapture;
 use crate::input::inject::InputInjector;
 use crate::net::protocol::Message;
 
-/// Find pointer devices (devices that have REL_X and REL_Y).
-fn find_pointer_devices() -> Result<Vec<PathBuf>> {
-    let mut devices = Vec::new();
+#[derive(Debug)]
+enum PointerKind {
+    /// Mouse — uses REL_X/REL_Y relative deltas
+    Relative,
+    /// Touchpad/trackpad — uses ABS_X/ABS_Y absolute coordinates
+    Absolute {
+        abs_x_min: i32,
+        abs_x_max: i32,
+        abs_y_min: i32,
+        abs_y_max: i32,
+    },
+}
+
+struct PointerDevice {
+    device: Device,
+    kind: PointerKind,
+}
+
+/// Find pointer devices: mice (REL_X/REL_Y) and touchpads (ABS_X/ABS_Y + BTN_TOUCH).
+fn find_pointer_devices() -> Result<Vec<(PathBuf, PointerKind)>> {
+    let mut found = Vec::new();
     let entries: Vec<_> = std::fs::read_dir("/dev/input")
         .wrap_err("Cannot read /dev/input")?
         .filter_map(|e| e.ok())
@@ -24,25 +42,62 @@ fn find_pointer_devices() -> Result<Vec<PathBuf>> {
         if !path.to_string_lossy().contains("event") {
             continue;
         }
-        if let Ok(device) = Device::open(&path) {
-            let supported = device.supported_relative_axes();
-            if let Some(axes) = supported {
-                if axes.contains(RelativeAxisType::REL_X) && axes.contains(RelativeAxisType::REL_Y) {
-                    debug!("Found pointer device: {} ({})",
-                           device.name().unwrap_or("unknown"), path.display());
-                    devices.push(path);
+        let device = match Device::open(&path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let name = device.name().unwrap_or("unknown");
+
+        // Check for relative-axis mouse
+        if let Some(axes) = device.supported_relative_axes() {
+            if axes.contains(RelativeAxisType::REL_X) && axes.contains(RelativeAxisType::REL_Y) {
+                debug!("Found relative pointer: {} ({})", name, path.display());
+                found.push((path, PointerKind::Relative));
+                continue;
+            }
+        }
+
+        // Check for absolute-axis touchpad (must have BTN_TOUCH to distinguish
+        // from tablets/joysticks, or have "trackpad"/"touchpad" in name)
+        if let Some(axes) = device.supported_absolute_axes() {
+            if axes.contains(AbsoluteAxisType::ABS_X) && axes.contains(AbsoluteAxisType::ABS_Y) {
+                let has_btn_touch = device.supported_keys()
+                    .map_or(false, |k| k.contains(Key::BTN_TOUCH));
+                let name_lower = name.to_lowercase();
+                let name_match = name_lower.contains("trackpad") || name_lower.contains("touchpad");
+
+                if has_btn_touch || name_match {
+                    let abs_info_x = device.get_abs_state().map(|s| {
+                        s.get(AbsoluteAxisType::ABS_X.0 as usize).cloned()
+                    }).ok().flatten();
+                    let abs_info_y = device.get_abs_state().map(|s| {
+                        s.get(AbsoluteAxisType::ABS_Y.0 as usize).cloned()
+                    }).ok().flatten();
+
+                    if let (Some(ax), Some(ay)) = (abs_info_x, abs_info_y) {
+                        debug!("Found absolute pointer: {} ({}) x:[{}..{}] y:[{}..{}]",
+                               name, path.display(), ax.minimum, ax.maximum, ay.minimum, ay.maximum);
+                        found.push((path, PointerKind::Absolute {
+                            abs_x_min: ax.minimum,
+                            abs_x_max: ax.maximum,
+                            abs_y_min: ay.minimum,
+                            abs_y_max: ay.maximum,
+                        }));
+                        continue;
+                    }
                 }
             }
         }
     }
 
-    if devices.is_empty() {
+    if found.is_empty() {
         return Err(eyre!(
             "No pointer devices found. Make sure user is in the 'input' group: sudo usermod -aG input $USER"
         ));
     }
 
-    Ok(devices)
+    Ok(found)
 }
 
 /// Get screen size from X11 (XWayland provides correct screen dimensions)
@@ -63,9 +118,9 @@ fn get_screen_size() -> (u32, u32) {
 }
 
 /// Evdev-based input capturer for Wayland.
-/// Reads raw mouse events from /dev/input/ and accumulates position.
+/// Reads raw mouse/touchpad events from /dev/input/ and tracks position.
 pub struct WaylandCapturer {
-    devices: Vec<Device>,
+    devices: Vec<PointerDevice>,
     cursor_x: i32,
     cursor_y: i32,
     screen_width: u32,
@@ -76,9 +131,9 @@ pub struct WaylandCapturer {
 
 impl WaylandCapturer {
     pub fn new() -> Result<Self> {
-        let paths = find_pointer_devices()?;
+        let found = find_pointer_devices()?;
         let mut devices = Vec::new();
-        for path in &paths {
+        for (path, kind) in &found {
             let device = Device::open(path)
                 .wrap_err_with(|| format!("Failed to open {}", path.display()))?;
             // Set non-blocking via fcntl so poll doesn't block the async runtime
@@ -87,7 +142,19 @@ impl WaylandCapturer {
                 let flags = libc::fcntl(fd, libc::F_GETFL);
                 libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
             }
-            devices.push(device);
+            devices.push(PointerDevice {
+                device,
+                kind: match kind {
+                    PointerKind::Relative => PointerKind::Relative,
+                    PointerKind::Absolute { abs_x_min, abs_x_max, abs_y_min, abs_y_max } =>
+                        PointerKind::Absolute {
+                            abs_x_min: *abs_x_min,
+                            abs_x_max: *abs_x_max,
+                            abs_y_min: *abs_y_min,
+                            abs_y_max: *abs_y_max,
+                        },
+                },
+            });
         }
 
         let (screen_width, screen_height) = get_screen_size();
@@ -109,11 +176,21 @@ impl WaylandCapturer {
         })
     }
 
+    /// Map an absolute axis value to screen coordinates.
+    fn map_abs(val: i32, abs_min: i32, abs_max: i32, screen_max: u32) -> i32 {
+        let range = (abs_max - abs_min).max(1) as f64;
+        let normalized = (val - abs_min) as f64 / range;
+        (normalized * screen_max as f64) as i32
+    }
+
     /// Process all pending events from all devices.
     fn drain_events(&mut self) {
-        for device in &mut self.devices {
+        let sw = self.screen_width;
+        let sh = self.screen_height;
+
+        for pdev in &mut self.devices {
             loop {
-                match device.fetch_events() {
+                match pdev.device.fetch_events() {
                     Ok(events) => {
                         let mut got_any = false;
                         for event in events {
@@ -131,13 +208,26 @@ impl WaylandCapturer {
                                         _ => {}
                                     }
                                 }
+                                InputEventKind::AbsAxis(axis) => {
+                                    if let PointerKind::Absolute { abs_x_min, abs_x_max, abs_y_min, abs_y_max } = &pdev.kind {
+                                        match axis {
+                                            AbsoluteAxisType::ABS_X => {
+                                                self.cursor_x = Self::map_abs(event.value(), *abs_x_min, *abs_x_max, sw);
+                                            }
+                                            AbsoluteAxisType::ABS_Y => {
+                                                self.cursor_y = Self::map_abs(event.value(), *abs_y_min, *abs_y_max, sh);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
                                 InputEventKind::Key(key) => {
                                     let code = key.code() as u32;
                                     let pressed = event.value() != 0;
 
-                                    // Track mouse buttons
+                                    // Track mouse buttons (including touchpad taps)
                                     match key {
-                                        Key::BTN_LEFT => {
+                                        Key::BTN_LEFT | Key::BTN_TOUCH => {
                                             if pressed { self.buttons |= 1; }
                                             else { self.buttons &= !1; }
                                         }

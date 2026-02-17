@@ -53,6 +53,26 @@ async fn main() -> Result<()> {
         Command::Setup => {
             setup::run_setup().await?;
         }
+        Command::TestInput => {
+            use std::io::Write;
+            let mut cap = input::capture::create_capturer()?;
+            let (sw, sh) = cap.screen_size()?;
+            println!("Screen: {}x{}", sw, sh);
+            println!("Move your mouse around. Press Ctrl+C to stop.\n");
+            loop {
+                let keys = cap.poll_key_events()?;
+                let (x, y) = cap.mouse_position()?;
+                let btns = cap.mouse_buttons()?;
+                print!("\rMouse: ({:5}, {:5})  buttons: {:03b}", x, y, btns);
+                for k in &keys {
+                    if let net::protocol::Message::KeyEvent { keycode, pressed, .. } = k {
+                        print!("  key:{} {}", keycode, if *pressed { "dn" } else { "up" });
+                    }
+                }
+                std::io::stdout().flush().ok();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
     }
 
     Ok(())

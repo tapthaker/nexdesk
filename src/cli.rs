@@ -53,4 +53,7 @@ pub enum Command {
 
     /// Launch the TUI setup wizard
     Setup,
+
+    /// Test input capture (prints mouse position for 10 seconds)
+    TestInput,
 }
