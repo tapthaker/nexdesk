@@ -36,8 +36,8 @@ pub enum Command {
         port: u16,
 
         /// Screen edge where the remote machine is located
-        #[arg(short, long, default_value = "right")]
-        edge: Edge,
+        #[arg(short, long)]
+        edge: Option<Edge>,
     },
 
     /// Connect to a server as a client (discovers via mDNS if no address given)

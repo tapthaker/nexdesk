@@ -40,11 +40,35 @@ async fn main() -> Result<()> {
         }
         Command::Serve { port, edge } => {
             input::ensure_accessibility()?;
-            let dir = match edge {
-                cli::Edge::Left => net::protocol::Direction::Left,
-                cli::Edge::Right => net::protocol::Direction::Right,
-                cli::Edge::Up => net::protocol::Direction::Up,
-                cli::Edge::Down => net::protocol::Direction::Down,
+            let dir = if let Some(edge) = edge {
+                match edge {
+                    cli::Edge::Left => net::protocol::Direction::Left,
+                    cli::Edge::Right => net::protocol::Direction::Right,
+                    cli::Edge::Up => net::protocol::Direction::Up,
+                    cli::Edge::Down => net::protocol::Direction::Down,
+                }
+            } else {
+                let cfg = config::NexdeskConfig::load()?;
+                if let Some(ref edge_str) = cfg.switch_edge {
+                    match edge_str.as_str() {
+                        "left" => net::protocol::Direction::Left,
+                        "right" => net::protocol::Direction::Right,
+                        "top" | "up" => net::protocol::Direction::Up,
+                        "bottom" | "down" => net::protocol::Direction::Down,
+                        _ => net::protocol::Direction::Right,
+                    }
+                } else {
+                    let dir = setup::edge_picker::pick_edge()?;
+                    let mut cfg = config::NexdeskConfig::load()?;
+                    cfg.switch_edge = Some(match dir {
+                        net::protocol::Direction::Left => "left",
+                        net::protocol::Direction::Right => "right",
+                        net::protocol::Direction::Up => "top",
+                        net::protocol::Direction::Down => "bottom",
+                    }.to_string());
+                    cfg.save()?;
+                    dir
+                }
             };
             net::quic::serve(port, Some(dir)).await?;
         }

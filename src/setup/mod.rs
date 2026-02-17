@@ -5,6 +5,7 @@ mod network;
 mod screens;
 mod certificates;
 mod service;
+pub mod edge_picker;
 
 use color_eyre::eyre::Result;
 
