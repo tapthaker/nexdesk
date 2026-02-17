@@ -133,6 +133,9 @@ async fn handle_server_connection(connection: quinn::Connection, trigger_edge: O
     let mut last_y: i32 = 0;
     let mut last_buttons: u8 = 0;
     let mut server_edge_cooldown: u32 = 0;
+    /// Consecutive polls at the edge before triggering (~200ms at 2ms poll)
+    let mut edge_dwell: u32 = 0;
+    const EDGE_DWELL_THRESHOLD: u32 = 100;
 
     info!("Server ready. Move mouse to screen edge to start sharing.");
     info!("Screen size: {}x{}", screen_w, screen_h);
@@ -166,11 +169,18 @@ async fn handle_server_connection(connection: quinn::Connection, trigger_edge: O
                 }
 
                 if !active {
+                    let at_edge = edge::detect_edge(clamped_x, clamped_y, sw, sh)
+                        .filter(|d| trigger_edge.map_or(true, |e| std::mem::discriminant(d) == std::mem::discriminant(&e)));
+
                     if server_edge_cooldown > 0 {
                         server_edge_cooldown -= 1;
-                    } else if let Some(dir) = edge::detect_edge(clamped_x, clamped_y, sw, sh)
-                        .filter(|d| trigger_edge.map_or(true, |e| std::mem::discriminant(d) == std::mem::discriminant(&e)))
-                    {
+                        edge_dwell = 0;
+                    } else if let Some(dir) = at_edge {
+                        edge_dwell += 1;
+                        if edge_dwell < EDGE_DWELL_THRESHOLD {
+                            continue;
+                        }
+                        edge_dwell = 0;
                         info!("Edge detected: {:?} — switching to remote", dir);
                         active = true;
                         last_buttons = buttons;
@@ -195,6 +205,9 @@ async fn handle_server_connection(connection: quinn::Connection, trigger_edge: O
                         send_message_uni(&mut sender, &move_msg).await.ok();
                         last_x = mx;
                         last_y = my;
+                    } else {
+                        // Cursor moved away from edge — reset dwell counter
+                        edge_dwell = 0;
                     }
                 } else {
                     let mut sender = input_send.lock().await;

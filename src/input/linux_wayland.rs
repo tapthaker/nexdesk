@@ -122,11 +122,13 @@ fn get_screen_size() -> (u32, u32) {
 }
 
 /// Evdev-based input capturer for Wayland.
-/// Reads raw mouse/touchpad events from /dev/input/ and tracks position.
+/// Tracks cursor position from raw evdev events for edge detection and
+/// forwards deltas to the remote when grabbed (active sharing).
 pub struct WaylandCapturer {
     devices: Vec<PointerDevice>,
     cursor_x: i32,
     cursor_y: i32,
+    grabbed: bool,
     screen_width: u32,
     screen_height: u32,
     pressed_keys: HashSet<u32>,
@@ -167,6 +169,7 @@ impl WaylandCapturer {
             devices,
             cursor_x,
             cursor_y,
+            grabbed: false,
             screen_width,
             screen_height,
             pressed_keys: HashSet::new(),
@@ -175,8 +178,9 @@ impl WaylandCapturer {
     }
 
     /// Touchpad-to-screen speed multiplier.
-    /// A full swipe across the pad moves the cursor this fraction of screen width.
-    const TOUCHPAD_SPEED: f64 = 1.8;
+    /// Slightly below compositor speed so edge detection triggers
+    /// close to when the real cursor reaches the edge.
+    const TOUCHPAD_SPEED: f64 = 1.2;
 
     /// Process all pending events from all devices.
     fn drain_events(&mut self) {
@@ -285,8 +289,6 @@ impl WaylandCapturer {
 
 impl InputCapture for WaylandCapturer {
     fn mouse_position(&self) -> Result<(i32, i32)> {
-        // We use interior mutability pattern through the Mutex in quic.rs
-        // drain_events is called in poll_key_events which is called each poll cycle
         Ok((self.cursor_x, self.cursor_y))
     }
 
@@ -306,6 +308,7 @@ impl InputCapture for WaylandCapturer {
                 pdev.device.ungrab().wrap_err("Failed to ungrab device")?;
             }
         }
+        self.grabbed = grab;
         debug!("Input devices {}", if grab { "grabbed" } else { "ungrabbed" });
         Ok(())
     }
