@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nexdesk — Share your keyboard and mouse across machines</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: #0d1117;
+      color: #c9d1d9;
+      line-height: 1.6;
+    }
+
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .container {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    header {
+      padding: 80px 0 48px;
+      text-align: center;
+    }
+
+    header h1 {
+      font-size: 3rem;
+      color: #f0f6fc;
+      margin-bottom: 12px;
+    }
+
+    header p {
+      font-size: 1.25rem;
+      color: #8b949e;
+    }
+
+    section {
+      padding: 40px 0;
+    }
+
+    section h2 {
+      font-size: 1.5rem;
+      color: #f0f6fc;
+      margin-bottom: 16px;
+      border-bottom: 1px solid #21262d;
+      padding-bottom: 8px;
+    }
+
+    .features {
+      list-style: none;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    @media (max-width: 500px) {
+      .features { grid-template-columns: 1fr; }
+      header h1 { font-size: 2rem; }
+    }
+
+    .features li {
+      background: #161b22;
+      border: 1px solid #21262d;
+      border-radius: 8px;
+      padding: 16px;
+    }
+
+    .features li strong {
+      color: #f0f6fc;
+      display: block;
+      margin-bottom: 4px;
+    }
+
+    pre {
+      background: #161b22;
+      border: 1px solid #21262d;
+      border-radius: 8px;
+      padding: 16px;
+      overflow-x: auto;
+      font-size: 0.9rem;
+      margin: 12px 0;
+    }
+
+    code { color: #79c0ff; }
+
+    .download-btn {
+      display: inline-block;
+      background: #238636;
+      color: #fff;
+      padding: 12px 24px;
+      border-radius: 6px;
+      font-size: 1rem;
+      font-weight: 600;
+      margin-top: 8px;
+    }
+
+    .download-btn:hover {
+      background: #2ea043;
+      text-decoration: none;
+    }
+
+    footer {
+      text-align: center;
+      padding: 48px 0 32px;
+      color: #484f58;
+      font-size: 0.85rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Nexdesk</h1>
+      <p>Share your keyboard and mouse across machines</p>
+    </header>
+
+    <section>
+      <h2>Features</h2>
+      <ul class="features">
+        <li>
+          <strong>Cross-platform</strong>
+          Linux and macOS — move your cursor to the screen edge and keep going.
+        </li>
+        <li>
+          <strong>QUIC transport</strong>
+          Encrypted, low-latency communication powered by Quinn/rustls.
+        </li>
+        <li>
+          <strong>Zero-config discovery</strong>
+          mDNS auto-discovery finds peers on your local network instantly.
+        </li>
+        <li>
+          <strong>TUI setup wizard</strong>
+          Interactive terminal UI for monitor alignment and one-time pairing.
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Install</h2>
+      <p>Download the latest release for your platform:</p>
+      <br>
+      <a class="download-btn" href="https://github.com/tapthaker/nexdesk/releases/latest">Download from GitHub Releases</a>
+      <p style="margin-top: 16px;">Or build from source:</p>
+      <pre><code>git clone https://github.com/tapthaker/nexdesk.git
+cd nexdesk
+cargo build --release</code></pre>
+    </section>
+
+    <section>
+      <h2>Quick start</h2>
+      <p>On the <strong>server</strong> machine (shares keyboard &amp; mouse):</p>
+      <pre><code>nexdesk serve</code></pre>
+      <p>On the <strong>client</strong> machine:</p>
+      <pre><code>nexdesk connect</code></pre>
+      <p>That's it. mDNS discovery handles the rest. A one-time OTP pairing prompt will appear on first connection.</p>
+    </section>
+
+    <footer>
+      <a href="https://github.com/tapthaker/nexdesk">GitHub</a>
+    </footer>
+  </div>
+</body>
+</html>
