@@ -39,6 +39,7 @@ async fn main() -> Result<()> {
             net::quic::ping(&addr).await?;
         }
         Command::Serve { port, edge } => {
+            input::ensure_accessibility()?;
             let dir = match edge {
                 cli::Edge::Left => net::protocol::Direction::Left,
                 cli::Edge::Right => net::protocol::Direction::Right,
@@ -48,6 +49,7 @@ async fn main() -> Result<()> {
             net::quic::serve(port, Some(dir)).await?;
         }
         Command::Connect { addr } => {
+            input::ensure_accessibility()?;
             net::quic::connect(addr.as_deref()).await?;
         }
         Command::Fingerprint => {
@@ -60,6 +62,7 @@ async fn main() -> Result<()> {
             setup::run_setup().await?;
         }
         Command::TestInput => {
+            input::ensure_accessibility()?;
             use std::io::Write;
             let mut cap = input::capture::create_capturer()?;
             let (sw, sh) = cap.screen_size()?;

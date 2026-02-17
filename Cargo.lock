@@ -987,6 +987,7 @@ dependencies = [
  "bincode",
  "clap",
  "color-eyre",
+ "core-foundation",
  "crossterm",
  "directories",
  "evdev",

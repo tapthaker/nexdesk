@@ -101,19 +101,6 @@ impl MacOSInjector {
         let screen_height = CGDisplayPixelsHigh(MAIN_DISPLAY) as u32;
         debug!("macOS injector: screen {}x{}", screen_width, screen_height);
 
-        // Check accessibility permissions (required for CGEvent posting)
-        let trusted = unsafe {
-            extern "C" {
-                fn AXIsProcessTrusted() -> bool;
-            }
-            AXIsProcessTrusted()
-        };
-        if trusted {
-            tracing::info!("Accessibility: granted");
-        } else {
-            tracing::warn!("Accessibility: NOT granted — mouse/keyboard injection will not work! Grant access in System Settings > Privacy & Security > Accessibility");
-        }
-
         Ok(Self {
             screen_width,
             screen_height,
