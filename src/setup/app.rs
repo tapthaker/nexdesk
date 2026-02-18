@@ -191,12 +191,16 @@ pub async fn run() -> Result<()> {
 
             // Title bar
             let role = state.config.role.as_deref();
-            let title = format!(
-                " Nexdesk Setup - Step {}/{}: {} ",
-                state.step.number(role),
-                Step::total_steps(),
-                state.step.title()
-            );
+            let title = if state.step == Step::Done {
+                " Nexdesk Setup - Complete ".to_string()
+            } else {
+                format!(
+                    " Nexdesk Setup - Step {}/{}: {} ",
+                    state.step.number(role),
+                    Step::total_steps(),
+                    state.step.title()
+                )
+            };
             let header = Block::default()
                 .title(title)
                 .borders(Borders::ALL)
