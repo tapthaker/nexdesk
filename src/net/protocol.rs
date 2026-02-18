@@ -33,11 +33,13 @@ pub enum Message {
         hostname: String,
         screen: ScreenLayout,
         fingerprint: String,
+        build_version: Option<String>,
     },
     HelloAck {
         accepted: bool,
         otp: Option<String>,
         screen: Option<ScreenLayout>,
+        build_version: Option<String>,
     },
     PairingResult { success: bool },
 
@@ -68,6 +70,9 @@ pub enum Message {
 
 /// Protocol version.
 pub const PROTOCOL_VERSION: u32 = 3;
+
+/// Build version string burned in at compile time (e.g. "v0.1.2" or "v0.1.2-3-gabcdef").
+pub const BUILD_VERSION: &str = env!("NEXDESK_VERSION");
 
 /// Encode a message to bytes.
 pub fn encode(msg: &Message) -> color_eyre::eyre::Result<Vec<u8>> {

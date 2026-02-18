@@ -33,7 +33,7 @@ pub async fn advertise(port: u16) -> Result<()> {
         [
             ("hostname", hostname.as_str()),
             ("platform", platform),
-            ("version", env!("CARGO_PKG_VERSION")),
+            ("version", crate::net::protocol::BUILD_VERSION),
         ]
         .as_slice(),
     )?;
@@ -154,7 +154,7 @@ pub fn start_advertising(port: u16) -> Result<AdvertiseHandle> {
         [
             ("hostname", hostname.as_str()),
             ("platform", platform),
-            ("version", env!("CARGO_PKG_VERSION")),
+            ("version", crate::net::protocol::BUILD_VERSION),
         ]
         .as_slice(),
     )?;

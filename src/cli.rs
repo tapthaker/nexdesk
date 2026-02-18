@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(name = "nexdesk", version, about = "Cross-platform KVM sharing tool")]
+#[command(name = "nexdesk", version = env!("NEXDESK_VERSION"), about = "Cross-platform KVM sharing tool")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

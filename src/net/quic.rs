@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use tokio::time;
 use tracing::{info, debug, warn, error};
 
-use crate::net::protocol::{self, Message, PROTOCOL_VERSION, ScreenLayout};
+use crate::net::protocol::{self, Message, PROTOCOL_VERSION, BUILD_VERSION, ScreenLayout};
 use crate::net::tls;
 use crate::net::discovery;
 use crate::net::transition::{ServerTransition, ServerOutput, ClientTransition, ClientOutput};
@@ -79,12 +79,13 @@ async fn handle_server_connection(
             height: screen_h,
         },
         fingerprint: server_fingerprint.to_string(),
+        build_version: Some(BUILD_VERSION.to_string()),
     };
     send_message(&mut control_send, &hello).await?;
 
     // Receive HelloAck with optional OTP
     let peer_screen = match recv_message(&mut control_recv).await? {
-        Some(Message::HelloAck { accepted: true, otp, screen }) => {
+        Some(Message::HelloAck { accepted: true, otp, screen, build_version }) => {
             // Validate OTP if provided
             match otp {
                 Some(code) => {
@@ -105,6 +106,11 @@ async fn handle_server_connection(
                     let result = Message::PairingResult { success: true };
                     send_message(&mut control_send, &result).await?;
                 }
+            }
+            let peer_version = build_version.as_deref().unwrap_or("unknown");
+            info!("Peer {} build version: {}", remote, peer_version);
+            if peer_version != BUILD_VERSION {
+                warn!("Version mismatch: server={}, client={}", BUILD_VERSION, peer_version);
             }
             screen.unwrap_or(ScreenLayout { width: 1920, height: 1080 })
         }
@@ -462,11 +468,15 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     let (mut control_send, mut control_recv) = connection.accept_bi().await?;
 
     let mut server_screen = match recv_message(&mut control_recv).await? {
-        Some(Message::Hello { version, hostname, screen, fingerprint }) => {
+        Some(Message::Hello { version, hostname, screen, fingerprint, build_version }) => {
+            let server_ver = build_version.as_deref().unwrap_or("unknown");
             info!(
-                "Server: {} (v{}, screen: {}x{})",
-                hostname, version, screen.width, screen.height
+                "Server: {} (proto v{}, build {}, screen: {}x{})",
+                hostname, version, server_ver, screen.width, screen.height
             );
+            if server_ver != BUILD_VERSION {
+                warn!("Version mismatch: server={}, client={}", server_ver, BUILD_VERSION);
+            }
 
             // Check if we already trust this server's fingerprint
             let otp = if tls::is_fingerprint_trusted(&fingerprint) {
@@ -489,6 +499,7 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                 accepted: true,
                 otp: otp.clone(),
                 screen: Some(ScreenLayout { width: my_w, height: my_h }),
+                build_version: Some(BUILD_VERSION.to_string()),
             };
             send_message(&mut control_send, &ack).await?;
 
@@ -710,10 +721,11 @@ pub async fn ping(addr: &str) -> Result<()> {
 
     let hello = recv_message(&mut recv).await?;
     match hello {
-        Some(Message::Hello { version, hostname, screen, fingerprint }) => {
+        Some(Message::Hello { version, hostname, screen, fingerprint, build_version }) => {
+            let server_ver = build_version.as_deref().unwrap_or("unknown");
             info!(
-                "Server: {} (v{}, screen: {}x{})",
-                hostname, version, screen.width, screen.height
+                "Server: {} (proto v{}, build {}, screen: {}x{})",
+                hostname, version, server_ver, screen.width, screen.height
             );
 
             // Check if we already trust this server
@@ -731,7 +743,7 @@ pub async fn ping(addr: &str) -> Result<()> {
                 Some(code)
             };
 
-            let ack = Message::HelloAck { accepted: true, otp: otp.clone(), screen: None };
+            let ack = Message::HelloAck { accepted: true, otp: otp.clone(), screen: None, build_version: Some(BUILD_VERSION.to_string()) };
             send_message(&mut send, &ack).await?;
 
             // Wait for PairingResult
