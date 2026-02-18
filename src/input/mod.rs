@@ -35,10 +35,24 @@ pub mod wayland_layer_shell {
 #[cfg(target_os = "macos")]
 pub mod macos;
 
-/// Check (and on macOS, prompt for) required input permissions.
-/// On macOS this triggers the Accessibility permissions dialog if not already granted.
-/// On other platforms this is a no-op.
-pub fn ensure_accessibility() -> color_eyre::eyre::Result<()> {
+/// Check if accessibility permission is currently granted (no prompt).
+/// Always returns true on non-macOS platforms.
+pub fn is_accessibility_granted() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn AXIsProcessTrusted() -> bool;
+        }
+        unsafe { AXIsProcessTrusted() }
+    }
+    #[cfg(not(target_os = "macos"))]
+    true
+}
+
+/// Request accessibility permission, showing the system prompt dialog on macOS.
+/// Returns whether permission is currently granted.
+/// Always returns true on non-macOS platforms.
+pub fn request_accessibility() -> bool {
     #[cfg(target_os = "macos")]
     {
         use core_foundation::base::TCFType;
@@ -56,23 +70,27 @@ pub fn ensure_accessibility() -> color_eyre::eyre::Result<()> {
         let value = CFBoolean::true_value();
         let options = CFDictionary::from_CFType_pairs(&[(key, value)]);
 
-        let trusted = unsafe {
-            AXIsProcessTrustedWithOptions(options.as_CFTypeRef())
-        };
-
-        if trusted {
-            tracing::info!("Accessibility: granted");
-        } else {
-            tracing::warn!(
-                "Accessibility permission required. A system dialog should have appeared. \
-                 Grant access in System Settings > Privacy & Security > Accessibility, \
-                 then restart nexdesk."
-            );
-            return Err(color_eyre::eyre::eyre!(
-                "Accessibility permission not granted. Grant access and restart."
-            ));
-        }
+        unsafe { AXIsProcessTrustedWithOptions(options.as_CFTypeRef()) }
     }
+    #[cfg(not(target_os = "macos"))]
+    true
+}
 
-    Ok(())
+/// Check (and on macOS, prompt for) required input permissions.
+/// On macOS this triggers the Accessibility permissions dialog if not already granted.
+/// On other platforms this is a no-op.
+pub fn ensure_accessibility() -> color_eyre::eyre::Result<()> {
+    if request_accessibility() {
+        tracing::info!("Accessibility: granted");
+        Ok(())
+    } else {
+        tracing::warn!(
+            "Accessibility permission required. A system dialog should have appeared. \
+             Grant access in System Settings > Privacy & Security > Accessibility, \
+             then restart nexdesk."
+        );
+        Err(color_eyre::eyre::eyre!(
+            "Accessibility permission not granted. Grant access and restart."
+        ))
+    }
 }

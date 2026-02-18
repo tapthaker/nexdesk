@@ -23,9 +23,21 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SetupState) {
                 Style::default().fg(Color::Yellow),
             )));
         } else {
-            lines.push(Line::from("  Discovered peers:"));
-            for peer in &state.discovered_peers {
-                lines.push(Line::from(format!("    - {}", peer)));
+            lines.push(Line::from("  Select a peer (Up/Down to choose):"));
+            for (i, peer) in state.discovered_peers.iter().enumerate() {
+                let label = format!(
+                    "  {} {} ({}) at {}",
+                    if i == state.peer_selection { "▸" } else { " " },
+                    peer.name,
+                    peer.platform,
+                    peer.addr,
+                );
+                let style = if i == state.peer_selection {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(label, style)));
             }
         }
     } else {

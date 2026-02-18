@@ -4,6 +4,7 @@ mod role;
 mod network;
 mod screens;
 mod certificates;
+mod permissions;
 mod service;
 pub mod edge_picker;
 

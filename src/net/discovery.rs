@@ -7,6 +7,16 @@ use tracing::{info, debug};
 
 const SERVICE_TYPE: &str = "_nexdesk._udp.local.";
 
+/// Get the primary local IPv4 address using the routing table (no packets sent).
+fn local_ipv4() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("1.1.1.1:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v4) => Some(v4.to_string()),
+        _ => None,
+    }
+}
+
 /// Advertise this machine on the local network via mDNS.
 pub async fn advertise(port: u16) -> Result<()> {
     let mdns = ServiceDaemon::new()?;
@@ -24,11 +34,12 @@ pub async fn advertise(port: u16) -> Result<()> {
     };
 
     let instance_name = format!("{hostname}");
+    let ip = local_ipv4().unwrap_or_default();
     let service = ServiceInfo::new(
         SERVICE_TYPE,
         &instance_name,
         &format!("{hostname}.local."),
-        "",
+        &ip,
         port,
         [
             ("hostname", hostname.as_str()),
@@ -38,11 +49,9 @@ pub async fn advertise(port: u16) -> Result<()> {
         .as_slice(),
     )?;
 
-    let service = service.enable_addr_auto();
-
     mdns.register(service)?;
 
-    info!("Advertising as '{}' on port {} (platform: {})", hostname, port, platform);
+    info!("Advertising as '{}' on port {} (platform: {}, ip: {})", hostname, port, platform, ip);
     info!("Press Ctrl+C to stop");
 
     // Keep running until interrupted
@@ -145,11 +154,12 @@ pub fn start_advertising(port: u16) -> Result<AdvertiseHandle> {
     };
 
     let instance_name = format!("{hostname}");
+    let ip = local_ipv4().unwrap_or_default();
     let service = ServiceInfo::new(
         SERVICE_TYPE,
         &instance_name,
         &format!("{hostname}.local."),
-        "",
+        &ip,
         port,
         [
             ("hostname", hostname.as_str()),
@@ -159,12 +169,64 @@ pub fn start_advertising(port: u16) -> Result<AdvertiseHandle> {
         .as_slice(),
     )?;
 
-    let service = service.enable_addr_auto();
     mdns.register(service)?;
 
-    info!("mDNS: advertising as '{}' on port {}", hostname, port);
+    info!("mDNS: advertising as '{}' on port {} (ip: {})", hostname, port, ip);
 
     Ok(AdvertiseHandle { mdns: Some(mdns) })
+}
+
+/// A peer discovered via mDNS browsing.
+pub struct DiscoveredPeer {
+    pub name: String,
+    pub platform: String,
+    pub addr: SocketAddr,
+}
+
+/// Handle to a running mDNS browse. Shuts down on drop.
+pub struct BrowseHandle {
+    mdns: Option<ServiceDaemon>,
+}
+
+impl Drop for BrowseHandle {
+    fn drop(&mut self) {
+        if let Some(mdns) = self.mdns.take() {
+            mdns.shutdown().ok();
+        }
+    }
+}
+
+/// Start browsing for nexdesk peers on the network (non-blocking).
+/// Returns a receiver for discovered peers and a handle that stops browsing on drop.
+pub fn start_browsing() -> Result<(std::sync::mpsc::Receiver<DiscoveredPeer>, BrowseHandle)> {
+    let mdns = ServiceDaemon::new()?;
+    let receiver = mdns.browse(SERVICE_TYPE)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        loop {
+            match receiver.recv() {
+                Ok(ServiceEvent::ServiceResolved(info)) => {
+                    let name = info.get_property_val_str("hostname")
+                        .unwrap_or("unknown").to_string();
+                    let platform = info.get_property_val_str("platform")
+                        .unwrap_or("unknown").to_string();
+                    let port = info.get_port();
+                    if let Some(ip) = info.get_addresses().iter().next() {
+                        let _ = tx.send(DiscoveredPeer {
+                            name,
+                            platform,
+                            addr: SocketAddr::new(*ip, port),
+                        });
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+
+    Ok((rx, BrowseHandle { mdns: Some(mdns) }))
 }
 
 /// Discover the first nexdesk server on the LAN.

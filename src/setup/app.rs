@@ -13,8 +13,9 @@ use crossterm::{
 use ratatui::{prelude::*, widgets::*};
 
 use crate::config::NexdeskConfig;
+use crate::net::discovery::{BrowseHandle, DiscoveredPeer};
 
-use super::{welcome, role, network, screens, certificates, service};
+use super::{welcome, role, network, screens, certificates, permissions, service};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -23,6 +24,7 @@ pub enum Step {
     Network,
     Screens,
     Certificates,
+    Permissions,
     Service,
     Done,
 }
@@ -37,7 +39,8 @@ impl Step {
             },
             Step::Network => Step::Certificates,
             Step::Screens => Step::Certificates,
-            Step::Certificates => Step::Service,
+            Step::Certificates => if cfg!(target_os = "macos") { Step::Permissions } else { Step::Service },
+            Step::Permissions => Step::Service,
             Step::Service => Step::Done,
             Step::Done => Step::Done,
         }
@@ -53,7 +56,8 @@ impl Step {
                 Some("server") => Step::Screens,
                 _ => Step::Network,
             },
-            Step::Service => Step::Certificates,
+            Step::Permissions => Step::Certificates,
+            Step::Service => if cfg!(target_os = "macos") { Step::Permissions } else { Step::Certificates },
             Step::Done => Step::Service,
         }
     }
@@ -65,6 +69,7 @@ impl Step {
             Step::Network => "Network Configuration",
             Step::Screens => "Screen Arrangement",
             Step::Certificates => "Certificate Setup",
+            Step::Permissions => "Permissions",
             Step::Service => "Install Service",
             Step::Done => "Complete",
         }
@@ -74,13 +79,17 @@ impl Step {
         match self {
             Step::Welcome => 1,
             Step::Role => 2,
-            // Both server and client have 5 steps total (+ Done)
-            Step::Network => 3,   // client only
-            Step::Screens => 3,   // server only
+            Step::Network => 3,
+            Step::Screens => 3,
             Step::Certificates => 4,
-            Step::Service => 5,
-            Step::Done => 6,
+            Step::Permissions => 5,
+            Step::Service => if cfg!(target_os = "macos") { 6 } else { 5 },
+            Step::Done => if cfg!(target_os = "macos") { 7 } else { 6 },
         }
+    }
+
+    fn total_steps() -> usize {
+        if cfg!(target_os = "macos") { 6 } else { 5 }
     }
 }
 
@@ -89,11 +98,16 @@ pub struct SetupState {
     pub config: NexdeskConfig,
     pub role_selection: usize,
     pub edge_selection: usize,
-    pub discovered_peers: Vec<String>,
+    pub discovered_peers: Vec<DiscoveredPeer>,
+    pub peer_selection: usize,
     pub manual_addr: String,
     pub use_discovery: bool,
     pub service_installed: bool,
     pub fingerprint: Option<String>,
+    pub accessibility_granted: bool,
+    accessibility_prompted: bool,
+    peer_receiver: Option<std::sync::mpsc::Receiver<DiscoveredPeer>>,
+    _browse_handle: Option<BrowseHandle>,
 }
 
 impl SetupState {
@@ -105,24 +119,34 @@ impl SetupState {
             role_selection: 0,
             edge_selection: 1, // default: right
             discovered_peers: Vec::new(),
+            peer_selection: 0,
             manual_addr: String::new(),
             use_discovery: true,
             service_installed: false,
             fingerprint: None,
+            accessibility_granted: crate::input::is_accessibility_granted(),
+            accessibility_prompted: false,
+            peer_receiver: None,
+            _browse_handle: None,
         })
     }
 }
 
 pub async fn run() -> Result<()> {
     // When invoked via `curl | sh`, stdin is the pipe from curl.
-    // Reopen /dev/tty over fd 0 so crossterm reads from the real terminal.
+    // The install script redirects stdin from /dev/tty, but as a fallback,
+    // reopen /dev/tty over fd 0. We keep _tty_guard alive so the fd isn't
+    // closed, which is required for macOS kqueue-based event polling.
     #[cfg(unix)]
-    {
+    let _tty_guard = {
         if !io::stdin().is_terminal() {
             let tty = std::fs::File::open("/dev/tty")?;
             unsafe { libc::dup2(tty.as_raw_fd(), libc::STDIN_FILENO); }
+            Some(tty)
+        } else {
+            None
         }
-    }
+    };
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -133,6 +157,25 @@ pub async fn run() -> Result<()> {
     let mut state = SetupState::new()?;
 
     loop {
+        // On the Permissions step, trigger the prompt once and poll for status
+        if state.step == Step::Permissions {
+            if !state.accessibility_prompted {
+                state.accessibility_prompted = true;
+                state.accessibility_granted = crate::input::request_accessibility();
+            } else if !state.accessibility_granted {
+                state.accessibility_granted = crate::input::is_accessibility_granted();
+            }
+        }
+
+        // Drain any newly discovered peers from the mDNS browse task
+        if let Some(rx) = &state.peer_receiver {
+            while let Ok(peer) = rx.try_recv() {
+                if !state.discovered_peers.iter().any(|p| p.addr == peer.addr) {
+                    state.discovered_peers.push(peer);
+                }
+            }
+        }
+
         terminal.draw(|frame| {
             let area = frame.area();
 
@@ -149,8 +192,9 @@ pub async fn run() -> Result<()> {
             // Title bar
             let role = state.config.role.as_deref();
             let title = format!(
-                " Nexdesk Setup - Step {}/5: {} ",
+                " Nexdesk Setup - Step {}/{}: {} ",
                 state.step.number(role),
+                Step::total_steps(),
                 state.step.title()
             );
             let header = Block::default()
@@ -167,6 +211,7 @@ pub async fn run() -> Result<()> {
                 Step::Network => network::render(frame, content_area, &state),
                 Step::Screens => screens::render(frame, content_area, &state),
                 Step::Certificates => certificates::render(frame, content_area, &state),
+                Step::Permissions => permissions::render(frame, content_area, &state),
                 Step::Service => service::render(frame, content_area, &state),
                 Step::Done => render_done(frame, content_area),
             };
@@ -176,6 +221,8 @@ pub async fn run() -> Result<()> {
                 " Press 'q' to exit "
             } else if state.step == Step::Screens {
                 " ←↑↓→ Select edge | Enter: Next | Backspace: Back | q: Quit "
+            } else if state.step == Step::Network {
+                " ↑/↓ Select peer | Tab: Switch mode | Enter: Next | Backspace: Back | q: Quit "
             } else {
                 " ←/→ Navigate | Enter: Next | q: Quit "
             };
@@ -222,6 +269,9 @@ pub async fn run() -> Result<()> {
                             Step::Role => {
                                 state.role_selection = state.role_selection.saturating_sub(1);
                             }
+                            Step::Network if state.use_discovery => {
+                                state.peer_selection = state.peer_selection.saturating_sub(1);
+                            }
                             Step::Screens => {
                                 state.edge_selection = 2; // top
                             }
@@ -232,6 +282,9 @@ pub async fn run() -> Result<()> {
                         match state.step {
                             Step::Role => {
                                 state.role_selection = (state.role_selection + 1).min(1);
+                            }
+                            Step::Network if state.use_discovery && !state.discovered_peers.is_empty() => {
+                                state.peer_selection = (state.peer_selection + 1).min(state.discovered_peers.len() - 1);
                             }
                             Step::Screens => {
                                 state.edge_selection = 3; // bottom
@@ -275,9 +328,29 @@ fn apply_step(state: &mut SetupState) -> Result<()> {
             state.config.role = Some(
                 if state.role_selection == 0 { "server" } else { "client" }.to_string(),
             );
+            // Stop any previous discovery
+            state._browse_handle = None;
+            state.peer_receiver = None;
+            state.discovered_peers.clear();
+            // Start mDNS discovery when role is client
+            if state.role_selection == 1 {
+                match crate::net::discovery::start_browsing() {
+                    Ok((rx, handle)) => {
+                        state.peer_receiver = Some(rx);
+                        state._browse_handle = Some(handle);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to start peer discovery: {}", e);
+                    }
+                }
+            }
         }
         Step::Network => {
-            if !state.use_discovery && !state.manual_addr.is_empty() {
+            if state.use_discovery {
+                if let Some(peer) = state.discovered_peers.get(state.peer_selection) {
+                    state.config.server_addr = Some(peer.addr.to_string());
+                }
+            } else if !state.manual_addr.is_empty() {
                 state.config.server_addr = Some(state.manual_addr.clone());
             }
         }

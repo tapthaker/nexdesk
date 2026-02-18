@@ -197,11 +197,12 @@ fi
 # Run interactive setup wizard
 # ============================================
 
-if [ "$NON_INTERACTIVE" != true ] && [ -t 1 ]; then
+if [ "$NON_INTERACTIVE" != true ] && [ -c /dev/tty ]; then
   printf '\n'
   # Ensure the binary is in PATH for this session
   export PATH="$INSTALL_DIR:$PATH"
-  # The binary handles reopening /dev/tty internally when stdin is a pipe,
-  # so no shell-level redirect is needed (and it breaks macOS kqueue).
-  nexdesk setup
+  # Redirect stdin from /dev/tty so the TUI gets a real terminal.
+  # The shell keeps /dev/tty open for the process lifetime, which is
+  # important for macOS kqueue-based event polling in crossterm.
+  nexdesk setup < /dev/tty
 fi
