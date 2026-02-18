@@ -163,11 +163,6 @@ pub fn try_create(
 
     info!("Layer-shell: screen {}x{}, {} output(s)", screen_w, screen_h, state.outputs.len());
 
-    // Create the shared memory buffer (1 pixel, ARGB8888 = 4 bytes, transparent)
-    let shm_fd = create_shm_file(4)?;
-    let pool = shm.create_pool(shm_fd.as_fd(), 4, &qh, ());
-    let buffer = pool.create_buffer(0, 1, 1, 4, wl_shm::Format::Argb8888, &qh, ());
-
     // Create edge surfaces for each output (or one if no outputs)
     let outputs_to_use: Vec<_> = if state.outputs.is_empty() {
         vec![None]
@@ -204,9 +199,10 @@ pub fn try_create(
         state.edge_surfaces.push(EdgeSurface {
             surface: surface.clone(),
             layer_surface,
-            buffer: buffer.clone(),
             direction: trigger_edge,
             configured: false,
+            configured_width: 0,
+            configured_height: 0,
         });
     }
 
@@ -214,10 +210,23 @@ pub fn try_create(
     event_queue.roundtrip(&mut state)
         .wrap_err("layer surface configure roundtrip failed")?;
 
-    // Attach buffer and commit for configured surfaces
+    // Create properly-sized transparent buffers and attach for configured surfaces
     for edge in &state.edge_surfaces {
-        if edge.configured {
-            edge.surface.attach(Some(&edge.buffer), 0, 0);
+        if edge.configured && edge.configured_width > 0 && edge.configured_height > 0 {
+            let stride = edge.configured_width * 4;
+            let buf_size = (stride * edge.configured_height) as usize;
+            let fd = create_shm_file(buf_size)?;
+            let pool = shm.create_pool(fd.as_fd(), buf_size as i32, &qh, ());
+            let buffer = pool.create_buffer(
+                0,
+                edge.configured_width as i32,
+                edge.configured_height as i32,
+                stride as i32,
+                wl_shm::Format::Argb8888,
+                &qh,
+                (),
+            );
+            edge.surface.attach(Some(&buffer), 0, 0);
             edge.surface.commit();
         }
     }
@@ -258,9 +267,10 @@ struct OutputInfo {
 struct EdgeSurface {
     surface: wl_surface::WlSurface,
     layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
-    buffer: wl_buffer::WlBuffer,
     direction: Direction,
     configured: bool,
+    configured_width: u32,
+    configured_height: u32,
 }
 
 struct GrabState {
@@ -700,6 +710,8 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for WaylandState {
             for edge in &mut state.edge_surfaces {
                 if edge.layer_surface == *layer_surface {
                     edge.configured = true;
+                    edge.configured_width = width;
+                    edge.configured_height = height;
                     break;
                 }
             }
