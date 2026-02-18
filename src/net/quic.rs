@@ -84,7 +84,7 @@ async fn handle_server_connection(
 
     // Receive HelloAck with optional OTP
     let peer_screen = match recv_message(&mut control_recv).await? {
-        Some(Message::HelloAck { accepted: true, otp }) => {
+        Some(Message::HelloAck { accepted: true, otp, screen }) => {
             // Validate OTP if provided
             match otp {
                 Some(code) => {
@@ -106,7 +106,7 @@ async fn handle_server_connection(
                     send_message(&mut control_send, &result).await?;
                 }
             }
-            ScreenLayout { width: 1920, height: 1080 }
+            screen.unwrap_or(ScreenLayout { width: 1920, height: 1080 })
         }
         Some(Message::HelloAck { accepted: false, .. }) => {
             return Err(eyre!("Peer rejected connection"));
@@ -189,6 +189,7 @@ async fn handle_server_connection(
 
     // Input polling + edge detection + forwarding
     let capturer = Arc::new(std::sync::Mutex::new(capturer));
+    info!("Peer screen: {}x{}", peer_screen.width, peer_screen.height);
     let mut transition = ServerTransition::new(trigger_edge, peer_screen);
 
     info!("Server ready. Move mouse to screen edge to start sharing.");
@@ -196,6 +197,9 @@ async fn handle_server_connection(
 
     let mut poll_interval = time::interval(MOUSE_POLL_INTERVAL);
     let mut debug_counter: u64 = 0;
+    let mut last_screen_w = screen_w;
+    let mut last_screen_h = screen_h;
+    let mut screen_check = time::interval(Duration::from_secs(5));
 
     loop {
         tokio::select! {
@@ -341,6 +345,10 @@ async fn handle_server_connection(
                             capturer.lock().unwrap().set_grab(false).ok();
                         }
                     }
+                    Ok(Some(Message::ScreenResize { screen })) => {
+                        info!("Peer screen updated: {}x{}", screen.width, screen.height);
+                        transition.update_peer_screen(screen);
+                    }
                     Ok(Some(other)) => {
                         debug!("Received message: {:?}", other);
                     }
@@ -350,6 +358,21 @@ async fn handle_server_connection(
                     }
                     Err(e) => {
                         warn!("Error reading from {}: {}", remote, e);
+                        break;
+                    }
+                }
+            }
+            _ = screen_check.tick() => {
+                let size = capturer.lock().unwrap().screen_size().unwrap_or((last_screen_w, last_screen_h));
+                if size.0 != last_screen_w || size.1 != last_screen_h {
+                    info!("Screen size changed: {}x{} -> {}x{}", last_screen_w, last_screen_h, size.0, size.1);
+                    last_screen_w = size.0;
+                    last_screen_h = size.1;
+                    let resize_msg = Message::ScreenResize {
+                        screen: ScreenLayout { width: size.0, height: size.1 },
+                    };
+                    if let Err(e) = send_message(&mut control_send, &resize_msg).await {
+                        warn!("Failed to send screen resize: {}", e);
                         break;
                     }
                 }
@@ -381,6 +404,8 @@ pub async fn connect(addr: Option<&str>) -> Result<()> {
         None => None,
     };
 
+    let endpoint = make_client_endpoint()?;
+
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(30);
 
@@ -400,13 +425,18 @@ pub async fn connect(addr: Option<&str>) -> Result<()> {
             }
         };
 
-        match connect_once(target_addr).await {
-            Ok(()) => {
+        let ep = endpoint.clone();
+        let handle = tokio::spawn(async move { connect_once(&ep, target_addr).await });
+        match handle.await {
+            Ok(Ok(())) => {
                 info!("Connection closed cleanly");
                 backoff = Duration::from_secs(1);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("Connection error: {}", e);
+            }
+            Err(join_err) => {
+                error!("Connection panicked: {}", join_err);
             }
         }
 
@@ -418,16 +448,20 @@ pub async fn connect(addr: Option<&str>) -> Result<()> {
 
 /// Perform a single client connection to the server, handling handshake with
 /// OTP pairing and then running the input/clipboard loop until disconnection.
-async fn connect_once(addr: SocketAddr) -> Result<()> {
-    let endpoint = make_client_endpoint()?;
-    let connection = connect_with_retry(&endpoint, addr).await?;
+async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
+    let connection = connect_with_retry(endpoint, addr).await?;
 
     info!("Connected to {}", addr);
+
+    // Create input injector early so we can send screen size in handshake
+    let mut injector = crate::input::inject::create_injector()?;
+    let (my_w, my_h) = injector.screen_size()?;
+    info!("Local screen: {}x{}", my_w, my_h);
 
     // Accept control stream and do handshake
     let (mut control_send, mut control_recv) = connection.accept_bi().await?;
 
-    let _server_screen = match recv_message(&mut control_recv).await? {
+    let mut server_screen = match recv_message(&mut control_recv).await? {
         Some(Message::Hello { version, hostname, screen, fingerprint }) => {
             info!(
                 "Server: {} (v{}, screen: {}x{})",
@@ -451,7 +485,11 @@ async fn connect_once(addr: SocketAddr) -> Result<()> {
                 Some(code)
             };
 
-            let ack = Message::HelloAck { accepted: true, otp: otp.clone() };
+            let ack = Message::HelloAck {
+                accepted: true,
+                otp: otp.clone(),
+                screen: Some(ScreenLayout { width: my_w, height: my_h }),
+            };
             send_message(&mut control_send, &ack).await?;
 
             // Wait for PairingResult
@@ -478,12 +516,10 @@ async fn connect_once(addr: SocketAddr) -> Result<()> {
         }
     };
 
-    // Create input injector
-    let mut injector = crate::input::inject::create_injector()?;
-    let (my_w, my_h) = injector.screen_size()?;
-    info!("Local screen: {}x{}", my_w, my_h);
-
     let mut transition = ClientTransition::new(my_w, my_h);
+
+    // Shutdown signal for clipboard tasks
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
     // Accept clipboard stream (bidirectional, second bi-stream from server)
     let (clip_send, mut clip_recv) = tokio::time::timeout(
@@ -500,14 +536,21 @@ async fn connect_once(addr: SocketAddr) -> Result<()> {
     // Spawn clipboard polling task (client → server)
     let clip_send = Arc::new(Mutex::new(clip_send));
     let clip_send_clone = clip_send.clone();
+    let mut shutdown_rx1 = shutdown_tx.subscribe();
     tokio::spawn(async move {
         let mut clipboard = crate::clipboard::sync::ClipboardSync::new();
         let interval = crate::clipboard::sync::ClipboardSync::poll_interval();
         loop {
-            tokio::time::sleep(interval).await;
-            if let Ok(Some(msg)) = clipboard.poll_change() {
-                let mut sender = clip_send_clone.lock().await;
-                if send_message(&mut sender, &msg).await.is_err() {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {
+                    if let Ok(Some(msg)) = clipboard.poll_change() {
+                        let mut sender = clip_send_clone.lock().await;
+                        if send_message(&mut sender, &msg).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                _ = shutdown_rx1.changed() => {
                     break;
                 }
             }
@@ -515,15 +558,23 @@ async fn connect_once(addr: SocketAddr) -> Result<()> {
     });
 
     // Spawn clipboard receive task (server → client)
+    let mut shutdown_rx2 = shutdown_tx.subscribe();
     tokio::spawn(async move {
         let mut clipboard = crate::clipboard::sync::ClipboardSync::new();
         loop {
-            match recv_message(&mut clip_recv).await {
-                Ok(Some(Message::ClipboardUpdate { content })) => {
-                    clipboard.apply_update(&content).ok();
+            tokio::select! {
+                result = recv_message(&mut clip_recv) => {
+                    match result {
+                        Ok(Some(Message::ClipboardUpdate { content })) => {
+                            clipboard.apply_update(&content).ok();
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => break,
+                    }
                 }
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
+                _ = shutdown_rx2.changed() => {
+                    break;
+                }
             }
         }
     });
@@ -541,6 +592,10 @@ async fn connect_once(addr: SocketAddr) -> Result<()> {
     // Read and discard the stream-ready marker
     let _marker = recv_message_uni(&mut input_recv).await?;
     debug!("Input stream accepted");
+
+    let mut last_screen_w = my_w;
+    let mut last_screen_h = my_h;
+    let mut screen_check = time::interval(Duration::from_secs(5));
 
     loop {
         tokio::select! {
@@ -588,7 +643,14 @@ async fn connect_once(addr: SocketAddr) -> Result<()> {
                 match msg {
                     Ok(Some(Message::Heartbeat { timestamp })) => {
                         let ack = Message::HeartbeatAck { timestamp };
-                        send_message(&mut control_send, &ack).await?;
+                        if let Err(e) = send_message(&mut control_send, &ack).await {
+                            warn!("Failed to send heartbeat ack: {}", e);
+                            break;
+                        }
+                    }
+                    Ok(Some(Message::ScreenResize { screen })) => {
+                        info!("Server screen changed: {}x{}", screen.width, screen.height);
+                        server_screen = screen;
                     }
                     Ok(Some(other)) => {
                         debug!("Control message: {:?}", other);
@@ -603,8 +665,34 @@ async fn connect_once(addr: SocketAddr) -> Result<()> {
                     }
                 }
             }
+            _ = screen_check.tick() => {
+                if let Ok((w, h)) = injector.screen_size() {
+                    if w != last_screen_w || h != last_screen_h {
+                        info!("Screen size changed: {}x{} -> {}x{}", last_screen_w, last_screen_h, w, h);
+                        last_screen_w = w;
+                        last_screen_h = h;
+                        transition.update_screen_size(w, h);
+                        let resize_msg = Message::ScreenResize {
+                            screen: ScreenLayout { width: w, height: h },
+                        };
+                        if let Err(e) = send_message(&mut control_send, &resize_msg).await {
+                            warn!("Failed to send screen resize: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
+
+    // Signal clipboard tasks to shut down
+    shutdown_tx.send(true).ok();
+
+    // Gracefully close the connection
+    connection.close(0u32.into(), b"disconnected");
+
+    // Suppress unused variable warning
+    let _ = server_screen;
 
     Ok(())
 }
@@ -643,7 +731,7 @@ pub async fn ping(addr: &str) -> Result<()> {
                 Some(code)
             };
 
-            let ack = Message::HelloAck { accepted: true, otp: otp.clone() };
+            let ack = Message::HelloAck { accepted: true, otp: otp.clone(), screen: None };
             send_message(&mut send, &ack).await?;
 
             // Wait for PairingResult

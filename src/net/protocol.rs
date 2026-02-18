@@ -37,6 +37,7 @@ pub enum Message {
     HelloAck {
         accepted: bool,
         otp: Option<String>,
+        screen: Option<ScreenLayout>,
     },
     PairingResult { success: bool },
 
@@ -53,6 +54,9 @@ pub enum Message {
         modifiers: u16,
     },
 
+    // Screen resize notification
+    ScreenResize { screen: ScreenLayout },
+
     // Phase 4b: Clipboard
     ClipboardUpdate { content: ClipboardContent },
 
@@ -63,7 +67,7 @@ pub enum Message {
 }
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Encode a message to bytes.
 pub fn encode(msg: &Message) -> color_eyre::eyre::Result<Vec<u8>> {

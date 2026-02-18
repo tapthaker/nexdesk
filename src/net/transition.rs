@@ -261,6 +261,10 @@ impl ServerTransition {
         }
     }
 
+    pub fn update_peer_screen(&mut self, screen: ScreenLayout) {
+        self.peer_screen = screen;
+    }
+
     pub fn on_switch_back(&mut self) {
         self.active = false;
         self.edge_cooldown = SERVER_EDGE_COOLDOWN;
@@ -321,6 +325,13 @@ impl ClientTransition {
             edge_dwell: 0,
             switch_back_edge: None,
         }
+    }
+
+    pub fn update_screen_size(&mut self, w: u32, h: u32) {
+        self.screen_w = w;
+        self.screen_h = h;
+        self.cursor_x = self.cursor_x.clamp(0, w as i32 - 1);
+        self.cursor_y = self.cursor_y.clamp(0, h as i32 - 1);
     }
 
     pub fn handle(&mut self, message: Message) -> ClientOutput {
