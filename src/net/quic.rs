@@ -467,7 +467,7 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     // Accept control stream and do handshake
     let (mut control_send, mut control_recv) = connection.accept_bi().await?;
 
-    let mut server_screen = match recv_message(&mut control_recv).await? {
+    let (mut server_screen, server_build_version) = match recv_message(&mut control_recv).await? {
         Some(Message::Hello { version, hostname, screen, fingerprint, build_version }) => {
             let server_ver = build_version.as_deref().unwrap_or("unknown");
             info!(
@@ -520,12 +520,34 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                 }
             }
 
-            screen
+            let ver = build_version.unwrap_or_else(|| "unknown".to_string());
+            (screen, ver)
         }
         other => {
             return Err(eyre!("Expected Hello, got: {:?}", other));
         }
     };
+
+    // Auto-update if server has a newer clean release version
+    if server_build_version != BUILD_VERSION {
+        if crate::net::update::is_release_version(&server_build_version) {
+            info!("Server has release version {}, attempting self-update...", server_build_version);
+            match crate::net::update::self_update(&server_build_version).await {
+                Ok(()) => {
+                    info!("Updated to {}. Restarting...", server_build_version);
+                    connection.close(0u32.into(), b"updating");
+                    let exe = std::env::current_exe()?;
+                    let args: Vec<String> = std::env::args().collect();
+                    use std::os::unix::process::CommandExt;
+                    let err = std::process::Command::new(exe).args(&args[1..]).exec();
+                    return Err(eyre!("Failed to restart after update: {}", err));
+                }
+                Err(e) => {
+                    warn!("Self-update failed: {}. Continuing with current version.", e);
+                }
+            }
+        }
+    }
 
     let mut transition = ClientTransition::new(my_w, my_h);
 
