@@ -18,15 +18,18 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let filter = if cli.verbose {
-        EnvFilter::new("nexdesk=debug")
-    } else {
-        EnvFilter::new("nexdesk=info")
-    };
+    // Skip tracing init for setup command — log output corrupts the TUI.
+    if !matches!(cli.command, Command::Setup) {
+        let filter = if cli.verbose {
+            EnvFilter::new("nexdesk=debug")
+        } else {
+            EnvFilter::new("nexdesk=info")
+        };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .init();
+    }
 
     match cli.command {
         Command::Advertise { port } => {
