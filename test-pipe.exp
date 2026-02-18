@@ -1,0 +1,34 @@
+#!/usr/bin/expect -f
+# Test nexdesk setup launched from a pipe context (simulates curl | sh)
+
+set timeout 15
+set env(RUST_BACKTRACE) "1"
+
+puts "=== Testing pipe context ==="
+
+# This simulates what install.sh does: launch nexdesk setup < /dev/tty from within a piped shell
+spawn sh -c {echo '$HOME/.local/bin/nexdesk setup < /dev/tty' | sh}
+
+expect {
+    "Nexdesk Setup" {
+        puts "\n=== SUCCESS: Setup wizard launched! ==="
+        sleep 1
+        send "q"
+    }
+    "\[?1049h" {
+        # Alternate screen entered - TUI is running, wait a moment for rendering
+        sleep 1
+        puts "\n=== SUCCESS: TUI alternate screen active ==="
+        send "q"
+    }
+    -re "Failed to initialize.*\n" {
+        puts "\n=== CRASH: Failed to initialize ==="
+    }
+    timeout {
+        puts "\n=== TIMEOUT ==="
+    }
+}
+
+# Wait for process to exit
+expect eof
+puts "=== Done ==="

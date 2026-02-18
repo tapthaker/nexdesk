@@ -1,0 +1,46 @@
+#!/usr/bin/expect -f
+# Test the full curl | sh install flow on macOS
+
+set timeout 30
+
+# Remove .local/bin from PATH so the install script shows the PATH prompt
+set env(PATH) [regsub -all {[^:]*\.local/bin:?} $env(PATH) ""]
+set env(RUST_BACKTRACE) "full"
+
+puts "=== Starting curl | sh install test ==="
+
+spawn sh -c "curl -fsSL https://raw.githubusercontent.com/tapthaker/nexdesk/master/install.sh | sh"
+
+# Wait for the PATH prompt
+expect {
+    "Y/n" {
+        puts "\n=== Got PATH prompt, sending y ==="
+        send "y\r"
+    }
+    "Installed!" {
+        puts "\n=== Already installed ==="
+    }
+    timeout {
+        puts "\n=== TIMEOUT waiting for install ==="
+        exit 1
+    }
+}
+
+# Capture everything that happens
+expect {
+    "Welcome to Nexdesk" {
+        puts "\n=== SUCCESS: Setup wizard launched! ==="
+        sleep 1
+        send "q"
+    }
+    -re "Error.*\n.*\n.*\n.*\n.*\n.*\n.*\n.*\n.*\n" {
+        puts "\n=== CRASH OUTPUT START ==="
+        puts $expect_out(0,string)
+        puts "=== CRASH OUTPUT END ==="
+    }
+    timeout {
+        puts "\n=== TIMEOUT waiting for wizard ==="
+    }
+}
+
+expect eof
