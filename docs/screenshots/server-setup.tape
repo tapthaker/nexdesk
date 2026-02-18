@@ -11,7 +11,7 @@ Set Theme "Catppuccin Mocha"
 Set Padding 20
 
 # Install
-Type "curl -fsSL https://raw.githubusercontent.com/tapthaker/nexdesk/master/install.sh | sh"
+Type "curl -fsSL https://raw.githubusercontent.com/tapthaker/nexdesk/main/install.sh | sh"
 Enter
 Sleep 8s
 Screenshot docs/screenshots/server-00-install.png

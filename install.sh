@@ -1,6 +1,6 @@
 #!/bin/sh
 # Nexdesk Installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/tapthaker/nexdesk/master/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/tapthaker/nexdesk/main/install.sh | sh
 
 set -e
 
