@@ -133,14 +133,44 @@ impl SetupState {
 }
 
 pub async fn run() -> Result<()> {
-    // When invoked via `curl | sh`, stdin is the pipe from curl.
-    // The install script redirects stdin from /dev/tty, but as a fallback,
-    // reopen /dev/tty over fd 0. We keep _tty_guard alive so the fd isn't
-    // closed, which is required for macOS kqueue-based event polling.
+    // When invoked via `curl | sh`, stdin may be a pipe or /dev/tty opened
+    // read-only by the shell's `<` redirect. On macOS, kqueue returns EINVAL
+    // for /dev/tty fds, so we resolve the actual PTY device path (e.g.
+    // /dev/ttys001) via ttyname() on stdout/stderr and reopen that O_RDWR.
+    // We keep _tty_guard alive so the fd isn't closed.
     #[cfg(unix)]
     let _tty_guard = {
-        if !io::stdin().is_terminal() {
-            let tty = std::fs::File::open("/dev/tty")?;
+        let stdin_fd = io::stdin().as_raw_fd();
+        let flags = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
+        let need_reopen = if !io::stdin().is_terminal() {
+            true
+        } else if flags >= 0 && (flags & libc::O_ACCMODE == libc::O_RDONLY) {
+            true
+        } else {
+            false
+        };
+        if need_reopen {
+            // Try to get the actual PTY device path via ttyname on stdin,
+            // stdout, or stderr. On macOS, kqueue returns EINVAL for /dev/tty
+            // fds, so we need the real PTY device (e.g. /dev/ttys001).
+            let tty_path = unsafe {
+                let mut path: Option<String> = None;
+                for fd in [stdin_fd, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+                    let name = libc::ttyname(fd);
+                    if !name.is_null() {
+                        let s = std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned();
+                        if s != "/dev/tty" {
+                            path = Some(s);
+                            break;
+                        }
+                    }
+                }
+                path.unwrap_or_else(|| "/dev/tty".to_string())
+            };
+            let tty = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&tty_path)?;
             unsafe { libc::dup2(tty.as_raw_fd(), libc::STDIN_FILENO); }
             Some(tty)
         } else {
