@@ -211,6 +211,32 @@ async fn handle_server_connection(
     info!("Peer screen: {}x{}", peer_screen.width, peer_screen.height);
     let mut transition = ServerTransition::new(trigger_edge, peer_screen);
 
+    // Spawn file transfer acceptor (receives files from client via new bi-streams)
+    let ft_conn = connection.clone();
+    tokio::spawn(async move {
+        loop {
+            match ft_conn.accept_bi().await {
+                Ok((send, recv)) => {
+                    tokio::spawn(async move {
+                        match crate::filetransfer::recv::receive_files(send, recv).await {
+                            Ok(paths) if !paths.is_empty() => {
+                                info!("Received {} file(s) from client", paths.len());
+                                tokio::task::spawn_blocking(move || {
+                                    crate::filetransfer::clipboard_files::set_clipboard_files(&paths).ok();
+                                }).await.ok();
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!("File transfer receive error: {}", e);
+                            }
+                        }
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     info!("Server ready. Move mouse to screen edge to start sharing.");
     info!("Screen size: {}x{}", screen_w, screen_h);
 
@@ -272,6 +298,19 @@ async fn handle_server_connection(
                         for msg in messages {
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
+                        // Check clipboard for files and transfer them
+                        let ft_conn = connection.clone();
+                        tokio::spawn(async move {
+                            let files = tokio::task::spawn_blocking(|| {
+                                crate::filetransfer::clipboard_files::get_clipboard_files()
+                            }).await.ok().flatten();
+                            if let Some(files) = files {
+                                info!("Transferring {} clipboard file(s) to client", files.len());
+                                if let Err(e) = crate::filetransfer::send::send_files(&ft_conn, files).await {
+                                    warn!("File transfer error: {}", e);
+                                }
+                            }
+                        });
                     }
                     ServerOutput::Forward { messages } => {
                         let mut sender = input_send.lock().await;
@@ -399,6 +438,19 @@ async fn handle_server_connection(
                         for msg in messages {
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
+                        // Check clipboard for files and transfer them
+                        let ft_conn = connection.clone();
+                        tokio::spawn(async move {
+                            let files = tokio::task::spawn_blocking(|| {
+                                crate::filetransfer::clipboard_files::get_clipboard_files()
+                            }).await.ok().flatten();
+                            if let Some(files) = files {
+                                info!("Transferring {} clipboard file(s) to client", files.len());
+                                if let Err(e) = crate::filetransfer::send::send_files(&ft_conn, files).await {
+                                    warn!("File transfer error: {}", e);
+                                }
+                            }
+                        });
                     }
                     LayerShellEvent::MouseMove { dx, dy } => {
                         if transition.is_active() {
@@ -767,6 +819,40 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
         }
     });
 
+    // Spawn file transfer acceptor (receives files from server via new bi-streams)
+    let ft_conn = connection.clone();
+    let mut shutdown_rx3 = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                result = ft_conn.accept_bi() => {
+                    match result {
+                        Ok((send, recv)) => {
+                            tokio::spawn(async move {
+                                match crate::filetransfer::recv::receive_files(send, recv).await {
+                                    Ok(paths) if !paths.is_empty() => {
+                                        info!("Received {} file(s) from server", paths.len());
+                                        tokio::task::spawn_blocking(move || {
+                                            crate::filetransfer::clipboard_files::set_clipboard_files(&paths).ok();
+                                        }).await.ok();
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        warn!("File transfer receive error: {}", e);
+                                    }
+                                }
+                            });
+                        }
+                        Err(_) => break,
+                    }
+                }
+                _ = shutdown_rx3.changed() => {
+                    break;
+                }
+            }
+        }
+    });
+
     info!("Client ready. Waiting for server to share mouse...");
 
     // Accept the unidirectional input stream from the server
@@ -815,6 +901,19 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 info!("Edge on client: {:?} — requesting switch back", direction);
                                 let switch_msg = Message::SwitchScreen { direction };
                                 send_message(&mut control_send, &switch_msg).await.ok();
+                                // Check clipboard for files and transfer them
+                                let ft_conn = connection.clone();
+                                tokio::spawn(async move {
+                                    let files = tokio::task::spawn_blocking(|| {
+                                        crate::filetransfer::clipboard_files::get_clipboard_files()
+                                    }).await.ok().flatten();
+                                    if let Some(files) = files {
+                                        info!("Transferring {} clipboard file(s) to server", files.len());
+                                        if let Err(e) = crate::filetransfer::send::send_files(&ft_conn, files).await {
+                                            warn!("File transfer error: {}", e);
+                                        }
+                                    }
+                                });
                             }
                         }
                     }

@@ -22,6 +22,13 @@ pub enum ClipboardContent {
     Text(String),
 }
 
+/// File metadata for file transfer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileInfo {
+    pub name: String,
+    pub size: u64,
+}
+
 /// All protocol messages sent over QUIC streams.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
@@ -62,17 +69,20 @@ pub enum Message {
     // Phase 4b: Clipboard
     ClipboardUpdate { content: ClipboardContent },
 
-    // Phase 4c: File transfer (stubs)
-    FileTransferStart { name: String, size: u64 },
-    FileTransferChunk { data: Vec<u8> },
-    FileTransferEnd { checksum: String },
+    // Phase 4c: File transfer
+    FileTransferOffer { transfer_id: u64, files: Vec<FileInfo>, total_size: u64 },
+    FileTransferAccept { transfer_id: u64 },
+    FileTransferChunk { transfer_id: u64, file_index: u32, offset: u64, data: Vec<u8> },
+    FileTransferComplete { transfer_id: u64, file_index: u32, checksum: String },
+    FileTransferDone { transfer_id: u64 },
+    FileTransferCancel { transfer_id: u64 },
 
     // Wake remote display
     WakeDisplay,
 }
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Build version string burned in at compile time (e.g. "v0.1.2" or "v0.1.2-3-gabcdef").
 pub const BUILD_VERSION: &str = env!("NEXDESK_VERSION");

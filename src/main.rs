@@ -5,6 +5,7 @@ mod input;
 mod clipboard;
 mod cursor;
 mod daemon;
+mod filetransfer;
 mod setup;
 
 use clap::Parser;
