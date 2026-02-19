@@ -112,6 +112,8 @@ pub struct MacOSInjector {
     screen_height: u32,
     /// Tracked modifier flags for synthesized key events
     modifier_flags: CGEventFlags,
+    /// Bitmask of currently pressed mouse buttons (bit 0=left, 1=right, 2=middle)
+    buttons_down: u8,
 }
 
 #[cfg(target_os = "macos")]
@@ -125,6 +127,7 @@ impl MacOSInjector {
             screen_width,
             screen_height,
             modifier_flags: CGEventFlags::empty(),
+            buttons_down: 0,
         })
     }
 
@@ -179,15 +182,20 @@ impl InputInjector for MacOSInjector {
                 self.move_mouse(*x, *y)?;
             }
             Message::MouseButton { button, pressed } => {
-                let (event_type, cg_button) = match (button, pressed) {
-                    (0, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
-                    (0, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
-                    (1, true) => (CGEventType::RightMouseDown, CGMouseButton::Right),
-                    (1, false) => (CGEventType::RightMouseUp, CGMouseButton::Right),
-                    (2, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
-                    (2, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
+                let (event_type, cg_button, bit) = match (button, pressed) {
+                    (0, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left, 0u8),
+                    (0, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left, 0u8),
+                    (1, true) => (CGEventType::RightMouseDown, CGMouseButton::Right, 1u8),
+                    (1, false) => (CGEventType::RightMouseUp, CGMouseButton::Right, 1u8),
+                    (2, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center, 2u8),
+                    (2, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center, 2u8),
                     _ => return Ok(()),
                 };
+                if *pressed {
+                    self.buttons_down |= 1 << bit;
+                } else {
+                    self.buttons_down &= !(1 << bit);
+                }
                 let (cx, cy) = self.current_position()?;
                 self.post_mouse_event(event_type, cx as f64, cy as f64, cg_button)?;
             }
@@ -244,12 +252,18 @@ impl InputInjector for MacOSInjector {
         let sh = CGDisplayPixelsHigh(MAIN_DISPLAY) as i32;
         let x = x.clamp(0, sw - 1) as f64;
         let y = y.clamp(0, sh - 1) as f64;
-        self.post_mouse_event(
-            CGEventType::MouseMoved,
-            x,
-            y,
-            CGMouseButton::Left,
-        )?;
+        // macOS requires drag event types when a button is held, otherwise
+        // the move is not recognized as part of a drag operation.
+        let (event_type, button) = if self.buttons_down & 1 != 0 {
+            (CGEventType::LeftMouseDragged, CGMouseButton::Left)
+        } else if self.buttons_down & 2 != 0 {
+            (CGEventType::RightMouseDragged, CGMouseButton::Right)
+        } else if self.buttons_down & 4 != 0 {
+            (CGEventType::OtherMouseDragged, CGMouseButton::Center)
+        } else {
+            (CGEventType::MouseMoved, CGMouseButton::Left)
+        };
+        self.post_mouse_event(event_type, x, y, button)?;
         Ok(())
     }
 
