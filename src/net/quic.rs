@@ -725,6 +725,7 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                             ClientOutput::Ignore => {}
                             ClientOutput::Activate => {
                                 info!("Server sharing mouse");
+                                crate::input::wake::wake_display();
                             }
                             ClientOutput::InjectMove { x, y } => {
                                 let msg = Message::MouseMove { x, y };
