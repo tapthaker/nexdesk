@@ -36,6 +36,9 @@ pub async fn serve(port: u16, trigger_edge: Option<crate::net::protocol::Directi
     let otp = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000u32));
     println!("\n  Pairing code: {}\n", otp);
 
+    // Periodically check for new releases and self-update
+    tokio::spawn(crate::net::update::update_check_loop());
+
     while let Some(incoming) = endpoint.accept().await {
         let connection = incoming.await?;
         let remote = connection.remote_address();

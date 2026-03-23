@@ -1,5 +1,5 @@
 use color_eyre::eyre::{Result, eyre};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Returns the platform slug used in GitHub release asset names.
 fn platform_slug() -> Option<&'static str> {
@@ -83,6 +83,83 @@ pub async fn self_update(target_version: &str) -> Result<()> {
 
     info!("Successfully updated to {}", target_version);
     Ok(())
+}
+
+/// Fetches the latest release tag from GitHub (e.g. "v0.1.8").
+pub async fn check_latest_version() -> Result<String> {
+    let client = reqwest::Client::builder()
+        .user_agent("nexdesk")
+        .build()
+        .map_err(|e| eyre!("Failed to build HTTP client: {}", e))?;
+
+    let resp = client
+        .get("https://api.github.com/repos/tapthaker/nexdesk/releases/latest")
+        .send()
+        .await
+        .map_err(|e| eyre!("Failed to fetch latest release: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(eyre!("GitHub API returned HTTP {}", resp.status()));
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| eyre!("Failed to parse GitHub response: {}", e))?;
+
+    body["tag_name"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| eyre!("No tag_name in GitHub response"))
+}
+
+/// Periodically checks for new releases and self-updates. Exits the process
+/// on successful update so the service manager (LaunchAgent/systemd) restarts
+/// with the new binary.
+pub async fn update_check_loop() {
+    use std::time::Duration;
+    use crate::net::protocol::BUILD_VERSION;
+
+    // Skip update checks for dev builds
+    if !is_release_version(BUILD_VERSION) {
+        info!("Dev build ({}), skipping update checks", BUILD_VERSION);
+        return;
+    }
+
+    let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
+    interval.tick().await; // skip the immediate first tick
+
+    loop {
+        interval.tick().await;
+
+        let latest = match check_latest_version().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Update check failed: {}", e);
+                continue;
+            }
+        };
+
+        if latest == BUILD_VERSION {
+            info!("Up to date ({})", BUILD_VERSION);
+            continue;
+        }
+
+        if !is_release_version(&latest) {
+            continue;
+        }
+
+        info!("New version available: {} (current: {})", latest, BUILD_VERSION);
+        match self_update(&latest).await {
+            Ok(()) => {
+                info!("Updated to {}. Exiting for restart...", latest);
+                std::process::exit(0);
+            }
+            Err(e) => {
+                warn!("Self-update to {} failed: {}", latest, e);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
