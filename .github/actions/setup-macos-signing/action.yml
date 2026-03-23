@@ -1,0 +1,57 @@
+name: Setup macOS Code Signing
+description: Import Developer ID certificate into a temporary keychain
+
+inputs:
+  p12-base64:
+    description: Base64-encoded .p12 certificate
+    required: true
+  p12-password:
+    description: Password for the .p12 file
+    required: true
+
+outputs:
+  signing-identity:
+    description: The signing identity extracted from the certificate
+    value: ${{ steps.identity.outputs.identity }}
+
+runs:
+  using: composite
+  steps:
+    - name: Create keychain and import certificate
+      shell: bash
+      run: |
+        KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+        KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+
+        # Create temporary keychain
+        security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+        security set-keychain-settings -lut 3600 "$KEYCHAIN_PATH"
+        security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+        # Decode and import certificate
+        P12_PATH="$RUNNER_TEMP/certificate.p12"
+        echo "${{ inputs.p12-base64 }}" | base64 --decode > "$P12_PATH"
+        security import "$P12_PATH" \
+          -k "$KEYCHAIN_PATH" \
+          -P "${{ inputs.p12-password }}" \
+          -T /usr/bin/codesign \
+          -T /usr/bin/security
+
+        # Allow codesign to access the keychain without prompts
+        security set-key-partition-list -S apple-tool:,apple:,codesign: \
+          -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+        # Add to search list so codesign finds it
+        security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+        # Clean up .p12 file
+        rm -f "$P12_PATH"
+
+    - name: Extract signing identity
+      id: identity
+      shell: bash
+      run: |
+        KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+        IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+        echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+        echo "Signing identity: $IDENTITY"
