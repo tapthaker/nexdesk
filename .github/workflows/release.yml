@@ -30,8 +30,20 @@ jobs:
 
   build-macos:
     runs-on: macos-latest
+    environment: CI
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup code signing
+        id: signing
+        uses: ./.github/actions/setup-macos-signing
+        with:
+          p12-base64: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          p12-password: ${{ secrets.APPLE_DEVELOPER_ID_PASSWORD }}
+
+      - name: Decode notary API key
+        run: |
+          echo "${{ secrets.APPLE_NOTARY_KEY }}" | base64 --decode > "$RUNNER_TEMP/notary-key.p8"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -40,14 +52,42 @@ jobs:
       - name: Build (aarch64)
         run: cargo build --release
 
-      - name: Rename aarch64 binary
-        run: cp target/release/nexdesk nexdesk-macos-aarch64
+      - name: Sign and notarize (aarch64)
+        run: |
+          cp target/release/nexdesk nexdesk-macos-aarch64
+
+          codesign --force --sign "${{ steps.signing.outputs.signing-identity }}" \
+            --options runtime --timestamp \
+            --entitlements entitlements.plist \
+            nexdesk-macos-aarch64
+
+          ditto -c -k nexdesk-macos-aarch64 nexdesk-macos-aarch64.zip
+
+          xcrun notarytool submit nexdesk-macos-aarch64.zip \
+            --key "$RUNNER_TEMP/notary-key.p8" \
+            --key-id "${{ secrets.APPLE_NOTARY_KEY_ID }}" \
+            --issuer "${{ secrets.APPLE_NOTARY_ISSUER_ID }}" \
+            --wait
 
       - name: Build (x86_64)
         run: cargo build --release --target x86_64-apple-darwin
 
-      - name: Rename x86_64 binary
-        run: cp target/x86_64-apple-darwin/release/nexdesk nexdesk-macos-x86_64
+      - name: Sign and notarize (x86_64)
+        run: |
+          cp target/x86_64-apple-darwin/release/nexdesk nexdesk-macos-x86_64
+
+          codesign --force --sign "${{ steps.signing.outputs.signing-identity }}" \
+            --options runtime --timestamp \
+            --entitlements entitlements.plist \
+            nexdesk-macos-x86_64
+
+          ditto -c -k nexdesk-macos-x86_64 nexdesk-macos-x86_64.zip
+
+          xcrun notarytool submit nexdesk-macos-x86_64.zip \
+            --key "$RUNNER_TEMP/notary-key.p8" \
+            --key-id "${{ secrets.APPLE_NOTARY_KEY_ID }}" \
+            --issuer "${{ secrets.APPLE_NOTARY_ISSUER_ID }}" \
+            --wait
 
       - uses: actions/upload-artifact@v4
         with:
