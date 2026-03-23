@@ -66,6 +66,9 @@ pub enum Message {
     // Screen resize notification
     ScreenResize { screen: ScreenLayout },
 
+    // Wake remote display
+    WakeDisplay,
+
     // Phase 4b: Clipboard
     ClipboardUpdate { content: ClipboardContent },
 

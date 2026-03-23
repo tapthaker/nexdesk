@@ -233,6 +233,12 @@ async fn handle_server_connection(
     let mut last_screen_h = screen_h;
     let mut screen_check = time::interval(Duration::from_secs(5));
 
+    // Track input activity so we can wake the client display when the
+    // server user returns after being idle.
+    let mut prev_mouse_pos: (i32, i32) = (0, 0);
+    let mut last_input_time = Instant::now();
+    const IDLE_THRESHOLD: Duration = Duration::from_secs(30);
+
     loop {
         tokio::select! {
             // Branch: evdev polling (disabled when layer-shell is active)
@@ -248,6 +254,19 @@ async fn handle_server_connection(
                     let btns = cap.mouse_buttons().unwrap_or(0);
                     (pos.0, pos.1, size.0, size.1, btns, keys)
                 };
+
+                // Detect input activity after idle period
+                let has_input = (mx, my) != prev_mouse_pos || !key_events.is_empty() || buttons != 0;
+                if has_input {
+                    let idle_duration = last_input_time.elapsed();
+                    if idle_duration >= IDLE_THRESHOLD {
+                        info!("User active after {}s idle — waking client display", idle_duration.as_secs());
+                        let wake_msg = Message::WakeDisplay;
+                        send_message(&mut control_send, &wake_msg).await.ok();
+                    }
+                    prev_mouse_pos = (mx, my);
+                    last_input_time = Instant::now();
+                }
 
                 // Log position every 500 polls (~1 second)
                 debug_counter += 1;
@@ -305,6 +324,16 @@ async fn handle_server_connection(
                 }
             }, if use_layer_shell => {
                 use crate::input::wayland_layer_shell::{LayerShellEvent, LayerShellCommand};
+
+                // Detect input activity after idle period (layer-shell path)
+                let idle_duration = last_input_time.elapsed();
+                if idle_duration >= IDLE_THRESHOLD {
+                    info!("User active after {}s idle — waking client display", idle_duration.as_secs());
+                    let wake_msg = Message::WakeDisplay;
+                    send_message(&mut control_send, &wake_msg).await.ok();
+                }
+                last_input_time = Instant::now();
+
                 match event {
                     LayerShellEvent::EdgeEnter { direction } => {
                         let messages = transition.activate_instant(direction);
@@ -784,6 +813,10 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                     Ok(Some(Message::ScreenResize { screen })) => {
                         info!("Server screen changed: {}x{}", screen.width, screen.height);
                         server_screen = screen;
+                    }
+                    Ok(Some(Message::WakeDisplay)) => {
+                        info!("Server user active — waking display");
+                        crate::input::wake::wake_display();
                     }
                     Ok(Some(other)) => {
                         debug!("Control message: {:?}", other);
