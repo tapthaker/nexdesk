@@ -7,7 +7,7 @@ use objc2_core_foundation::CGPoint;
 #[cfg(target_os = "macos")]
 use objc2_core_graphics::{
     CGDirectDisplayID, CGDisplayPixelsHigh, CGDisplayPixelsWide,
-    CGEvent, CGEventFlags, CGEventSourceStateID, CGEventTapLocation, CGEventType,
+    CGEvent, CGEventField, CGEventFlags, CGEventSourceStateID, CGEventTapLocation, CGEventType,
     CGMouseButton, CGEventSource, CGScrollEventUnit,
 };
 
@@ -197,7 +197,14 @@ impl InputInjector for MacOSInjector {
                     self.buttons_down &= !(1 << bit);
                 }
                 let (cx, cy) = self.current_position()?;
-                self.post_mouse_event(event_type, cx as f64, cy as f64, cg_button)?;
+                let point = CGPoint { x: cx as f64, y: cy as f64 };
+                let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+                    .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
+                let event = CGEvent::new_mouse_event(Some(&source), event_type, point, cg_button)
+                    .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create mouse event"))?;
+                // Click count must be 1 for macOS to initiate drag-and-drop sessions.
+                CGEvent::set_integer_value_field(Some(&event), CGEventField::MouseEventClickState, 1);
+                CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
             }
             Message::MouseScroll { dx, dy } => {
                 // Negate: scroll values arrive in traditional convention (positive=up)
