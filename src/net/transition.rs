@@ -1207,11 +1207,8 @@ mod tests {
         ct.handle(Message::SwitchScreen {
             direction: Direction::Right,
         });
-        let out = ct.handle(Message::MouseScroll { dx: 0, dy: -3 });
-        assert!(matches!(
-            out,
-            ClientOutput::Forward(Message::MouseScroll { dx: 0, dy: -3 })
-        ));
+        let out = ct.handle(Message::MouseScroll { dx: 0.0, dy: -3.0, phase: crate::net::protocol::ScrollPhase::None });
+        assert!(matches!(out, ClientOutput::Forward(Message::MouseScroll { dx, dy, .. }) if dx == 0.0 && dy == -3.0));
     }
 
     #[test]

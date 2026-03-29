@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
                         net::protocol::Message::KeyEvent { keycode, pressed, .. } => {
                             print!("  key:{} {}", keycode, if *pressed { "dn" } else { "up" });
                         }
-                        net::protocol::Message::MouseScroll { dx, dy } => {
+                        net::protocol::Message::MouseScroll { dx, dy, .. } => {
                             print!("  scroll:({}, {})", dx, dy);
                         }
                         _ => {}

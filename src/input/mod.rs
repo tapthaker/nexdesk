@@ -22,6 +22,7 @@ pub mod wayland_layer_shell {
         MouseMove { dx: f64, dy: f64 },
         MouseButton { button: u32, pressed: bool },
         MouseScroll { dx: f64, dy: f64 },
+        ScrollEnd,
         KeyEvent { keycode: u32, pressed: bool },
         KeyModifiers { depressed: u32, latched: u32, locked: u32, group: u32 },
     }

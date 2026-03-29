@@ -484,7 +484,20 @@ async fn handle_server_connection(
                     }
                     LayerShellEvent::MouseScroll { dx, dy } => {
                         if transition.is_active() {
-                            let msg = Message::MouseScroll { dx: dx as i32, dy: dy as i32 };
+                            let msg = Message::MouseScroll {
+                                dx, dy,
+                                phase: crate::net::protocol::ScrollPhase::Changed,
+                            };
+                            let mut sender = input_send.lock().await;
+                            send_message_uni(&mut sender, &msg).await.ok();
+                        }
+                    }
+                    LayerShellEvent::ScrollEnd => {
+                        if transition.is_active() {
+                            let msg = Message::MouseScroll {
+                                dx: 0.0, dy: 0.0,
+                                phase: crate::net::protocol::ScrollPhase::Ended,
+                            };
                             let mut sender = input_send.lock().await;
                             send_message_uni(&mut sender, &msg).await.ok();
                         }

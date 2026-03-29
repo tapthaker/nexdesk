@@ -223,27 +223,45 @@ impl InputInjector for MacOSInjector {
                 CGEvent::set_integer_value_field(Some(&event), CGEventField::MouseEventClickState, self.click_count);
                 CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
             }
-            Message::MouseScroll { dx, dy } => {
+            Message::MouseScroll { dx, dy, phase } => {
+                use crate::net::protocol::ScrollPhase;
+
                 let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
+                let is_continuous = *phase != ScrollPhase::None;
                 // Use 2 wheels to include horizontal axis (needed for back/forward swipe)
-                let wheel_count = if *dx != 0 { 2 } else { 1 };
+                let wheel_count = if *dx != 0.0 { 2 } else { 1 };
                 let event = CGEvent::new_scroll_wheel_event2(
                     Some(&source),
                     CGScrollEventUnit::Pixel,
                     wheel_count,
-                    -*dy,
-                    -*dx,
+                    -*dy as i32,
+                    -*dx as i32,
                     0,
                 )
                 .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create scroll event"))?;
-                // Mark as continuous (trackpad-style) for smooth scrolling and
-                // to enable momentum/swipe-to-navigate in apps.
-                CGEvent::set_integer_value_field(
-                    Some(&event),
-                    CGEventField::ScrollWheelEventIsContinuous,
-                    1,
-                );
+
+                if is_continuous {
+                    // Mark as continuous (trackpad-style) for smooth scrolling
+                    CGEvent::set_integer_value_field(
+                        Some(&event),
+                        CGEventField::ScrollWheelEventIsContinuous,
+                        1,
+                    );
+                    // Set scroll phase so macOS can detect gestures (swipe-back, etc.)
+                    let cg_phase: i64 = match phase {
+                        ScrollPhase::Began => 1,   // kCGScrollPhaseBegan
+                        ScrollPhase::Changed => 2, // kCGScrollPhaseChanged
+                        ScrollPhase::Ended => 4,   // kCGScrollPhaseEnded
+                        ScrollPhase::None => 0,
+                    };
+                    CGEvent::set_integer_value_field(
+                        Some(&event),
+                        CGEventField::ScrollWheelEventScrollPhase,
+                        cg_phase,
+                    );
+                }
+
                 CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
             }
             Message::KeyEvent {
