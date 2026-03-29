@@ -132,7 +132,7 @@ async fn handle_server_connection(
     // actually sees this stream (QUIC may not push an empty stream).
     let marker = Message::Heartbeat { timestamp: 0 };
     send_message(&mut clip_send, &marker).await?;
-    debug!("Clipboard stream opened and marker sent");
+    info!("Clipboard stream opened");
 
     // Open unidirectional input stream (server → client)
     let mut input_send = connection.open_uni().await?;
@@ -496,9 +496,6 @@ pub async fn connect(addr: Option<&str>) -> Result<()> {
 
     let endpoint = make_client_endpoint()?;
 
-    let mut backoff = Duration::from_secs(1);
-    let max_backoff = Duration::from_secs(30);
-
     loop {
         let target_addr = match resolved_addr {
             Some(a) => a,
@@ -506,9 +503,8 @@ pub async fn connect(addr: Option<&str>) -> Result<()> {
                 match discovery::discover_one(Duration::from_secs(10)).await {
                     Ok(a) => a,
                     Err(e) => {
-                        warn!("Discovery failed: {}. Retrying in {:?}...", e, backoff);
-                        time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(max_backoff);
+                        warn!("Discovery failed: {}. Retrying in 2s...", e);
+                        time::sleep(Duration::from_secs(2)).await;
                         continue;
                     }
                 }
@@ -518,21 +514,13 @@ pub async fn connect(addr: Option<&str>) -> Result<()> {
         let ep = endpoint.clone();
         let handle = tokio::spawn(async move { connect_once(&ep, target_addr).await });
         match handle.await {
-            Ok(Ok(())) => {
-                info!("Connection closed cleanly");
-                backoff = Duration::from_secs(1);
-            }
-            Ok(Err(e)) => {
-                warn!("Connection error: {}", e);
-            }
-            Err(join_err) => {
-                error!("Connection panicked: {}", join_err);
-            }
+            Ok(Ok(())) => info!("Connection closed cleanly"),
+            Ok(Err(e)) => warn!("Connection error: {}", e),
+            Err(join_err) => error!("Connection panicked: {}", join_err),
         }
 
-        info!("Reconnecting in {:?}...", backoff);
-        time::sleep(backoff).await;
-        backoff = (backoff * 2).min(max_backoff);
+        info!("Reconnecting in 2s...");
+        time::sleep(Duration::from_secs(2)).await;
     }
 }
 
@@ -612,10 +600,12 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
         }
     };
 
-    // Auto-update if server has a newer clean release version
+    // Auto-update only if server has a strictly newer clean release version
     if server_build_version != BUILD_VERSION {
-        if crate::net::update::is_release_version(&server_build_version) {
-            info!("Server has release version {}, attempting self-update...", server_build_version);
+        if crate::net::update::is_release_version(&server_build_version)
+            && crate::net::update::is_newer(&server_build_version, BUILD_VERSION)
+        {
+            info!("Server has newer version {}, attempting self-update...", server_build_version);
             match crate::net::update::self_update(&server_build_version).await {
                 Ok(()) => {
                     info!("Updated to {}. Restarting...", server_build_version);
@@ -648,7 +638,7 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     .wrap_err("Failed to accept clipboard stream")?;
     // Read and discard the stream-ready marker
     let _marker = recv_message(&mut clip_recv).await?;
-    debug!("Clipboard stream accepted");
+    info!("Clipboard stream accepted");
 
     // Spawn clipboard polling task (client → server)
     let clip_send = Arc::new(Mutex::new(clip_send));
@@ -683,10 +673,21 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                 result = recv_message(&mut clip_recv) => {
                     match result {
                         Ok(Some(Message::ClipboardUpdate { content })) => {
-                            clipboard.apply_update(&content).ok();
+                            if let Err(e) = clipboard.apply_update(&content) {
+                                warn!("Failed to apply clipboard update: {}", e);
+                            }
                         }
-                        Ok(Some(_)) => {}
-                        Ok(None) | Err(_) => break,
+                        Ok(Some(other)) => {
+                            debug!("Unexpected message on clipboard stream: {:?}", other);
+                        }
+                        Ok(None) => {
+                            info!("Clipboard stream closed by server");
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("Clipboard stream error: {}", e);
+                            break;
+                        }
                     }
                 }
                 _ = shutdown_rx2.changed() => {

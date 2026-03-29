@@ -11,6 +11,26 @@ fn platform_slug() -> Option<&'static str> {
     }
 }
 
+/// Parse a version string like "v0.1.2" into (major, minor, patch).
+fn parse_semver(version: &str) -> Option<(u32, u32, u32)> {
+    let v = version.strip_prefix('v')?;
+    // Take only the semver part before any suffix like "-dirty" or "-3-gabcdef"
+    let v = v.split('-').next()?;
+    let parts: Vec<&str> = v.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    Some((parts[0].parse().ok()?, parts[1].parse().ok()?, parts[2].parse().ok()?))
+}
+
+/// Returns true if `a` is a newer version than `b`.
+pub fn is_newer(a: &str, b: &str) -> bool {
+    match (parse_semver(a), parse_semver(b)) {
+        (Some(va), Some(vb)) => va > vb,
+        _ => false,
+    }
+}
+
 /// Returns true only for clean semver release tags (e.g. `v0.1.2`).
 /// Rejects dirty builds (`v0.1.2-dirty`) and dev builds (`v0.1.2-3-gabcdef`).
 pub fn is_release_version(version: &str) -> bool {
@@ -145,7 +165,7 @@ pub async fn update_check_loop() {
             continue;
         }
 
-        if !is_release_version(&latest) {
+        if !is_release_version(&latest) || !is_newer(&latest, BUILD_VERSION) {
             continue;
         }
 
@@ -178,5 +198,19 @@ mod tests {
         assert!(!is_release_version("0.1.2")); // no 'v' prefix
         assert!(!is_release_version("unknown"));
         assert!(!is_release_version(""));
+    }
+
+    #[test]
+    fn test_is_newer() {
+        assert!(is_newer("v0.1.10", "v0.1.9"));
+        assert!(is_newer("v0.2.0", "v0.1.9"));
+        assert!(is_newer("v1.0.0", "v0.99.99"));
+
+        assert!(!is_newer("v0.1.9", "v0.1.10"));
+        assert!(!is_newer("v0.1.9", "v0.1.9"));
+
+        // Handles dirty/dev versions by comparing base semver
+        assert!(is_newer("v0.1.10", "v0.1.9-dirty"));
+        assert!(!is_newer("v0.1.9", "v0.1.10-dirty"));
     }
 }

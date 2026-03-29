@@ -1,6 +1,6 @@
 [package]
 name = "nexdesk"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 description = "Cross-platform KVM sharing tool with QUIC transport"
 

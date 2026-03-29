@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use color_eyre::eyre::Result;
 use ring::digest;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 use crate::net::protocol::{ClipboardContent, Message};
 
@@ -13,6 +13,7 @@ pub struct ClipboardSync {
 
 impl ClipboardSync {
     pub fn new() -> Self {
+        info!("Clipboard sync initialized");
         Self { last_hash: None }
     }
 
@@ -29,7 +30,10 @@ impl ClipboardSync {
 
         let text = match clipboard.get_text() {
             Ok(t) => t,
-            Err(_) => return Ok(None),
+            Err(e) => {
+                warn!("Failed to read clipboard text: {}", e);
+                return Ok(None);
+            }
         };
 
         let hash = digest::digest(&digest::SHA256, text.as_bytes());
@@ -40,7 +44,7 @@ impl ClipboardSync {
         }
 
         self.last_hash = Some(hash_bytes);
-        debug!("Clipboard changed ({} bytes)", text.len());
+        info!("Clipboard changed ({} bytes), sending to peer", text.len());
 
         Ok(Some(Message::ClipboardUpdate {
             content: ClipboardContent::Text(text),
@@ -56,7 +60,7 @@ impl ClipboardSync {
                 // Update hash so we don't echo it back
                 let hash = digest::digest(&digest::SHA256, text.as_bytes());
                 self.last_hash = Some(hash.as_ref().to_vec());
-                debug!("Applied clipboard update ({} bytes)", text.len());
+                info!("Applied clipboard update from peer ({} bytes)", text.len());
             }
         }
         Ok(())
