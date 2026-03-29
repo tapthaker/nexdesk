@@ -1,6 +1,6 @@
 [package]
 name = "nexdesk"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 description = "Cross-platform KVM sharing tool with QUIC transport"
 
@@ -35,9 +35,6 @@ quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.13"
 ring = "0.17"
-
-# Clipboard (Phase 4b)
-arboard = "3"
 
 # TUI (Phase 6)
 ratatui = "0.29"

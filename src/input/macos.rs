@@ -114,6 +114,10 @@ pub struct MacOSInjector {
     modifier_flags: CGEventFlags,
     /// Bitmask of currently pressed mouse buttons (bit 0=left, 1=right, 2=middle)
     buttons_down: u8,
+    /// Timestamp and button of last mouse-down, for multi-click detection
+    last_click: Option<(std::time::Instant, u8)>,
+    /// Current click count (1=single, 2=double, 3=triple)
+    click_count: i64,
 }
 
 #[cfg(target_os = "macos")]
@@ -128,6 +132,8 @@ impl MacOSInjector {
             screen_height,
             modifier_flags: CGEventFlags::empty(),
             buttons_down: 0,
+            last_click: None,
+            click_count: 0,
         })
     }
 
@@ -193,6 +199,18 @@ impl InputInjector for MacOSInjector {
                 };
                 if *pressed {
                     self.buttons_down |= 1 << bit;
+                    // Track multi-click: if same button pressed within 500ms, increment count
+                    let now = std::time::Instant::now();
+                    if let Some((last_time, last_btn)) = self.last_click {
+                        if last_btn == *button && now.duration_since(last_time).as_millis() < 500 {
+                            self.click_count += 1;
+                        } else {
+                            self.click_count = 1;
+                        }
+                    } else {
+                        self.click_count = 1;
+                    }
+                    self.last_click = Some((now, *button));
                 } else {
                     self.buttons_down &= !(1 << bit);
                 }
@@ -202,25 +220,30 @@ impl InputInjector for MacOSInjector {
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
                 let event = CGEvent::new_mouse_event(Some(&source), event_type, point, cg_button)
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create mouse event"))?;
-                // Click count must be 1 for macOS to initiate drag-and-drop sessions.
-                CGEvent::set_integer_value_field(Some(&event), CGEventField::MouseEventClickState, 1);
+                CGEvent::set_integer_value_field(Some(&event), CGEventField::MouseEventClickState, self.click_count);
                 CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
             }
             Message::MouseScroll { dx, dy } => {
-                // Negate: scroll values arrive in traditional convention (positive=up)
-                // but CGEvent synthetic events bypass macOS natural scrolling, so we
-                // invert to match the default natural-scrolling direction.
                 let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
+                // Use 2 wheels to include horizontal axis (needed for back/forward swipe)
+                let wheel_count = if *dx != 0 { 2 } else { 1 };
                 let event = CGEvent::new_scroll_wheel_event2(
                     Some(&source),
                     CGScrollEventUnit::Pixel,
-                    1, // wheel_count
+                    wheel_count,
                     -*dy,
                     -*dx,
                     0,
                 )
                 .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create scroll event"))?;
+                // Mark as continuous (trackpad-style) for smooth scrolling and
+                // to enable momentum/swipe-to-navigate in apps.
+                CGEvent::set_integer_value_field(
+                    Some(&event),
+                    CGEventField::ScrollWheelEventIsContinuous,
+                    1,
+                );
                 CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
             }
             Message::KeyEvent {
