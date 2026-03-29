@@ -228,31 +228,54 @@ impl InputInjector for MacOSInjector {
 
                 let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
-                let is_continuous = *phase != ScrollPhase::None;
-                // Use 2 wheels to include horizontal axis (needed for back/forward swipe)
-                let wheel_count = if *dx != 0.0 { 2 } else { 1 };
-                let event = CGEvent::new_scroll_wheel_event2(
-                    Some(&source),
-                    CGScrollEventUnit::Pixel,
-                    wheel_count,
-                    -*dy as i32,
-                    -*dx as i32,
-                    0,
-                )
-                .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create scroll event"))?;
 
-                if is_continuous {
-                    // Mark as continuous (trackpad-style) for smooth scrolling
+                // Vertical scroll: line-based events with pixel point deltas.
+                // This approach works in all apps including Firefox.
+                if *dy != 0.0 {
+                    let line_dy = if *dy > 0.0 { -1 } else { 1 };
+                    let event = CGEvent::new_scroll_wheel_event2(
+                        Some(&source),
+                        CGScrollEventUnit::Line,
+                        1,
+                        line_dy,
+                        0,
+                        0,
+                    )
+                    .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create scroll event"))?;
+                    CGEvent::set_integer_value_field(
+                        Some(&event),
+                        CGEventField::ScrollWheelEventPointDeltaAxis1,
+                        -*dy as i64,
+                    );
+                    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+                }
+
+                // Horizontal scroll: continuous trackpad events with phases.
+                // This is what triggers swipe-to-navigate in browsers/Finder.
+                if *dx != 0.0 || (*phase == ScrollPhase::Ended && *dy == 0.0) {
+                    let event = CGEvent::new_scroll_wheel_event2(
+                        Some(&source),
+                        CGScrollEventUnit::Pixel,
+                        2,
+                        0,
+                        -*dx as i32,
+                        0,
+                    )
+                    .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create scroll event"))?;
                     CGEvent::set_integer_value_field(
                         Some(&event),
                         CGEventField::ScrollWheelEventIsContinuous,
                         1,
                     );
-                    // Set scroll phase so macOS can detect gestures (swipe-back, etc.)
+                    CGEvent::set_integer_value_field(
+                        Some(&event),
+                        CGEventField::ScrollWheelEventPointDeltaAxis2,
+                        -*dx as i64,
+                    );
                     let cg_phase: i64 = match phase {
-                        ScrollPhase::Began => 1,   // kCGScrollPhaseBegan
-                        ScrollPhase::Changed => 2, // kCGScrollPhaseChanged
-                        ScrollPhase::Ended => 4,   // kCGScrollPhaseEnded
+                        ScrollPhase::Began => 1,
+                        ScrollPhase::Changed => 2,
+                        ScrollPhase::Ended => 4,
                         ScrollPhase::None => 0,
                     };
                     CGEvent::set_integer_value_field(
@@ -260,9 +283,8 @@ impl InputInjector for MacOSInjector {
                         CGEventField::ScrollWheelEventScrollPhase,
                         cg_phase,
                     );
+                    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
                 }
-
-                CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
             }
             Message::KeyEvent {
                 keycode, pressed, ..

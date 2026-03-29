@@ -251,6 +251,8 @@ async fn handle_server_connection(
     let mut last_input_time = Instant::now();
     const IDLE_THRESHOLD: Duration = Duration::from_secs(30);
 
+    // Track scroll gesture state for proper Began/Changed/Ended phases.
+    let mut scroll_active = false;
     let mut layer_shell_keyboard_grabbed = false;
 
     loop {
@@ -484,16 +486,20 @@ async fn handle_server_connection(
                     }
                     LayerShellEvent::MouseScroll { dx, dy } => {
                         if transition.is_active() {
-                            let msg = Message::MouseScroll {
-                                dx, dy,
-                                phase: crate::net::protocol::ScrollPhase::Changed,
+                            let phase = if scroll_active {
+                                crate::net::protocol::ScrollPhase::Changed
+                            } else {
+                                scroll_active = true;
+                                crate::net::protocol::ScrollPhase::Began
                             };
+                            let msg = Message::MouseScroll { dx, dy, phase };
                             let mut sender = input_send.lock().await;
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
                     }
                     LayerShellEvent::ScrollEnd => {
-                        if transition.is_active() {
+                        if transition.is_active() && scroll_active {
+                            scroll_active = false;
                             let msg = Message::MouseScroll {
                                 dx: 0.0, dy: 0.0,
                                 phase: crate::net::protocol::ScrollPhase::Ended,
