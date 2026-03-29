@@ -16,6 +16,19 @@ pub enum Direction {
     Down,
 }
 
+/// Scroll gesture phase (maps to macOS CGScrollEventScrollPhase).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScrollPhase {
+    /// Discrete scroll (mouse wheel) — no phase tracking.
+    None,
+    /// Continuous gesture started.
+    Began,
+    /// Continuous gesture ongoing.
+    Changed,
+    /// Continuous gesture ended.
+    Ended,
+}
+
 /// Clipboard content types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClipboardContent {
@@ -53,7 +66,7 @@ pub enum Message {
     // Phase 3: Mouse
     MouseMove { x: i32, y: i32 },
     MouseButton { button: u8, pressed: bool },
-    MouseScroll { dx: i32, dy: i32 },
+    MouseScroll { dx: f64, dy: f64, phase: ScrollPhase },
     SwitchScreen { direction: Direction },
 
     // Phase 4a: Keyboard

@@ -49,6 +49,7 @@ pub enum LayerShellEvent {
     MouseMove { dx: f64, dy: f64 },
     MouseButton { button: u32, pressed: bool },
     MouseScroll { dx: f64, dy: f64 },
+    ScrollEnd,
     KeyEvent { keycode: u32, pressed: bool },
     KeyModifiers { depressed: u32, latched: u32, locked: u32, group: u32 },
 }
@@ -607,6 +608,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                     if dx != 0.0 || dy != 0.0 {
                         state.send_event(LayerShellEvent::MouseScroll { dx, dy });
                     }
+                }
+            }
+            wl_pointer::Event::AxisStop { .. } => {
+                if state.grabbed {
+                    state.send_event(LayerShellEvent::ScrollEnd);
                 }
             }
             _ => {}

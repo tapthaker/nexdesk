@@ -496,11 +496,14 @@ impl InputCapture for WaylandCapturer {
             }
         }
 
-        // Emit accumulated scroll events
-        let sx = self.scroll_acc_x as i32;
-        let sy = self.scroll_acc_y as i32;
-        if sx != 0 || sy != 0 {
-            events.push(Message::MouseScroll { dx: sx, dy: sy });
+        // Emit accumulated scroll events (discrete mouse wheel — no phase)
+        let sx = self.scroll_acc_x;
+        let sy = self.scroll_acc_y;
+        if sx != 0.0 || sy != 0.0 {
+            events.push(Message::MouseScroll {
+                dx: sx, dy: sy,
+                phase: crate::net::protocol::ScrollPhase::None,
+            });
             self.scroll_acc_x = 0.0;
             self.scroll_acc_y = 0.0;
         }

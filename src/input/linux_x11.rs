@@ -140,17 +140,19 @@ impl InputInjector for X11Injector {
                 self.conn.xtest_fake_input(event_type, x_button, 0, self.root, 0, 0, 0)?;
                 self.conn.flush()?;
             }
-            Message::MouseScroll { dx, dy } => {
-                if *dy != 0 {
-                    let button = if *dy > 0 { 4u8 } else { 5u8 };
-                    for _ in 0..dy.unsigned_abs() {
+            Message::MouseScroll { dx, dy, .. } => {
+                let idy = *dy as i32;
+                let idx = *dx as i32;
+                if idy != 0 {
+                    let button = if idy > 0 { 4u8 } else { 5u8 };
+                    for _ in 0..idy.unsigned_abs() {
                         self.conn.xtest_fake_input(BUTTON_PRESS, button, 0, self.root, 0, 0, 0)?;
                         self.conn.xtest_fake_input(BUTTON_RELEASE, button, 0, self.root, 0, 0, 0)?;
                     }
                 }
-                if *dx != 0 {
-                    let button = if *dx > 0 { 7u8 } else { 6u8 };
-                    for _ in 0..dx.unsigned_abs() {
+                if idx != 0 {
+                    let button = if idx > 0 { 7u8 } else { 6u8 };
+                    for _ in 0..idx.unsigned_abs() {
                         self.conn.xtest_fake_input(BUTTON_PRESS, button, 0, self.root, 0, 0, 0)?;
                         self.conn.xtest_fake_input(BUTTON_RELEASE, button, 0, self.root, 0, 0, 0)?;
                     }
