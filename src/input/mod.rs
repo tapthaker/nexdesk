@@ -41,6 +41,7 @@ pub mod macos;
 pub fn is_accessibility_granted() -> bool {
     #[cfg(target_os = "macos")]
     {
+        #[link(name = "ApplicationServices", kind = "framework")]
         extern "C" {
             fn AXIsProcessTrusted() -> bool;
         }
