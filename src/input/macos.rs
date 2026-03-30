@@ -105,6 +105,23 @@ const EVDEV_KEY_LEFTMETA: u32 = 125;
 #[cfg(target_os = "macos")]
 const EVDEV_KEY_RIGHTMETA: u32 = 126;
 
+/// Map evdev keycode to macOS NX_KEYTYPE for media/special keys.
+/// Returns None for non-media keys.
+#[cfg(target_os = "macos")]
+fn evdev_to_media_key(evdev: u32) -> Option<i32> {
+    match evdev {
+        113 => Some(7),  // KEY_MUTE         -> NX_KEYTYPE_MUTE
+        114 => Some(1),  // KEY_VOLUMEDOWN   -> NX_KEYTYPE_SOUND_DOWN
+        115 => Some(0),  // KEY_VOLUMEUP     -> NX_KEYTYPE_SOUND_UP
+        163 => Some(17), // KEY_NEXTSONG     -> NX_KEYTYPE_NEXT
+        164 => Some(16), // KEY_PLAYPAUSE    -> NX_KEYTYPE_PLAY
+        165 => Some(18), // KEY_PREVIOUSSONG -> NX_KEYTYPE_PREVIOUS
+        224 => Some(22), // KEY_BRIGHTNESSDOWN -> NX_KEYTYPE_BRIGHTNESS_DOWN
+        225 => Some(21), // KEY_BRIGHTNESSUP   -> NX_KEYTYPE_BRIGHTNESS_UP
+        _ => None,
+    }
+}
+
 /// macOS input injector using CoreGraphics.
 #[cfg(target_os = "macos")]
 pub struct MacOSInjector {
@@ -151,6 +168,39 @@ impl MacOSInjector {
         } else {
             self.modifier_flags -= flag;
         }
+    }
+
+    /// Post an NSSystemDefined media key event (volume, brightness, play, etc.)
+    fn post_media_key_event(&self, nx_keytype: i32, pressed: bool) -> color_eyre::eyre::Result<()> {
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
+        let event = CGEvent::new(Some(&source))
+            .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEvent"))?;
+        // NX_SYSDEFINED = 14
+        CGEvent::set_type(Some(&event), CGEventType(14));
+        // data1 layout: (keytype << 16) | (flags << 8)
+        // flags: 0x0A = key down, 0x0B = key up
+        let flags: i64 = if pressed { 0x0A } else { 0x0B };
+        let data1: i64 = ((nx_keytype as i64) << 16) | (flags << 8);
+        // CGEventField 85 = misc int field used for data1, 86 = data2
+        // But the proper way is to set the event's integer fields directly.
+        // kCGEventField 0x57 (87) is sometimes used, but the standard approach
+        // uses specific field offsets for NSSystemDefined events.
+        unsafe {
+            // Use the IOKit/CoreGraphics internal field offsets for system events
+            extern "C" {
+                fn CGEventSetIntegerValueField(event: *const std::ffi::c_void, field: u32, value: i64);
+            }
+            let event_ref = &*event as *const CGEvent as *const std::ffi::c_void;
+            // Field 133 = event subtype (8 = NX_SUBTYPE_AUX_CONTROL_BUTTON)
+            CGEventSetIntegerValueField(event_ref, 133, 8);
+            // Field 134 = data1
+            CGEventSetIntegerValueField(event_ref, 134, data1);
+            // Field 135 = data2
+            CGEventSetIntegerValueField(event_ref, 135, -1);
+        }
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+        Ok(())
     }
 
     fn post_mouse_event(
@@ -229,24 +279,18 @@ impl InputInjector for MacOSInjector {
                 let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
 
-                // Vertical scroll: line-based events with pixel point deltas.
-                // This approach works in all apps including Firefox.
+                // Vertical scroll: pixel-based events without the continuous
+                // flag. This works in all apps including Firefox.
                 if *dy != 0.0 {
-                    let line_dy = if *dy > 0.0 { -1 } else { 1 };
                     let event = CGEvent::new_scroll_wheel_event2(
                         Some(&source),
-                        CGScrollEventUnit::Line,
+                        CGScrollEventUnit::Pixel,
                         1,
-                        line_dy,
+                        -*dy as i32,
                         0,
                         0,
                     )
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create scroll event"))?;
-                    CGEvent::set_integer_value_field(
-                        Some(&event),
-                        CGEventField::ScrollWheelEventPointDeltaAxis1,
-                        -*dy as i64,
-                    );
                     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
                 }
 
@@ -289,6 +333,12 @@ impl InputInjector for MacOSInjector {
             Message::KeyEvent {
                 keycode, pressed, ..
             } => {
+                // Media keys use NSSystemDefined events, not keyboard events.
+                if let Some(nx_keytype) = evdev_to_media_key(*keycode) {
+                    self.post_media_key_event(nx_keytype, *pressed)?;
+                    return Ok(());
+                }
+
                 // Update modifier state BEFORE creating the event so that
                 // modifier key-down events carry their own flag.
                 self.update_modifier_flags(*keycode, *pressed);
