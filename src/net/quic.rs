@@ -142,12 +142,17 @@ async fn handle_server_connection(
     // Spawn clipboard polling task
     let clip_send = Arc::new(Mutex::new(clip_send));
     let clip_send_clone = clip_send.clone();
+    let clipboard = Arc::new(std::sync::Mutex::new(crate::clipboard::sync::ClipboardSync::new()));
+    let clipboard_poll = clipboard.clone();
     tokio::spawn(async move {
-        let mut clipboard = crate::clipboard::sync::ClipboardSync::new();
         let interval = crate::clipboard::sync::ClipboardSync::poll_interval();
         loop {
             tokio::time::sleep(interval).await;
-            if let Ok(Some(msg)) = clipboard.poll_change() {
+            let msg = {
+                let mut clipboard = clipboard_poll.lock().unwrap();
+                clipboard.poll_change()
+            };
+            if let Ok(Some(msg)) = msg {
                 let mut sender = clip_send_clone.lock().await;
                 if send_message(&mut sender, &msg).await.is_err() {
                     break;
@@ -157,11 +162,12 @@ async fn handle_server_connection(
     });
 
     // Spawn clipboard receive task
+    let clipboard_recv = clipboard.clone();
     tokio::spawn(async move {
-        let mut clipboard = crate::clipboard::sync::ClipboardSync::new();
         loop {
             match recv_message(&mut clip_recv).await {
                 Ok(Some(Message::ClipboardUpdate { content })) => {
+                    let mut clipboard = clipboard_recv.lock().unwrap();
                     clipboard.apply_update(&content).ok();
                 }
                 Ok(Some(_)) => {}
@@ -569,14 +575,19 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     // Spawn clipboard polling task (client → server)
     let clip_send = Arc::new(Mutex::new(clip_send));
     let clip_send_clone = clip_send.clone();
+    let clipboard = Arc::new(std::sync::Mutex::new(crate::clipboard::sync::ClipboardSync::new()));
+    let clipboard_poll = clipboard.clone();
     let mut shutdown_rx1 = shutdown_tx.subscribe();
     tokio::spawn(async move {
-        let mut clipboard = crate::clipboard::sync::ClipboardSync::new();
         let interval = crate::clipboard::sync::ClipboardSync::poll_interval();
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {
-                    if let Ok(Some(msg)) = clipboard.poll_change() {
+                    let msg = {
+                        let mut clipboard = clipboard_poll.lock().unwrap();
+                        clipboard.poll_change()
+                    };
+                    if let Ok(Some(msg)) = msg {
                         let mut sender = clip_send_clone.lock().await;
                         if send_message(&mut sender, &msg).await.is_err() {
                             break;
@@ -591,14 +602,15 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     });
 
     // Spawn clipboard receive task (server → client)
+    let clipboard_recv = clipboard.clone();
     let mut shutdown_rx2 = shutdown_tx.subscribe();
     tokio::spawn(async move {
-        let mut clipboard = crate::clipboard::sync::ClipboardSync::new();
         loop {
             tokio::select! {
                 result = recv_message(&mut clip_recv) => {
                     match result {
                         Ok(Some(Message::ClipboardUpdate { content })) => {
+                            let mut clipboard = clipboard_recv.lock().unwrap();
                             clipboard.apply_update(&content).ok();
                         }
                         Ok(Some(_)) => {}
