@@ -249,6 +249,29 @@ pub fn start_browsing() -> Result<(std::sync::mpsc::Receiver<DiscoveredPeer>, Br
 /// Discover the first nexdesk server on the LAN.
 /// Returns its socket address or an error if none found within `timeout`.
 pub async fn discover_one(timeout: Duration) -> Result<SocketAddr> {
+    let attempts = 3;
+    let per_attempt = timeout
+        .checked_div(attempts)
+        .filter(|duration| !duration.is_zero())
+        .unwrap_or(timeout);
+
+    for attempt in 1..=attempts {
+        match discover_one_attempt(per_attempt).await {
+            Ok(addr) => return Ok(addr),
+            Err(e) if attempt < attempts => {
+                debug!(
+                    "mDNS discovery attempt {}/{} failed: {}. Restarting browse session...",
+                    attempt, attempts, e
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(eyre!("No nexdesk server found within {:?}", timeout))
+}
+
+async fn discover_one_attempt(timeout: Duration) -> Result<SocketAddr> {
     let mdns = ServiceDaemon::new()?;
     let receiver = mdns.browse(SERVICE_TYPE)?;
 

@@ -277,7 +277,7 @@ pub async fn run() -> Result<()> {
                         if state.step == Step::Done {
                             break;
                         }
-                        apply_step(&mut state)?;
+                        apply_step_with_terminal(&mut terminal, &mut state).await?;
                         let role = state.config.role.as_deref().map(String::from);
                         state.step = state.step.next(role.as_deref());
                     }
@@ -285,7 +285,7 @@ pub async fn run() -> Result<()> {
                         if state.step == Step::Screens {
                             state.edge_selection = 1; // right
                         } else {
-                            apply_step(&mut state)?;
+                            apply_step_with_terminal(&mut terminal, &mut state).await?;
                             let role = state.config.role.as_deref().map(String::from);
                             state.step = state.step.next(role.as_deref());
                         }
@@ -356,7 +356,29 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-fn apply_step(state: &mut SetupState) -> Result<()> {
+async fn apply_step_with_terminal(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state: &mut SetupState,
+) -> Result<()> {
+    let suspend_tui = state.step == Step::Service && state.config.role.as_deref() != Some("server");
+
+    if suspend_tui {
+        disable_raw_mode()?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    }
+
+    let result = apply_step(state).await;
+
+    if suspend_tui {
+        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+        enable_raw_mode()?;
+        terminal.clear()?;
+    }
+
+    result
+}
+
+async fn apply_step(state: &mut SetupState) -> Result<()> {
     match state.step {
         Step::Role => {
             state.config.role = Some(
@@ -410,6 +432,11 @@ fn apply_step(state: &mut SetupState) -> Result<()> {
                     None => vec!["connect"],
                 },
             };
+            if state.config.role.as_deref() != Some("server") {
+                if let Some(addr) = state.config.server_addr.as_deref() {
+                    crate::net::quic::pair(addr).await?;
+                }
+            }
             if let Err(e) = crate::daemon::install_service(&args) {
                 tracing::warn!("Failed to install service: {}", e);
             } else {

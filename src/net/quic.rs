@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,7 +38,13 @@ pub async fn serve(port: u16, trigger_edge: Option<crate::net::protocol::Directi
     println!("\n  Pairing code: {}\n", otp);
 
     while let Some(incoming) = endpoint.accept().await {
-        let connection = incoming.await?;
+        let connection = match incoming.await {
+            Ok(connection) => connection,
+            Err(e) => {
+                warn!("Incoming connection failed before handshake: {}", e);
+                continue;
+            }
+        };
         let remote = connection.remote_address();
         info!("New connection from {}", remote);
 
@@ -508,6 +515,12 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                 info!("Server fingerprint already trusted");
                 None
             } else {
+                if !std::io::stdin().is_terminal() {
+                    return Err(eyre!(
+                        "Server fingerprint is not trusted and no interactive terminal is available for pairing. Run `nexdesk connect {}` from a terminal once, enter the pairing code, then restart the background service.",
+                        addr
+                    ));
+                }
                 // Prompt user for pairing code
                 let code = tokio::task::spawn_blocking(|| {
                     eprint!("Enter pairing code: ");
@@ -852,6 +865,80 @@ pub async fn ping(addr: &str) -> Result<()> {
 
     println!();
     connection.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+
+    Ok(())
+}
+
+/// Pair with a server once, storing its fingerprint if the OTP succeeds.
+pub async fn pair(addr: &str) -> Result<()> {
+    let addr = resolve_addr(addr)?;
+    let endpoint = make_client_endpoint()?;
+
+    info!("Pairing with {}...", addr);
+    let connection = connect_with_retry(&endpoint, addr).await?;
+
+    let (mut send, mut recv) = connection.accept_bi().await?;
+    let hello = recv_message(&mut recv).await?;
+
+    match hello {
+        Some(Message::Hello { version, hostname, screen, fingerprint, build_version }) => {
+            let server_ver = build_version.as_deref().unwrap_or("unknown");
+            info!(
+                "Server: {} (proto v{}, build {}, screen: {}x{})",
+                hostname, version, server_ver, screen.width, screen.height
+            );
+
+            let otp = if tls::is_fingerprint_trusted(&fingerprint) {
+                info!("Server fingerprint already trusted");
+                None
+            } else {
+                if !std::io::stdin().is_terminal() {
+                    return Err(eyre!(
+                        "Server fingerprint is not trusted and no interactive terminal is available for pairing. Run `nexdesk connect {}` from a terminal once, enter the pairing code, then restart the background service.",
+                        addr
+                    ));
+                }
+                let code = tokio::task::spawn_blocking(|| {
+                    eprint!("Enter pairing code: ");
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).ok();
+                    input.trim().to_string()
+                })
+                .await
+                .wrap_err("Failed to read pairing code")?;
+                Some(code)
+            };
+
+            let ack = Message::HelloAck {
+                accepted: true,
+                otp: otp.clone(),
+                screen: None,
+                build_version: Some(BUILD_VERSION.to_string()),
+            };
+            send_message(&mut send, &ack).await?;
+
+            match recv_message(&mut recv).await? {
+                Some(Message::PairingResult { success: true }) => {
+                    if otp.is_some() {
+                        tls::trust_fingerprint(&fingerprint)?;
+                        info!("Paired successfully. Fingerprint stored.");
+                    }
+                }
+                Some(Message::PairingResult { success: false }) => {
+                    return Err(eyre!("Pairing failed: invalid code"));
+                }
+                other => {
+                    return Err(eyre!("Expected PairingResult, got: {:?}", other));
+                }
+            }
+        }
+        other => {
+            return Err(eyre!("Expected Hello, got: {:?}", other));
+        }
+    }
+
+    connection.close(0u32.into(), b"paired");
     endpoint.wait_idle().await;
 
     Ok(())
