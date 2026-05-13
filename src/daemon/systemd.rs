@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
-use tracing::info;
+use tracing::{info, warn};
 
 const SERVICE_NAME: &str = "nexdesk";
 const SESSION_ENV_VARS: &[&str] = &[
@@ -68,6 +68,8 @@ WantedBy=default.target
 }
 
 pub fn install(args: &[&str]) -> Result<()> {
+    configure_firewall(args);
+
     let path = service_file_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).wrap_err("Failed to create systemd user directory")?;
@@ -93,6 +95,82 @@ pub fn install(args: &[&str]) -> Result<()> {
     info!("Enabled and started systemd user service {}", SERVICE_NAME);
 
     Ok(())
+}
+
+fn configure_firewall(args: &[&str]) {
+    if args.first() != Some(&"serve") {
+        return;
+    }
+
+    let port = service_port(args);
+    if !ufw_is_active() {
+        return;
+    }
+
+    match run_sudo_ufw(&[
+        "allow",
+        &format!("{port}/udp"),
+        "comment",
+        "nexdesk QUIC",
+    ]) {
+        Ok(()) => info!("Allowed nexdesk through UFW on UDP {}", port),
+        Err(e) => warn!(
+            "UFW is active but nexdesk could not add the UDP {} rule automatically: {}. Run: sudo ufw allow {}/udp comment 'nexdesk QUIC'",
+            port, e, port
+        ),
+    }
+}
+
+fn service_port(args: &[&str]) -> u16 {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match *arg {
+            "-p" | "--port" => {
+                if let Some(value) = iter.next() {
+                    if let Ok(port) = value.parse() {
+                        return port;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    4242
+}
+
+fn ufw_is_active() -> bool {
+    let output = Command::new("systemctl")
+        .args(["is-active", "--quiet", "ufw"])
+        .status();
+
+    matches!(output, Ok(status) if status.success())
+}
+
+fn run_sudo_ufw(args: &[&str]) -> Result<()> {
+    let output = Command::new("sudo")
+        .arg("-n")
+        .arg("ufw")
+        .args(args)
+        .output()
+        .wrap_err_with(|| format!("Failed to run sudo -n ufw {}", args.join(" ")))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(eyre!(
+        "sudo -n ufw {} exited with {}{}\n{}",
+        args.join(" "),
+        output.status,
+        if stdout.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", stdout.trim())
+        },
+        stderr.trim()
+    ))
 }
 
 fn run_systemctl(args: &[&str]) -> Result<()> {

@@ -40,6 +40,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SetupState) {
             platform
         )));
         lines.push(Line::from("  It will start automatically on login."));
+        #[cfg(target_os = "linux")]
+        if state.config.role.as_deref() == Some("server") {
+            lines.push(Line::from("  If UFW is active, setup will allow UDP 4242"));
+            lines.push(Line::from("  when passwordless sudo is available."));
+        }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  Press Enter to install and save configuration.",
