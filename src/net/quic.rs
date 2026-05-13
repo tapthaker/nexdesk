@@ -455,6 +455,7 @@ pub async fn connect(addr: Option<&str>) -> Result<()> {
             }
         };
 
+        info!("Connecting to nexdesk server at {}", target_addr);
         let ep = endpoint.clone();
         let handle = tokio::spawn(async move { connect_once(&ep, target_addr).await });
         match handle.await {
