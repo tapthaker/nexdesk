@@ -258,6 +258,14 @@ async fn handle_server_connection(
                             }
                         }
                     }
+                    ServerOutput::ShortcutRelease { messages } => {
+                        info!("Shortcut switch back — releasing grab");
+                        let mut sender = input_send.lock().await;
+                        for msg in messages {
+                            send_message_uni(&mut sender, &msg).await.ok();
+                        }
+                        capturer.lock().unwrap().set_grab(false).ok();
+                    }
                     ServerOutput::ForceRelease => {
                         warn!("Safety escape (Ctrl+Alt+Escape) — releasing grab");
                         capturer.lock().unwrap().set_grab(false).ok();
@@ -322,6 +330,16 @@ async fn handle_server_connection(
                             if transition.is_escape_combo() {
                                 warn!("Safety escape (Ctrl+Alt+Escape) — releasing layer-shell grab");
                                 transition.deactivate();
+                                if let Some(ref tx) = capture_tx {
+                                    tx.send(LayerShellCommand::Release).ok();
+                                }
+                            } else if transition.shortcut_direction().is_some() {
+                                info!("Shortcut switch back — releasing layer-shell grab");
+                                let messages = transition.deactivate_for_shortcut();
+                                let mut sender = input_send.lock().await;
+                                for msg in messages {
+                                    send_message_uni(&mut sender, &msg).await.ok();
+                                }
                                 if let Some(ref tx) = capture_tx {
                                     tx.send(LayerShellCommand::Release).ok();
                                 }

@@ -18,9 +18,15 @@ const KEY_REPEAT_INTERVAL: u32 = 15;
 // Evdev keycodes for the safety escape combo (Ctrl+Alt+Escape)
 const KEY_ESC: u32 = 1;
 const KEY_LEFTCTRL: u32 = 29;
+const KEY_LEFTSHIFT: u32 = 42;
+const KEY_RIGHTSHIFT: u32 = 54;
 const KEY_LEFTALT: u32 = 56;
 const KEY_RIGHTCTRL: u32 = 97;
 const KEY_RIGHTALT: u32 = 100;
+const KEY_UP: u32 = 103;
+const KEY_LEFT: u32 = 105;
+const KEY_RIGHT: u32 = 106;
+const KEY_DOWN: u32 = 108;
 
 /// Modifier keys that should NOT generate repeat events.
 fn is_modifier(keycode: u32) -> bool {
@@ -34,7 +40,7 @@ fn is_modifier(keycode: u32) -> bool {
         97 |   // KEY_RIGHTCTRL
         100 |  // KEY_RIGHTALT
         125 |  // KEY_LEFTMETA
-        126    // KEY_RIGHTMETA
+        126 // KEY_RIGHTMETA
     )
 }
 
@@ -43,8 +49,16 @@ fn is_modifier(keycode: u32) -> bool {
 #[derive(Debug)]
 pub enum ServerOutput {
     Idle,
-    Activate { messages: Vec<Message>, grab: bool },
-    Forward { messages: Vec<Message> },
+    Activate {
+        messages: Vec<Message>,
+        grab: bool,
+    },
+    Forward {
+        messages: Vec<Message>,
+    },
+    ShortcutRelease {
+        messages: Vec<Message>,
+    },
     /// Safety escape: Ctrl+Alt+Escape pressed, force-release grab
     ForceRelease,
 }
@@ -85,7 +99,10 @@ impl ServerTransition {
 
     fn update_pressed_keys(&mut self, key_events: &[Message]) {
         for msg in key_events {
-            if let Message::KeyEvent { keycode, pressed, .. } = msg {
+            if let Message::KeyEvent {
+                keycode, pressed, ..
+            } = msg
+            {
                 if *pressed {
                     self.pressed_keys.insert(*keycode);
                 } else {
@@ -96,12 +113,58 @@ impl ServerTransition {
     }
 
     pub fn is_escape_combo(&self) -> bool {
-        let has_ctrl = self.pressed_keys.contains(&KEY_LEFTCTRL)
-            || self.pressed_keys.contains(&KEY_RIGHTCTRL);
-        let has_alt = self.pressed_keys.contains(&KEY_LEFTALT)
-            || self.pressed_keys.contains(&KEY_RIGHTALT);
+        let has_ctrl =
+            self.pressed_keys.contains(&KEY_LEFTCTRL) || self.pressed_keys.contains(&KEY_RIGHTCTRL);
+        let has_alt =
+            self.pressed_keys.contains(&KEY_LEFTALT) || self.pressed_keys.contains(&KEY_RIGHTALT);
         let has_esc = self.pressed_keys.contains(&KEY_ESC);
         has_ctrl && has_alt && has_esc
+    }
+
+    pub fn shortcut_direction(&self) -> Option<Direction> {
+        let has_ctrl =
+            self.pressed_keys.contains(&KEY_LEFTCTRL) || self.pressed_keys.contains(&KEY_RIGHTCTRL);
+        let has_alt =
+            self.pressed_keys.contains(&KEY_LEFTALT) || self.pressed_keys.contains(&KEY_RIGHTALT);
+        let has_shift = self.pressed_keys.contains(&KEY_LEFTSHIFT)
+            || self.pressed_keys.contains(&KEY_RIGHTSHIFT);
+
+        if !(has_ctrl && has_alt && has_shift) {
+            return None;
+        }
+
+        let direction = if self.pressed_keys.contains(&KEY_RIGHT) {
+            Direction::Right
+        } else if self.pressed_keys.contains(&KEY_LEFT) {
+            Direction::Left
+        } else if self.pressed_keys.contains(&KEY_UP) {
+            Direction::Up
+        } else if self.pressed_keys.contains(&KEY_DOWN) {
+            Direction::Down
+        } else {
+            return None;
+        };
+
+        if self.trigger_edge.map_or(true, |edge| edge == direction) {
+            Some(direction)
+        } else {
+            None
+        }
+    }
+
+    fn release_pressed_keys(&mut self) -> Vec<Message> {
+        let mut keys: Vec<u32> = self.pressed_keys.iter().copied().collect();
+        keys.sort_unstable();
+        self.pressed_keys.clear();
+        self.key_hold_polls.clear();
+
+        keys.into_iter()
+            .map(|keycode| Message::KeyEvent {
+                keycode,
+                pressed: false,
+                modifiers: 0,
+            })
+            .collect()
     }
 
     /// Activate immediately (layer-shell: edge detection is instant, no dwell needed).
@@ -154,6 +217,41 @@ impl ServerTransition {
             self.pressed_keys.clear();
             self.key_hold_polls.clear();
             return ServerOutput::ForceRelease;
+        }
+
+        if let Some(dir) = self.shortcut_direction() {
+            if self.active {
+                self.active = false;
+                self.edge_cooldown = SERVER_EDGE_COOLDOWN;
+                return ServerOutput::ShortcutRelease {
+                    messages: self.release_pressed_keys(),
+                };
+            }
+
+            if self.edge_cooldown == 0 {
+                self.active = true;
+                self.last_buttons = buttons;
+                self.last_x = mx;
+                self.last_y = my;
+                self.edge_dwell = 0;
+
+                let pw = self.peer_screen.width as i32;
+                let ph = self.peer_screen.height as i32;
+                let (rx, ry) = match dir {
+                    Direction::Right => (INSET, ph / 2),
+                    Direction::Left => (pw - 1 - INSET, ph / 2),
+                    Direction::Down => (pw / 2, INSET),
+                    Direction::Up => (pw / 2, ph - 1 - INSET),
+                };
+
+                return ServerOutput::Activate {
+                    messages: vec![
+                        Message::SwitchScreen { direction: dir },
+                        Message::MouseMove { x: rx, y: ry },
+                    ],
+                    grab: true,
+                };
+            }
         }
 
         let clamped_x = mx.clamp(0, sw as i32 - 1);
@@ -230,7 +328,10 @@ impl ServerTransition {
 
             // Keyboard events: forward originals and update hold counters
             for key_msg in &key_events {
-                if let Message::KeyEvent { keycode, pressed, .. } = key_msg {
+                if let Message::KeyEvent {
+                    keycode, pressed, ..
+                } = key_msg
+                {
                     if *pressed {
                         self.key_hold_polls.entry(*keycode).or_insert(0);
                     } else {
@@ -275,6 +376,12 @@ impl ServerTransition {
         self.active = false;
         self.key_hold_polls.clear();
     }
+
+    pub fn deactivate_for_shortcut(&mut self) -> Vec<Message> {
+        self.active = false;
+        self.edge_cooldown = SERVER_EDGE_COOLDOWN;
+        self.release_pressed_keys()
+    }
 }
 
 // --- Client Transition ---
@@ -292,7 +399,10 @@ fn opposite(dir: Direction) -> Direction {
 pub enum ClientOutput {
     Ignore,
     Activate,
-    InjectMove { x: i32, y: i32 },
+    InjectMove {
+        x: i32,
+        y: i32,
+    },
     Forward(Message),
     SwitchBack {
         direction: Direction,
@@ -431,7 +541,11 @@ mod tests {
         // Dwell at right edge
         for i in 0..EDGE_DWELL_THRESHOLD - 1 {
             let out = st.poll(1919, 500, 1920, 1080, 0, vec![]);
-            assert!(matches!(out, ServerOutput::Idle), "should be idle at dwell {}", i);
+            assert!(
+                matches!(out, ServerOutput::Idle),
+                "should be idle at dwell {}",
+                i
+            );
         }
         // One more should trigger
         let out = st.poll(1919, 500, 1920, 1080, 0, vec![]);
@@ -471,7 +585,12 @@ mod tests {
         let out = st.poll(1919, 500, 1920, 1080, 0, vec![]);
         if let ServerOutput::Activate { messages, .. } = out {
             assert_eq!(messages.len(), 2);
-            assert!(matches!(messages[0], Message::SwitchScreen { direction: Direction::Right }));
+            assert!(matches!(
+                messages[0],
+                Message::SwitchScreen {
+                    direction: Direction::Right
+                }
+            ));
             // Placement: x=INSET, y clamped
             if let Message::MouseMove { x, y } = messages[1] {
                 assert_eq!(x, INSET);
@@ -539,7 +658,13 @@ mod tests {
         // Press button 0
         let out = st.poll(1919, 500, 1920, 1080, 1, vec![]);
         if let ServerOutput::Forward { messages } = out {
-            assert!(messages.iter().any(|m| matches!(m, Message::MouseButton { button: 0, pressed: true })));
+            assert!(messages.iter().any(|m| matches!(
+                m,
+                Message::MouseButton {
+                    button: 0,
+                    pressed: true
+                }
+            )));
         } else {
             panic!("Expected Forward");
         }
@@ -560,7 +685,9 @@ mod tests {
         };
         let out = st.poll(1919, 500, 1920, 1080, 0, vec![key]);
         if let ServerOutput::Forward { messages } = out {
-            assert!(messages.iter().any(|m| matches!(m, Message::KeyEvent { keycode: 42, .. })));
+            assert!(messages
+                .iter()
+                .any(|m| matches!(m, Message::KeyEvent { keycode: 42, .. })));
         } else {
             panic!("Expected Forward");
         }
@@ -624,9 +751,21 @@ mod tests {
         activate_server(&mut st);
 
         let keys = vec![
-            Message::KeyEvent { keycode: KEY_LEFTCTRL, pressed: true, modifiers: 0 },
-            Message::KeyEvent { keycode: KEY_LEFTALT, pressed: true, modifiers: 0 },
-            Message::KeyEvent { keycode: KEY_ESC, pressed: true, modifiers: 0 },
+            Message::KeyEvent {
+                keycode: KEY_LEFTCTRL,
+                pressed: true,
+                modifiers: 0,
+            },
+            Message::KeyEvent {
+                keycode: KEY_LEFTALT,
+                pressed: true,
+                modifiers: 0,
+            },
+            Message::KeyEvent {
+                keycode: KEY_ESC,
+                pressed: true,
+                modifiers: 0,
+            },
         ];
         let out = st.poll(1919, 500, 1920, 1080, 0, keys);
         assert!(matches!(out, ServerOutput::ForceRelease));
@@ -638,9 +777,11 @@ mod tests {
         let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
         activate_server(&mut st);
 
-        let keys = vec![
-            Message::KeyEvent { keycode: KEY_ESC, pressed: true, modifiers: 0 },
-        ];
+        let keys = vec![Message::KeyEvent {
+            keycode: KEY_ESC,
+            pressed: true,
+            modifiers: 0,
+        }];
         let out = st.poll(1919, 500, 1920, 1080, 0, keys);
         assert!(matches!(out, ServerOutput::Forward { .. }));
         assert!(st.is_active());
@@ -650,12 +791,141 @@ mod tests {
     fn server_escape_combo_ignored_when_inactive() {
         let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
         let keys = vec![
-            Message::KeyEvent { keycode: KEY_LEFTCTRL, pressed: true, modifiers: 0 },
-            Message::KeyEvent { keycode: KEY_LEFTALT, pressed: true, modifiers: 0 },
-            Message::KeyEvent { keycode: KEY_ESC, pressed: true, modifiers: 0 },
+            Message::KeyEvent {
+                keycode: KEY_LEFTCTRL,
+                pressed: true,
+                modifiers: 0,
+            },
+            Message::KeyEvent {
+                keycode: KEY_LEFTALT,
+                pressed: true,
+                modifiers: 0,
+            },
+            Message::KeyEvent {
+                keycode: KEY_ESC,
+                pressed: true,
+                modifiers: 0,
+            },
         ];
         let out = st.poll(500, 500, 1920, 1080, 0, keys);
         assert!(matches!(out, ServerOutput::Idle));
+    }
+
+    #[test]
+    fn server_shortcut_activates_matching_edge() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        let keys = vec![
+            Message::KeyEvent {
+                keycode: KEY_LEFTCTRL,
+                pressed: true,
+                modifiers: 0,
+            },
+            Message::KeyEvent {
+                keycode: KEY_LEFTALT,
+                pressed: true,
+                modifiers: 0,
+            },
+            Message::KeyEvent {
+                keycode: KEY_LEFTSHIFT,
+                pressed: true,
+                modifiers: 0,
+            },
+            Message::KeyEvent {
+                keycode: KEY_RIGHT,
+                pressed: true,
+                modifiers: 0,
+            },
+        ];
+
+        let out = st.poll(500, 500, 1920, 1080, 0, keys);
+        if let ServerOutput::Activate { messages, .. } = out {
+            assert!(matches!(
+                messages[0],
+                Message::SwitchScreen {
+                    direction: Direction::Right
+                }
+            ));
+            assert!(st.is_active());
+        } else {
+            panic!("Expected Activate");
+        }
+    }
+
+    #[test]
+    fn server_shortcut_respects_trigger_edge() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        let keys = vec![
+            Message::KeyEvent {
+                keycode: KEY_LEFTCTRL,
+                pressed: true,
+                modifiers: 0,
+            },
+            Message::KeyEvent {
+                keycode: KEY_LEFTALT,
+                pressed: true,
+                modifiers: 0,
+            },
+            Message::KeyEvent {
+                keycode: KEY_LEFTSHIFT,
+                pressed: true,
+                modifiers: 0,
+            },
+            Message::KeyEvent {
+                keycode: KEY_LEFT,
+                pressed: true,
+                modifiers: 0,
+            },
+        ];
+
+        let out = st.poll(500, 500, 1920, 1080, 0, keys);
+        assert!(matches!(out, ServerOutput::Idle));
+        assert!(!st.is_active());
+    }
+
+    #[test]
+    fn server_shortcut_releases_when_active() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        activate_server(&mut st);
+
+        let keys = vec![
+            Message::KeyEvent {
+                keycode: KEY_LEFTCTRL,
+                pressed: true,
+                modifiers: 0,
+            },
+            Message::KeyEvent {
+                keycode: KEY_LEFTALT,
+                pressed: true,
+                modifiers: 0,
+            },
+            Message::KeyEvent {
+                keycode: KEY_LEFTSHIFT,
+                pressed: true,
+                modifiers: 0,
+            },
+            Message::KeyEvent {
+                keycode: KEY_RIGHT,
+                pressed: true,
+                modifiers: 0,
+            },
+        ];
+
+        let out = st.poll(1919, 500, 1920, 1080, 0, keys);
+        if let ServerOutput::ShortcutRelease { messages } = out {
+            assert!(messages.iter().any(|m| {
+                matches!(
+                    m,
+                    Message::KeyEvent {
+                        keycode: KEY_LEFTCTRL,
+                        pressed: false,
+                        ..
+                    }
+                )
+            }));
+            assert!(!st.is_active());
+        } else {
+            panic!("Expected ShortcutRelease");
+        }
     }
 
     // ===== Client Tests =====
@@ -781,7 +1051,7 @@ mod tests {
 
         // Move to RIGHT edge (not the switch_back_edge)
         ct.handle(Message::MouseMove { x: 959, y: 0 }); // cursor at 1919
-        // Stay at right edge for many moves - should never switch back
+                                                        // Stay at right edge for many moves - should never switch back
         for _ in 0..CLIENT_EDGE_DWELL + 10 {
             let out = ct.handle(Message::MouseMove { x: 0, y: 0 });
             assert!(
@@ -855,7 +1125,10 @@ mod tests {
             let out = ct.handle(Message::MouseMove { x: 0, y: 0 });
             if let ClientOutput::SwitchBack { direction, inject } = out {
                 assert_eq!(direction, Direction::Left);
-                assert!(inject.is_some(), "SwitchBack must include inject coordinates");
+                assert!(
+                    inject.is_some(),
+                    "SwitchBack must include inject coordinates"
+                );
                 switched = true;
                 break;
             }
@@ -873,7 +1146,13 @@ mod tests {
             button: 0,
             pressed: true,
         });
-        assert!(matches!(out, ClientOutput::Forward(Message::MouseButton { button: 0, pressed: true })));
+        assert!(matches!(
+            out,
+            ClientOutput::Forward(Message::MouseButton {
+                button: 0,
+                pressed: true
+            })
+        ));
     }
 
     #[test]
@@ -883,7 +1162,10 @@ mod tests {
             direction: Direction::Right,
         });
         let out = ct.handle(Message::MouseScroll { dx: 0, dy: -3 });
-        assert!(matches!(out, ClientOutput::Forward(Message::MouseScroll { dx: 0, dy: -3 })));
+        assert!(matches!(
+            out,
+            ClientOutput::Forward(Message::MouseScroll { dx: 0, dy: -3 })
+        ));
     }
 
     #[test]
@@ -897,7 +1179,14 @@ mod tests {
             pressed: true,
             modifiers: 0,
         });
-        assert!(matches!(out, ClientOutput::Forward(Message::KeyEvent { keycode: 42, pressed: true, modifiers: 0 })));
+        assert!(matches!(
+            out,
+            ClientOutput::Forward(Message::KeyEvent {
+                keycode: 42,
+                pressed: true,
+                modifiers: 0
+            })
+        ));
     }
 
     // ===== Key Repeat Tests =====
@@ -908,7 +1197,11 @@ mod tests {
         activate_server(&mut st);
 
         // Press a non-modifier key (KEY_A = 30)
-        let key = vec![Message::KeyEvent { keycode: 30, pressed: true, modifiers: 0 }];
+        let key = vec![Message::KeyEvent {
+            keycode: 30,
+            pressed: true,
+            modifiers: 0,
+        }];
         st.poll(1919, 500, 1920, 1080, 0, key);
 
         // Hold until we see a repeat event (should happen within delay + interval polls)
@@ -916,7 +1209,16 @@ mod tests {
         for _ in 0..(KEY_REPEAT_DELAY + KEY_REPEAT_INTERVAL + 10) {
             let out = st.poll(1919, 500, 1920, 1080, 0, vec![]);
             if let ServerOutput::Forward { messages } = out {
-                if messages.iter().any(|m| matches!(m, Message::KeyEvent { keycode: 30, pressed: true, .. })) {
+                if messages.iter().any(|m| {
+                    matches!(
+                        m,
+                        Message::KeyEvent {
+                            keycode: 30,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                }) {
                     found_repeat = true;
                     break;
                 }
@@ -931,7 +1233,11 @@ mod tests {
         activate_server(&mut st);
 
         // Press Shift (modifier, keycode 42)
-        let key = vec![Message::KeyEvent { keycode: 42, pressed: true, modifiers: 0 }];
+        let key = vec![Message::KeyEvent {
+            keycode: 42,
+            pressed: true,
+            modifiers: 0,
+        }];
         st.poll(1919, 500, 1920, 1080, 0, key);
 
         // Hold past the delay
@@ -939,9 +1245,19 @@ mod tests {
             let out = st.poll(1919, 500, 1920, 1080, 0, vec![]);
             if let ServerOutput::Forward { messages } = out {
                 // Should never have a repeat for keycode 42
-                let repeats: Vec<_> = messages.iter().filter(|m| {
-                    matches!(m, Message::KeyEvent { keycode: 42, pressed: true, .. })
-                }).collect();
+                let repeats: Vec<_> = messages
+                    .iter()
+                    .filter(|m| {
+                        matches!(
+                            m,
+                            Message::KeyEvent {
+                                keycode: 42,
+                                pressed: true,
+                                ..
+                            }
+                        )
+                    })
+                    .collect();
                 assert!(repeats.is_empty(), "modifier keys should not repeat");
             }
         }
@@ -953,7 +1269,11 @@ mod tests {
         activate_server(&mut st);
 
         // Press KEY_A
-        let key = vec![Message::KeyEvent { keycode: 30, pressed: true, modifiers: 0 }];
+        let key = vec![Message::KeyEvent {
+            keycode: 30,
+            pressed: true,
+            modifiers: 0,
+        }];
         st.poll(1919, 500, 1920, 1080, 0, key);
 
         // Hold past the delay
@@ -962,16 +1282,30 @@ mod tests {
         }
 
         // Release the key
-        let key = vec![Message::KeyEvent { keycode: 30, pressed: false, modifiers: 0 }];
+        let key = vec![Message::KeyEvent {
+            keycode: 30,
+            pressed: false,
+            modifiers: 0,
+        }];
         st.poll(1919, 500, 1920, 1080, 0, key);
 
         // Further polls should NOT produce repeats for keycode 30
         for _ in 0..KEY_REPEAT_INTERVAL * 3 {
             let out = st.poll(1919, 500, 1920, 1080, 0, vec![]);
             if let ServerOutput::Forward { messages } = out {
-                let repeats: Vec<_> = messages.iter().filter(|m| {
-                    matches!(m, Message::KeyEvent { keycode: 30, pressed: true, .. })
-                }).collect();
+                let repeats: Vec<_> = messages
+                    .iter()
+                    .filter(|m| {
+                        matches!(
+                            m,
+                            Message::KeyEvent {
+                                keycode: 30,
+                                pressed: true,
+                                ..
+                            }
+                        )
+                    })
+                    .collect();
                 assert!(repeats.is_empty(), "released key should not repeat");
             }
         }
@@ -985,7 +1319,12 @@ mod tests {
         let messages = st.activate_instant(Direction::Right);
         assert!(st.is_active());
         assert_eq!(messages.len(), 2);
-        assert!(matches!(messages[0], Message::SwitchScreen { direction: Direction::Right }));
+        assert!(matches!(
+            messages[0],
+            Message::SwitchScreen {
+                direction: Direction::Right
+            }
+        ));
         if let Message::MouseMove { x, y } = messages[1] {
             assert_eq!(x, INSET);
             assert_eq!(y, 1440 / 2); // peer_screen height / 2
