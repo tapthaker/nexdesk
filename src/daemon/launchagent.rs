@@ -1,6 +1,7 @@
 use std::path::PathBuf;
+use std::process::Command;
 
-use color_eyre::eyre::{Result, WrapErr};
+use color_eyre::eyre::{eyre, Result, WrapErr};
 use tracing::info;
 
 const LABEL: &str = "com.nexdesk.agent";
@@ -14,8 +15,7 @@ fn plist_path() -> PathBuf {
 }
 
 fn plist_content(args: &[&str]) -> String {
-    let exe = std::env::current_exe()
-        .unwrap_or_else(|_| PathBuf::from("nexdesk"));
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nexdesk"));
 
     let arg_entries: String = args
         .iter()
@@ -55,14 +55,52 @@ fn plist_content(args: &[&str]) -> String {
 pub fn install(args: &[&str]) -> Result<()> {
     let path = plist_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .wrap_err("Failed to create LaunchAgents directory")?;
+        std::fs::create_dir_all(parent).wrap_err("Failed to create LaunchAgents directory")?;
     }
-    std::fs::write(&path, plist_content(args))
-        .wrap_err("Failed to write LaunchAgent plist")?;
+    std::fs::write(&path, plist_content(args)).wrap_err("Failed to write LaunchAgent plist")?;
 
     info!("Installed LaunchAgent at {}", path.display());
-    info!("Run: launchctl load {}", path.display());
+
+    let uid = current_uid();
+    let domain = format!("gui/{uid}");
+    let service = format!("{domain}/{LABEL}");
+
+    let _ = run_launchctl(&["bootout", &domain, path.to_string_lossy().as_ref()]);
+    run_launchctl(&["bootstrap", &domain, path.to_string_lossy().as_ref()])
+        .wrap_err("Failed to bootstrap LaunchAgent")?;
+    run_launchctl(&["enable", &service]).wrap_err("Failed to enable LaunchAgent")?;
+    run_launchctl(&["kickstart", "-k", &service]).wrap_err("Failed to start LaunchAgent")?;
+
+    info!("Loaded and started LaunchAgent {}", LABEL);
 
     Ok(())
+}
+
+fn current_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+fn run_launchctl(args: &[&str]) -> Result<()> {
+    let output = Command::new("launchctl")
+        .args(args)
+        .output()
+        .wrap_err_with(|| format!("Failed to run launchctl {}", args.join(" ")))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(eyre!(
+        "launchctl {} exited with {}{}\n{}",
+        args.join(" "),
+        output.status,
+        if stdout.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", stdout.trim())
+        },
+        stderr.trim()
+    ))
 }

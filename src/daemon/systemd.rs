@@ -1,6 +1,7 @@
 use std::path::PathBuf;
+use std::process::Command;
 
-use color_eyre::eyre::{Result, WrapErr};
+use color_eyre::eyre::{eyre, Result, WrapErr};
 use tracing::info;
 
 const SERVICE_NAME: &str = "nexdesk";
@@ -22,9 +23,7 @@ fn service_file_path() -> PathBuf {
 }
 
 fn systemd_escape(value: &str) -> String {
-    value
-        .replace('\\', r"\\")
-        .replace('"', r#"\""#)
+    value.replace('\\', r"\\").replace('"', r#"\""#)
 }
 
 fn service_environment() -> String {
@@ -37,8 +36,7 @@ fn service_environment() -> String {
 }
 
 fn service_unit(args: &[&str]) -> String {
-    let exe = std::env::current_exe()
-        .unwrap_or_else(|_| PathBuf::from("nexdesk"));
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nexdesk"));
 
     let args_str = args.join(" ");
     let env_lines = service_environment();
@@ -72,11 +70,9 @@ WantedBy=default.target
 pub fn install(args: &[&str]) -> Result<()> {
     let path = service_file_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .wrap_err("Failed to create systemd user directory")?;
+        std::fs::create_dir_all(parent).wrap_err("Failed to create systemd user directory")?;
     }
-    std::fs::write(&path, service_unit(args))
-        .wrap_err("Failed to write systemd service file")?;
+    std::fs::write(&path, service_unit(args)).wrap_err("Failed to write systemd service file")?;
 
     info!("Installed systemd user service at {}", path.display());
     for key in SESSION_ENV_VARS {
@@ -84,7 +80,42 @@ pub fn install(args: &[&str]) -> Result<()> {
             info!("Captured session env {}={}", key, value);
         }
     }
-    info!("Run: systemctl --user daemon-reload && systemctl --user enable --now {}", SERVICE_NAME);
+
+    run_systemctl(&["--user", "daemon-reload"]).wrap_err("Failed to reload systemd user units")?;
+    run_systemctl(&[
+        "--user",
+        "enable",
+        "--now",
+        &format!("{SERVICE_NAME}.service"),
+    ])
+    .wrap_err("Failed to enable and start systemd user service")?;
+
+    info!("Enabled and started systemd user service {}", SERVICE_NAME);
 
     Ok(())
+}
+
+fn run_systemctl(args: &[&str]) -> Result<()> {
+    let output = Command::new("systemctl")
+        .args(args)
+        .output()
+        .wrap_err_with(|| format!("Failed to run systemctl {}", args.join(" ")))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(eyre!(
+        "systemctl {} exited with {}{}\n{}",
+        args.join(" "),
+        output.status,
+        if stdout.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", stdout.trim())
+        },
+        stderr.trim()
+    ))
 }

@@ -18,11 +18,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SetupState) {
 
         #[cfg(target_os = "linux")]
         {
-            lines.push(Line::from("  To start: systemctl --user enable --now nexdesk"));
+            lines.push(Line::from("  The service is enabled and running."));
         }
         #[cfg(target_os = "macos")]
         {
-            lines.push(Line::from("  The service will start automatically on login."));
+            lines.push(Line::from(
+                "  The service will start automatically on login.",
+            ));
         }
     } else {
         let platform = if cfg!(target_os = "macos") {
@@ -45,7 +47,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SetupState) {
         )));
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" Service Installation "));
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Service Installation "),
+    );
     frame.render_widget(paragraph, area);
 }
