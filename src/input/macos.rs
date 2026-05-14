@@ -195,11 +195,16 @@ impl InputInjector for MacOSInjector {
                 // Negate: scroll values arrive in traditional convention (positive=up)
                 // but CGEvent synthetic events bypass macOS natural scrolling, so we
                 // invert to match the default natural-scrolling direction.
+                //
+                // Keep these as line units, not pixel units. The protocol currently
+                // represents scroll as wheel-style steps: Linux injection replays each
+                // unit as an X11 wheel button event, while pixel units on macOS make
+                // the same value scroll far more slowly.
                 let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
                 let event = CGEvent::new_scroll_wheel_event2(
                     Some(&source),
-                    CGScrollEventUnit::Pixel,
+                    CGScrollEventUnit::Line,
                     1, // wheel_count
                     -*dy,
                     -*dx,
