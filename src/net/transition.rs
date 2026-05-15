@@ -200,6 +200,60 @@ impl ServerTransition {
         }
     }
 
+    fn push_key_events_and_repeats(&mut self, key_events: Vec<Message>, messages: &mut Vec<Message>) {
+        for key_msg in &key_events {
+            if let Message::KeyEvent { keycode, pressed, .. } = key_msg {
+                if *pressed {
+                    self.key_hold_polls.entry(*keycode).or_insert(0);
+                } else {
+                    self.key_hold_polls.remove(keycode);
+                }
+            }
+        }
+        for key_msg in key_events {
+            messages.push(key_msg);
+        }
+
+        for (&keycode, polls) in &mut self.key_hold_polls {
+            *polls += 1;
+            if !is_modifier(keycode)
+                && *polls > KEY_REPEAT_DELAY
+                && (*polls - KEY_REPEAT_DELAY) % KEY_REPEAT_INTERVAL == 0
+            {
+                messages.push(Message::KeyEvent {
+                    keycode,
+                    pressed: true,
+                    modifiers: 0,
+                });
+            }
+        }
+    }
+
+    pub fn poll_active_keys(&mut self, key_events: Vec<Message>) -> ServerOutput {
+        if !self.active {
+            return ServerOutput::Idle;
+        }
+
+        self.update_pressed_keys(&key_events);
+        if self.is_escape_combo() {
+            self.active = false;
+            self.pressed_keys.clear();
+            self.key_hold_polls.clear();
+            return ServerOutput::ForceRelease;
+        }
+        if self.shortcut_direction().is_some() {
+            self.active = false;
+            self.edge_cooldown = SERVER_EDGE_COOLDOWN;
+            return ServerOutput::ShortcutRelease {
+                messages: self.release_pressed_keys(),
+            };
+        }
+
+        let mut messages = Vec::new();
+        self.push_key_events_and_repeats(key_events, &mut messages);
+        ServerOutput::Forward { messages }
+    }
+
     pub fn poll(
         &mut self,
         mx: i32,
@@ -326,37 +380,8 @@ impl ServerTransition {
                 self.last_buttons = buttons;
             }
 
-            // Keyboard events: forward originals and update hold counters
-            for key_msg in &key_events {
-                if let Message::KeyEvent {
-                    keycode, pressed, ..
-                } = key_msg
-                {
-                    if *pressed {
-                        self.key_hold_polls.entry(*keycode).or_insert(0);
-                    } else {
-                        self.key_hold_polls.remove(keycode);
-                    }
-                }
-            }
-            for key_msg in key_events {
-                messages.push(key_msg);
-            }
-
-            // Generate repeat events for non-modifier keys held past the delay
-            for (&keycode, polls) in &mut self.key_hold_polls {
-                *polls += 1;
-                if !is_modifier(keycode)
-                    && *polls > KEY_REPEAT_DELAY
-                    && (*polls - KEY_REPEAT_DELAY) % KEY_REPEAT_INTERVAL == 0
-                {
-                    messages.push(Message::KeyEvent {
-                        keycode,
-                        pressed: true,
-                        modifiers: 0,
-                    });
-                }
-            }
+            // Keyboard events: forward originals and synthesize repeats.
+            self.push_key_events_and_repeats(key_events, &mut messages);
 
             ServerOutput::Forward { messages }
         }
@@ -691,6 +716,27 @@ mod tests {
         } else {
             panic!("Expected Forward");
         }
+    }
+
+    #[test]
+    fn server_active_key_polling_forwards_keys() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        activate_server(&mut st);
+
+        let out = st.poll_active_keys(vec![Message::KeyEvent {
+            keycode: 115,
+            pressed: true,
+            modifiers: 0,
+        }]);
+
+        assert!(matches!(
+            out,
+            ServerOutput::Forward { ref messages }
+                if messages.iter().any(|m| matches!(
+                    m,
+                    Message::KeyEvent { keycode: 115, pressed: true, .. }
+                ))
+        ));
     }
 
     #[test]

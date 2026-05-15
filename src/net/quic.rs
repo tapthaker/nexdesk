@@ -215,10 +215,13 @@ async fn handle_server_connection(
     info!("Screen size: {}x{}", screen_w, screen_h);
 
     let mut poll_interval = time::interval(MOUSE_POLL_INTERVAL);
+    let mut layer_shell_key_poll_interval = time::interval(MOUSE_POLL_INTERVAL);
     let mut debug_counter: u64 = 0;
     let mut last_screen_w = screen_w;
     let mut last_screen_h = screen_h;
     let mut screen_check = time::interval(Duration::from_secs(5));
+
+    let mut layer_shell_keyboard_grabbed = false;
 
     loop {
         tokio::select! {
@@ -279,6 +282,64 @@ async fn handle_server_connection(
                     }
                 }
             }
+            // Branch: keyboard polling for layer-shell mode. Wayland compositors
+            // can consume global shortcuts and media keys before wl_keyboard sees
+            // them, so use evdev while the remote screen is active.
+            _ = layer_shell_key_poll_interval.tick(), if use_layer_shell && layer_shell_keyboard_grabbed && transition.is_active() => {
+                let key_events: Vec<Message> = {
+                    let mut cap = capturer.lock().unwrap();
+                    cap.poll_key_events()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|msg| matches!(msg, Message::KeyEvent { .. }))
+                        .collect()
+                };
+
+                match transition.poll_active_keys(key_events) {
+                    ServerOutput::Idle => {}
+                    ServerOutput::Activate { .. } => {}
+                    ServerOutput::ShortcutRelease { messages } => {
+                        info!("Shortcut switch back — releasing layer-shell grab");
+                        let mut sender = input_send.lock().await;
+                        for msg in messages {
+                            send_message_uni(&mut sender, &msg).await.ok();
+                        }
+                        if let Some(ref tx) = capture_tx {
+                            use crate::input::wayland_layer_shell::LayerShellCommand;
+                            tx.send(LayerShellCommand::Release).ok();
+                        }
+                        capturer.lock().unwrap().set_keyboard_grab(false).ok();
+                        layer_shell_keyboard_grabbed = false;
+                    }
+                    ServerOutput::Forward { messages } => {
+                        if !messages.is_empty() {
+                            let mut sender = input_send.lock().await;
+                            for msg in messages {
+                                if let Err(e) = send_message_uni(&mut sender, &msg).await {
+                                    warn!("Failed to send key event: {}", e);
+                                    transition.deactivate();
+                                    if let Some(ref tx) = capture_tx {
+                                        use crate::input::wayland_layer_shell::LayerShellCommand;
+                                        tx.send(LayerShellCommand::Release).ok();
+                                    }
+                                    capturer.lock().unwrap().set_keyboard_grab(false).ok();
+                                    layer_shell_keyboard_grabbed = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    ServerOutput::ForceRelease => {
+                        warn!("Safety escape (Ctrl+Alt+Escape) — releasing layer-shell grab");
+                        if let Some(ref tx) = capture_tx {
+                            use crate::input::wayland_layer_shell::LayerShellCommand;
+                            tx.send(LayerShellCommand::Release).ok();
+                        }
+                        capturer.lock().unwrap().set_keyboard_grab(false).ok();
+                        layer_shell_keyboard_grabbed = false;
+                    }
+                }
+            }
             // Branch: Layer-shell events (only when layer-shell is active)
             Some(event) = async {
                 match &mut capture_rx {
@@ -291,6 +352,15 @@ async fn handle_server_connection(
                     LayerShellEvent::EdgeEnter { direction } => {
                         let messages = transition.activate_instant(direction);
                         info!("Layer-shell edge enter ({:?}) — switching to remote", direction);
+                        match capturer.lock().unwrap().set_keyboard_grab(true) {
+                            Ok(()) => {
+                                layer_shell_keyboard_grabbed = true;
+                            }
+                            Err(e) => {
+                                warn!("Failed to grab keyboard devices for layer-shell capture: {}", e);
+                                layer_shell_keyboard_grabbed = false;
+                            }
+                        }
                         let mut sender = input_send.lock().await;
                         for msg in messages {
                             send_message_uni(&mut sender, &msg).await.ok();
@@ -306,6 +376,8 @@ async fn handle_server_connection(
                                 if let Some(ref tx) = capture_tx {
                                     tx.send(LayerShellCommand::Release).ok();
                                 }
+                                capturer.lock().unwrap().set_keyboard_grab(false).ok();
+                                layer_shell_keyboard_grabbed = false;
                             }
                         }
                     }
@@ -332,7 +404,7 @@ async fn handle_server_connection(
                         }
                     }
                     LayerShellEvent::KeyEvent { keycode, pressed } => {
-                        if transition.is_active() {
+                        if transition.is_active() && !layer_shell_keyboard_grabbed {
                             transition.update_key(keycode, pressed);
                             if transition.is_escape_combo() {
                                 warn!("Safety escape (Ctrl+Alt+Escape) — releasing layer-shell grab");
@@ -350,6 +422,8 @@ async fn handle_server_connection(
                                 if let Some(ref tx) = capture_tx {
                                     tx.send(LayerShellCommand::Release).ok();
                                 }
+                                capturer.lock().unwrap().set_keyboard_grab(false).ok();
+                                layer_shell_keyboard_grabbed = false;
                             } else {
                                 let msg = Message::KeyEvent { keycode, pressed, modifiers: 0 };
                                 let mut sender = input_send.lock().await;
@@ -378,6 +452,8 @@ async fn handle_server_connection(
                                 use crate::input::wayland_layer_shell::LayerShellCommand;
                                 tx.send(LayerShellCommand::Release).ok();
                             }
+                            capturer.lock().unwrap().set_keyboard_grab(false).ok();
+                            layer_shell_keyboard_grabbed = false;
                         } else {
                             capturer.lock().unwrap().set_grab(false).ok();
                         }
@@ -425,6 +501,7 @@ async fn handle_server_connection(
             use crate::input::wayland_layer_shell::LayerShellCommand;
             tx.send(LayerShellCommand::Shutdown).ok();
         }
+        capturer.lock().unwrap().set_keyboard_grab(false).ok();
     } else {
         capturer.lock().unwrap().set_grab(false).ok();
     }

@@ -113,8 +113,26 @@ fn find_pointer_devices(entries: &[PathBuf]) -> Result<(Vec<(PathBuf, PointerKin
     Ok((found, claimed))
 }
 
-/// Find keyboard devices: devices with KEY_A support that are not already
-/// claimed as pointer devices.
+fn has_keyboard_or_media_keys(device: &Device) -> bool {
+    device.supported_keys().map_or(false, |keys| {
+        keys.contains(Key::KEY_A)
+            || keys.contains(Key::KEY_LEFTMETA)
+            || keys.contains(Key::KEY_RIGHTMETA)
+            || keys.contains(Key::KEY_EQUAL)
+            || keys.contains(Key::KEY_MINUS)
+            || keys.contains(Key::KEY_MUTE)
+            || keys.contains(Key::KEY_VOLUMEDOWN)
+            || keys.contains(Key::KEY_VOLUMEUP)
+            || keys.contains(Key::KEY_PLAYPAUSE)
+            || keys.contains(Key::KEY_NEXTSONG)
+            || keys.contains(Key::KEY_PREVIOUSSONG)
+            || keys.contains(Key::KEY_BRIGHTNESSDOWN)
+            || keys.contains(Key::KEY_BRIGHTNESSUP)
+    })
+}
+
+/// Find keyboard devices, including separate consumer-control devices used
+/// by many keyboards for media keys.
 fn find_keyboard_devices(entries: &[PathBuf], pointer_paths: &HashSet<PathBuf>) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for path in entries {
@@ -125,9 +143,7 @@ fn find_keyboard_devices(entries: &[PathBuf], pointer_paths: &HashSet<PathBuf>) 
             Ok(d) => d,
             Err(_) => continue,
         };
-        let has_key_a = device.supported_keys()
-            .map_or(false, |k| k.contains(Key::KEY_A));
-        if has_key_a {
+        if has_keyboard_or_media_keys(&device) {
             let name = device.name().unwrap_or("unknown");
             debug!("Found keyboard: {} ({})", name, path.display());
             found.push(path.clone());
@@ -467,6 +483,20 @@ impl InputCapture for WaylandCapturer {
         debug!("Input devices {} ({} pointers, {} keyboards)",
                if grab { "grabbed" } else { "ungrabbed" },
                self.devices.len(), self.keyboard_devices.len());
+        Ok(())
+    }
+
+    fn set_keyboard_grab(&mut self, grab: bool) -> Result<()> {
+        for kdev in &mut self.keyboard_devices {
+            if grab {
+                kdev.grab().wrap_err("Failed to grab keyboard device")?;
+            } else {
+                kdev.ungrab().wrap_err("Failed to ungrab keyboard device")?;
+            }
+        }
+        debug!("Keyboard devices {} ({})",
+               if grab { "grabbed" } else { "ungrabbed" },
+               self.keyboard_devices.len());
         Ok(())
     }
 

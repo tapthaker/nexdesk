@@ -22,6 +22,12 @@ pub trait InputCapture: Send {
     fn set_grab(&mut self, _grab: bool) -> Result<()> {
         Ok(()) // default no-op for platforms that don't need it
     }
+
+    /// Grab or ungrab only keyboard input devices when the platform can
+    /// separate keyboard capture from pointer capture.
+    fn set_keyboard_grab(&mut self, grab: bool) -> Result<()> {
+        self.set_grab(grab)
+    }
 }
 
 /// Create a platform-appropriate input capturer.
