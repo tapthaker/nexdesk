@@ -66,6 +66,9 @@ pub enum Message {
     FileTransferStart { name: String, size: u64 },
     FileTransferChunk { data: Vec<u8> },
     FileTransferEnd { checksum: String },
+
+    // Wake remote display
+    WakeDisplay,
 }
 
 /// Protocol version.
