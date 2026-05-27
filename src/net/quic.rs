@@ -336,8 +336,12 @@ async fn handle_server_connection(
                         }
                         capturer.lock().unwrap().set_grab(false).ok();
                     }
-                    ServerOutput::ForceRelease => {
+                    ServerOutput::ForceRelease { messages } => {
                         warn!("Safety escape (Ctrl+Alt+Escape) — releasing grab");
+                        let mut sender = input_send.lock().await;
+                        for msg in messages {
+                            send_message_uni(&mut sender, &msg).await.ok();
+                        }
                         capturer.lock().unwrap().set_grab(false).ok();
                     }
                 }
@@ -399,8 +403,12 @@ async fn handle_server_connection(
                             }
                         }
                     }
-                    ServerOutput::ForceRelease => {
+                    ServerOutput::ForceRelease { messages } => {
                         warn!("Safety escape (Ctrl+Alt+Escape) — releasing layer-shell grab");
+                        let mut sender = input_send.lock().await;
+                        for msg in messages {
+                            send_message_uni(&mut sender, &msg).await.ok();
+                        }
                         if let Some(ref tx) = capture_tx {
                             use crate::input::wayland_layer_shell::LayerShellCommand;
                             tx.send(LayerShellCommand::Release).ok();
@@ -516,7 +524,11 @@ async fn handle_server_connection(
                             transition.update_key(keycode, pressed);
                             if transition.is_escape_combo() {
                                 warn!("Safety escape (Ctrl+Alt+Escape) — releasing layer-shell grab");
-                                transition.deactivate();
+                                let messages = transition.deactivate_for_shortcut();
+                                let mut sender = input_send.lock().await;
+                                for msg in messages {
+                                    send_message_uni(&mut sender, &msg).await.ok();
+                                }
                                 if let Some(ref tx) = capture_tx {
                                     tx.send(LayerShellCommand::Release).ok();
                                 }
@@ -553,7 +565,13 @@ async fn handle_server_connection(
                     }
                     Ok(Some(Message::SwitchScreen { direction })) => {
                         info!("Client requested switch back: {:?}", direction);
-                        transition.on_switch_back();
+                        let messages = transition.on_switch_back();
+                        if !messages.is_empty() {
+                            let mut sender = input_send.lock().await;
+                            for msg in messages {
+                                send_message_uni(&mut sender, &msg).await.ok();
+                            }
+                        }
                         if use_layer_shell {
                             #[cfg(target_os = "linux")]
                             if let Some(ref tx) = capture_tx {

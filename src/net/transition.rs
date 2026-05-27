@@ -60,7 +60,9 @@ pub enum ServerOutput {
         messages: Vec<Message>,
     },
     /// Safety escape: Ctrl+Alt+Escape pressed, force-release grab
-    ForceRelease,
+    ForceRelease {
+        messages: Vec<Message>,
+    },
 }
 
 pub struct ServerTransition {
@@ -237,9 +239,9 @@ impl ServerTransition {
         self.update_pressed_keys(&key_events);
         if self.is_escape_combo() {
             self.active = false;
-            self.pressed_keys.clear();
-            self.key_hold_polls.clear();
-            return ServerOutput::ForceRelease;
+            return ServerOutput::ForceRelease {
+                messages: self.release_pressed_keys(),
+            };
         }
         if self.shortcut_direction().is_some() {
             self.active = false;
@@ -268,9 +270,9 @@ impl ServerTransition {
         // Safety escape: Ctrl+Alt+Escape always force-releases
         if self.active && self.is_escape_combo() {
             self.active = false;
-            self.pressed_keys.clear();
-            self.key_hold_polls.clear();
-            return ServerOutput::ForceRelease;
+            return ServerOutput::ForceRelease {
+                messages: self.release_pressed_keys(),
+            };
         }
 
         if let Some(dir) = self.shortcut_direction() {
@@ -391,10 +393,15 @@ impl ServerTransition {
         self.peer_screen = screen;
     }
 
-    pub fn on_switch_back(&mut self) {
+    /// Deactivate because the client hit its return edge.
+    ///
+    /// Any keys currently considered down on the remote side must be released
+    /// before we stop forwarding input; otherwise the client OS can be left
+    /// with a synthetic key-down that never gets its key-up.
+    pub fn on_switch_back(&mut self) -> Vec<Message> {
         self.active = false;
         self.edge_cooldown = SERVER_EDGE_COOLDOWN;
-        self.key_hold_polls.clear();
+        self.release_pressed_keys()
     }
 
     pub fn deactivate(&mut self) {
@@ -748,7 +755,8 @@ mod tests {
         st.poll(1919, 500, 1920, 1080, 0, vec![]);
         assert!(st.is_active());
 
-        st.on_switch_back();
+        let releases = st.on_switch_back();
+        assert!(releases.is_empty());
         assert!(!st.is_active());
 
         // Should be idle during cooldown even at edge
@@ -759,13 +767,45 @@ mod tests {
     }
 
     #[test]
+    fn server_switch_back_releases_held_keys() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        activate_server(&mut st);
+
+        st.poll(
+            1919,
+            500,
+            1920,
+            1080,
+            0,
+            vec![Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            }],
+        );
+
+        let releases = st.on_switch_back();
+        assert_eq!(releases.len(), 1);
+        assert!(matches!(
+            releases[0],
+            Message::KeyEvent {
+                keycode: 30,
+                pressed: false,
+                ..
+            }
+        ));
+        assert!(!st.is_active());
+    }
+
+    #[test]
     fn server_cooldown_prevents_retriggering() {
         let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
         for _ in 0..EDGE_DWELL_THRESHOLD - 1 {
             st.poll(1919, 500, 1920, 1080, 0, vec![]);
         }
         st.poll(1919, 500, 1920, 1080, 0, vec![]);
-        st.on_switch_back();
+        let releases = st.on_switch_back();
+        assert!(releases.is_empty());
 
         // During cooldown, dwell shouldn't accumulate
         for _ in 0..SERVER_EDGE_COOLDOWN {
@@ -814,7 +854,7 @@ mod tests {
             },
         ];
         let out = st.poll(1919, 500, 1920, 1080, 0, keys);
-        assert!(matches!(out, ServerOutput::ForceRelease));
+        assert!(matches!(out, ServerOutput::ForceRelease { .. }));
         assert!(!st.is_active());
     }
 
