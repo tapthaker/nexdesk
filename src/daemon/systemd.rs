@@ -55,7 +55,7 @@ After=network.target
 Type=simple
 ExecStart={exe} {args}
 {env_block}
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]
