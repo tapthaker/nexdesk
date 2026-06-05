@@ -1,22 +1,71 @@
-use std::net::SocketAddr;
+use std::collections::HashSet;
 use std::io::IsTerminal;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use color_eyre::eyre::{Result, WrapErr, eyre};
+use color_eyre::eyre::{eyre, Result, WrapErr};
 use quinn::{Endpoint, RecvStream, SendStream};
 use rand::Rng;
 use tokio::sync::Mutex;
 use tokio::time;
-use tracing::{info, debug, warn, error};
+use tracing::{debug, error, info, warn};
 
-use crate::net::protocol::{self, Message, PROTOCOL_VERSION, BUILD_VERSION, ScreenLayout};
-use crate::net::tls;
+use crate::input::inject::InputInjector;
 use crate::net::discovery;
-use crate::net::transition::{ServerTransition, ServerOutput, ClientTransition, ClientOutput};
+use crate::net::protocol::{self, Message, ScreenLayout, BUILD_VERSION, PROTOCOL_VERSION};
+use crate::net::tls;
+use crate::net::transition::{ClientOutput, ClientTransition, ServerOutput, ServerTransition};
 
 const DEFAULT_PORT: u16 = 4242;
 const MOUSE_POLL_INTERVAL: Duration = Duration::from_millis(2);
+const USER_ACTIVITY_INTERVAL: Duration = Duration::from_secs(20);
+
+fn track_injected_key(message: &Message, injected_keys: &mut HashSet<u32>) {
+    if let Message::KeyEvent {
+        keycode, pressed, ..
+    } = message
+    {
+        if *pressed {
+            injected_keys.insert(*keycode);
+        } else {
+            injected_keys.remove(keycode);
+        }
+    }
+}
+
+fn release_injected_keys(injector: &mut dyn InputInjector, injected_keys: &mut HashSet<u32>) {
+    if injected_keys.is_empty() {
+        return;
+    }
+
+    crate::input::wake::wake_display();
+
+    let mut keys: Vec<u32> = injected_keys.iter().copied().collect();
+    keys.sort_unstable();
+    for keycode in keys {
+        let msg = Message::KeyEvent {
+            keycode,
+            pressed: false,
+            modifiers: 0,
+        };
+        if let Err(e) = injector.inject(&msg) {
+            warn!("Failed to release injected key {}: {}", keycode, e);
+        } else {
+            injected_keys.remove(&keycode);
+        }
+    }
+}
+
+async fn send_user_activity(send: &mut SendStream, last_sent: &mut Instant) {
+    if last_sent.elapsed() < USER_ACTIVITY_INTERVAL {
+        return;
+    }
+
+    if send_message(send, &Message::WakeDisplay).await.is_ok() {
+        *last_sent = Instant::now();
+    }
+}
 
 /// Run a QUIC server that captures local mouse and sends events to clients.
 pub async fn serve(port: u16, trigger_edge: Option<crate::net::protocol::Direction>) -> Result<()> {
@@ -95,7 +144,12 @@ async fn handle_server_connection(
 
     // Receive HelloAck with optional OTP
     let peer_screen = match recv_message(&mut control_recv).await? {
-        Some(Message::HelloAck { accepted: true, otp, screen, build_version }) => {
+        Some(Message::HelloAck {
+            accepted: true,
+            otp,
+            screen,
+            build_version,
+        }) => {
             // Validate OTP if provided
             match otp {
                 Some(code) => {
@@ -120,11 +174,19 @@ async fn handle_server_connection(
             let peer_version = build_version.as_deref().unwrap_or("unknown");
             info!("Peer {} build version: {}", remote, peer_version);
             if peer_version != BUILD_VERSION {
-                warn!("Version mismatch: server={}, client={}", BUILD_VERSION, peer_version);
+                warn!(
+                    "Version mismatch: server={}, client={}",
+                    BUILD_VERSION, peer_version
+                );
             }
-            screen.unwrap_or(ScreenLayout { width: 1920, height: 1080 })
+            screen.unwrap_or(ScreenLayout {
+                width: 1920,
+                height: 1080,
+            })
         }
-        Some(Message::HelloAck { accepted: false, .. }) => {
+        Some(Message::HelloAck {
+            accepted: false, ..
+        }) => {
             return Err(eyre!("Peer rejected connection"));
         }
         other => {
@@ -152,7 +214,9 @@ async fn handle_server_connection(
     // Spawn clipboard polling task
     let clip_send = Arc::new(Mutex::new(clip_send));
     let clip_send_clone = clip_send.clone();
-    let clipboard = Arc::new(std::sync::Mutex::new(crate::clipboard::sync::ClipboardSync::new()));
+    let clipboard = Arc::new(std::sync::Mutex::new(
+        crate::clipboard::sync::ClipboardSync::new(),
+    ));
     let clipboard_poll = clipboard.clone();
     tokio::spawn(async move {
         let interval = crate::clipboard::sync::ClipboardSync::poll_interval();
@@ -190,12 +254,15 @@ async fn handle_server_connection(
     #[cfg(target_os = "linux")]
     let layer_shell = crate::input::wayland_layer_shell::try_create(
         trigger_edge.unwrap_or(crate::net::protocol::Direction::Right),
-    ).ok().flatten();
+    )
+    .ok()
+    .flatten();
     #[cfg(not(target_os = "linux"))]
     let layer_shell: Option<(
         tokio::sync::mpsc::UnboundedReceiver<crate::input::wayland_layer_shell::LayerShellEvent>,
         tokio::sync::mpsc::UnboundedSender<crate::input::wayland_layer_shell::LayerShellCommand>,
-        u32, u32,
+        u32,
+        u32,
     )> = None;
 
     let (mut capture_rx, capture_tx, use_layer_shell) = match layer_shell {
@@ -225,8 +292,13 @@ async fn handle_server_connection(
                             Ok(paths) if !paths.is_empty() => {
                                 info!("Received {} file(s) from client", paths.len());
                                 tokio::task::spawn_blocking(move || {
-                                    crate::filetransfer::clipboard_files::set_clipboard_files(&paths).ok();
-                                }).await.ok();
+                                    crate::filetransfer::clipboard_files::set_clipboard_files(
+                                        &paths,
+                                    )
+                                    .ok();
+                                })
+                                .await
+                                .ok();
                             }
                             Ok(_) => {}
                             Err(e) => {
@@ -251,8 +323,7 @@ async fn handle_server_connection(
     let mut screen_check = time::interval(Duration::from_secs(5));
 
     let mut prev_mouse_pos: (i32, i32) = (0, 0);
-    let mut last_input_time = Instant::now();
-    const IDLE_THRESHOLD: Duration = Duration::from_secs(30);
+    let mut last_user_activity_sent = Instant::now() - USER_ACTIVITY_INTERVAL;
 
     // Track scroll gesture state for proper Began/Changed/Ended phases.
     let mut scroll_active = false;
@@ -276,14 +347,8 @@ async fn handle_server_connection(
 
                 let has_input = (mx, my) != prev_mouse_pos || !key_events.is_empty() || buttons != 0;
                 if has_input {
-                    let idle_duration = last_input_time.elapsed();
-                    if idle_duration >= IDLE_THRESHOLD {
-                        info!("User active after {}s idle — waking client display", idle_duration.as_secs());
-                        let wake_msg = Message::WakeDisplay;
-                        send_message(&mut control_send, &wake_msg).await.ok();
-                    }
+                    send_user_activity(&mut control_send, &mut last_user_activity_sent).await;
                     prev_mouse_pos = (mx, my);
-                    last_input_time = Instant::now();
                 }
 
                 // Log position every 500 polls (~1 second)
@@ -360,13 +425,7 @@ async fn handle_server_connection(
                 };
 
                 if !key_events.is_empty() {
-                    let idle_duration = last_input_time.elapsed();
-                    if idle_duration >= IDLE_THRESHOLD {
-                        info!("User active after {}s idle — waking client display", idle_duration.as_secs());
-                        let wake_msg = Message::WakeDisplay;
-                        send_message(&mut control_send, &wake_msg).await.ok();
-                    }
-                    last_input_time = Instant::now();
+                    send_user_activity(&mut control_send, &mut last_user_activity_sent).await;
                 }
 
                 match transition.poll_active_keys(key_events) {
@@ -426,13 +485,7 @@ async fn handle_server_connection(
                 }
             }, if use_layer_shell => {
                 use crate::input::wayland_layer_shell::{LayerShellEvent, LayerShellCommand};
-                let idle_duration = last_input_time.elapsed();
-                if idle_duration >= IDLE_THRESHOLD {
-                    info!("User active after {}s idle — waking client display", idle_duration.as_secs());
-                    let wake_msg = Message::WakeDisplay;
-                    send_message(&mut control_send, &wake_msg).await.ok();
-                }
-                last_input_time = Instant::now();
+                send_user_activity(&mut control_send, &mut last_user_activity_sent).await;
 
                 match event {
                     LayerShellEvent::EdgeEnter { direction } => {
@@ -564,6 +617,7 @@ async fn handle_server_connection(
                         send_message(&mut control_send, &ack).await?;
                     }
                     Ok(Some(Message::SwitchScreen { direction })) => {
+                        crate::input::wake::wake_display();
                         info!("Client requested switch back: {:?}", direction);
                         let messages = transition.on_switch_back();
                         if !messages.is_empty() {
@@ -649,16 +703,14 @@ pub async fn connect(addr: Option<&str>) -> Result<()> {
     loop {
         let target_addr = match resolved_addr {
             Some(a) => a,
-            None => {
-                match discovery::discover_one(Duration::from_secs(10)).await {
-                    Ok(a) => a,
-                    Err(e) => {
-                        warn!("Discovery failed: {}. Retrying in 2s...", e);
-                        time::sleep(Duration::from_secs(2)).await;
-                        continue;
-                    }
+            None => match discovery::discover_one(Duration::from_secs(10)).await {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!("Discovery failed: {}. Retrying in 2s...", e);
+                    time::sleep(Duration::from_secs(2)).await;
+                    continue;
                 }
-            }
+            },
         };
 
         info!("Connecting to nexdesk server at {}", target_addr);
@@ -691,14 +743,23 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     let (mut control_send, mut control_recv) = connection.accept_bi().await?;
 
     let (mut server_screen, server_build_version) = match recv_message(&mut control_recv).await? {
-        Some(Message::Hello { version, hostname, screen, fingerprint, build_version }) => {
+        Some(Message::Hello {
+            version,
+            hostname,
+            screen,
+            fingerprint,
+            build_version,
+        }) => {
             let server_ver = build_version.as_deref().unwrap_or("unknown");
             info!(
                 "Server: {} (proto v{}, build {}, screen: {}x{})",
                 hostname, version, server_ver, screen.width, screen.height
             );
             if server_ver != BUILD_VERSION {
-                warn!("Version mismatch: server={}, client={}", server_ver, BUILD_VERSION);
+                warn!(
+                    "Version mismatch: server={}, client={}",
+                    server_ver, BUILD_VERSION
+                );
             }
 
             // Check if we already trust this server's fingerprint
@@ -727,7 +788,10 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
             let ack = Message::HelloAck {
                 accepted: true,
                 otp: otp.clone(),
-                screen: Some(ScreenLayout { width: my_w, height: my_h }),
+                screen: Some(ScreenLayout {
+                    width: my_w,
+                    height: my_h,
+                }),
                 build_version: Some(BUILD_VERSION.to_string()),
             };
             send_message(&mut control_send, &ack).await?;
@@ -762,7 +826,10 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
         if crate::net::update::is_release_version(&server_build_version)
             && crate::net::update::is_newer(&server_build_version, BUILD_VERSION)
         {
-            info!("Server has newer version {}, attempting self-update...", server_build_version);
+            info!(
+                "Server has newer version {}, attempting self-update...",
+                server_build_version
+            );
             match crate::net::update::self_update(&server_build_version).await {
                 Ok(()) => {
                     info!("Updated to {}. Restarting...", server_build_version);
@@ -774,7 +841,10 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                     return Err(eyre!("Failed to restart after update: {}", err));
                 }
                 Err(e) => {
-                    warn!("Self-update failed: {}. Continuing with current version.", e);
+                    warn!(
+                        "Self-update failed: {}. Continuing with current version.",
+                        e
+                    );
                 }
             }
         }
@@ -786,13 +856,11 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
     // Accept clipboard stream (bidirectional, second bi-stream from server)
-    let (clip_send, mut clip_recv) = tokio::time::timeout(
-        Duration::from_secs(10),
-        connection.accept_bi(),
-    )
-    .await
-    .wrap_err("Timeout waiting for clipboard stream from server")?
-    .wrap_err("Failed to accept clipboard stream")?;
+    let (clip_send, mut clip_recv) =
+        tokio::time::timeout(Duration::from_secs(10), connection.accept_bi())
+            .await
+            .wrap_err("Timeout waiting for clipboard stream from server")?
+            .wrap_err("Failed to accept clipboard stream")?;
     // Read and discard the stream-ready marker
     let _marker = recv_message(&mut clip_recv).await?;
     info!("Clipboard stream accepted");
@@ -800,7 +868,9 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     // Spawn clipboard polling task (client → server)
     let clip_send = Arc::new(Mutex::new(clip_send));
     let clip_send_clone = clip_send.clone();
-    let clipboard = Arc::new(std::sync::Mutex::new(crate::clipboard::sync::ClipboardSync::new()));
+    let clipboard = Arc::new(std::sync::Mutex::new(
+        crate::clipboard::sync::ClipboardSync::new(),
+    ));
     let clipboard_poll = clipboard.clone();
     let mut shutdown_rx1 = shutdown_tx.subscribe();
     tokio::spawn(async move {
@@ -897,13 +967,10 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     info!("Client ready. Waiting for server to share mouse...");
 
     // Accept the unidirectional input stream from the server
-    let mut input_recv = tokio::time::timeout(
-        Duration::from_secs(10),
-        connection.accept_uni(),
-    )
-    .await
-    .wrap_err("Timeout waiting for input stream from server")?
-    .wrap_err("Failed to accept input stream")?;
+    let mut input_recv = tokio::time::timeout(Duration::from_secs(10), connection.accept_uni())
+        .await
+        .wrap_err("Timeout waiting for input stream from server")?
+        .wrap_err("Failed to accept input stream")?;
     // Read and discard the stream-ready marker
     let _marker = recv_message_uni(&mut input_recv).await?;
     debug!("Input stream accepted");
@@ -911,14 +978,31 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     let mut last_screen_w = my_w;
     let mut last_screen_h = my_h;
     let mut screen_check = time::interval(Duration::from_secs(5));
+    let mut injected_keys: HashSet<u32> = HashSet::new();
 
     loop {
         tokio::select! {
             msg = recv_message_uni(&mut input_recv) => {
                 match msg {
                     Ok(Some(message)) => {
+                        let original_message = message.clone();
                         match transition.handle(message) {
-                            ClientOutput::Ignore => {}
+                            ClientOutput::Ignore => {
+                                // A switch-back deactivates the client before the server's
+                                // synthetic key-up cleanup can arrive. Still inject key releases
+                                // for keys we previously pressed, or the client OS can be left
+                                // with a sticky key.
+                                if let Message::KeyEvent { keycode, pressed: false, .. } = original_message {
+                                    if injected_keys.contains(&keycode) {
+                                        let release = Message::KeyEvent { keycode, pressed: false, modifiers: 0 };
+                                        if let Err(e) = injector.inject(&release) {
+                                            warn!("Inject key release error: {}", e);
+                                        } else {
+                                            injected_keys.remove(&keycode);
+                                        }
+                                    }
+                                }
+                            }
                             ClientOutput::Activate => {
                                 info!("Server sharing mouse");
                                 crate::input::wake::wake_display();
@@ -932,6 +1016,8 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                             ClientOutput::Forward(msg) => {
                                 if let Err(e) = injector.inject(&msg) {
                                     warn!("Inject error: {}", e);
+                                } else {
+                                    track_injected_key(&msg, &mut injected_keys);
                                 }
                             }
                             ClientOutput::SwitchBack { direction, inject } => {
@@ -939,6 +1025,10 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                     let msg = Message::MouseMove { x, y };
                                     injector.inject(&msg).ok();
                                 }
+                                // Release any remote-held keys immediately on switch-back. The
+                                // server also sends cleanup releases, but those can arrive after
+                                // this transition has become inactive.
+                                release_injected_keys(&mut *injector, &mut injected_keys);
                                 info!("Edge on client: {:?} — requesting switch back", direction);
                                 let switch_msg = Message::SwitchScreen { direction };
                                 send_message(&mut control_send, &switch_msg).await.ok();
@@ -982,7 +1072,7 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                         server_screen = screen;
                     }
                     Ok(Some(Message::WakeDisplay)) => {
-                        info!("Server user active — waking display");
+                        debug!("Peer user active — keeping this system awake");
                         crate::input::wake::wake_display();
                     }
                     Ok(Some(other)) => {
@@ -1018,6 +1108,10 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
         }
     }
 
+    // Release any synthetic keys that may still be down if the stream ended
+    // before their key-up events were processed (for example during display sleep).
+    release_injected_keys(&mut *injector, &mut injected_keys);
+
     // Signal clipboard tasks to shut down
     shutdown_tx.send(true).ok();
 
@@ -1043,7 +1137,13 @@ pub async fn ping(addr: &str) -> Result<()> {
 
     let hello = recv_message(&mut recv).await?;
     match hello {
-        Some(Message::Hello { version, hostname, screen, fingerprint, build_version }) => {
+        Some(Message::Hello {
+            version,
+            hostname,
+            screen,
+            fingerprint,
+            build_version,
+        }) => {
             let server_ver = build_version.as_deref().unwrap_or("unknown");
             info!(
                 "Server: {} (proto v{}, build {}, screen: {}x{})",
@@ -1065,7 +1165,12 @@ pub async fn ping(addr: &str) -> Result<()> {
                 Some(code)
             };
 
-            let ack = Message::HelloAck { accepted: true, otp: otp.clone(), screen: None, build_version: Some(BUILD_VERSION.to_string()) };
+            let ack = Message::HelloAck {
+                accepted: true,
+                otp: otp.clone(),
+                screen: None,
+                build_version: Some(BUILD_VERSION.to_string()),
+            };
             send_message(&mut send, &ack).await?;
 
             // Wait for PairingResult
@@ -1103,11 +1208,7 @@ pub async fn ping(addr: &str) -> Result<()> {
         match recv_message(&mut recv).await? {
             Some(Message::HeartbeatAck { timestamp: _ }) => {
                 let rtt = start.elapsed();
-                println!(
-                    "  seq={} rtt={:.3}ms",
-                    seq,
-                    rtt.as_secs_f64() * 1000.0
-                );
+                println!("  seq={} rtt={:.3}ms", seq, rtt.as_secs_f64() * 1000.0);
             }
             other => {
                 warn!("Unexpected response: {:?}", other);
@@ -1138,7 +1239,13 @@ pub async fn pair(addr: &str) -> Result<()> {
     let hello = recv_message(&mut recv).await?;
 
     match hello {
-        Some(Message::Hello { version, hostname, screen, fingerprint, build_version }) => {
+        Some(Message::Hello {
+            version,
+            hostname,
+            screen,
+            fingerprint,
+            build_version,
+        }) => {
             let server_ver = build_version.as_deref().unwrap_or("unknown");
             info!(
                 "Server: {} (proto v{}, build {}, screen: {}x{})",

@@ -46,8 +46,12 @@ pub struct FileInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
     // Phase 2: Control
-    Heartbeat { timestamp: u64 },
-    HeartbeatAck { timestamp: u64 },
+    Heartbeat {
+        timestamp: u64,
+    },
+    HeartbeatAck {
+        timestamp: u64,
+    },
     Hello {
         version: u32,
         hostname: String,
@@ -61,13 +65,27 @@ pub enum Message {
         screen: Option<ScreenLayout>,
         build_version: Option<String>,
     },
-    PairingResult { success: bool },
+    PairingResult {
+        success: bool,
+    },
 
     // Phase 3: Mouse
-    MouseMove { x: i32, y: i32 },
-    MouseButton { button: u8, pressed: bool },
-    MouseScroll { dx: f64, dy: f64, phase: ScrollPhase },
-    SwitchScreen { direction: Direction },
+    MouseMove {
+        x: i32,
+        y: i32,
+    },
+    MouseButton {
+        button: u8,
+        pressed: bool,
+    },
+    MouseScroll {
+        dx: f64,
+        dy: f64,
+        phase: ScrollPhase,
+    },
+    SwitchScreen {
+        direction: Direction,
+    },
 
     // Phase 4a: Keyboard
     KeyEvent {
@@ -77,20 +95,43 @@ pub enum Message {
     },
 
     // Screen resize notification
-    ScreenResize { screen: ScreenLayout },
+    ScreenResize {
+        screen: ScreenLayout,
+    },
 
     // Phase 4b: Clipboard
-    ClipboardUpdate { content: ClipboardContent },
+    ClipboardUpdate {
+        content: ClipboardContent,
+    },
 
     // Phase 4c: File transfer
-    FileTransferOffer { transfer_id: u64, files: Vec<FileInfo>, total_size: u64 },
-    FileTransferAccept { transfer_id: u64 },
-    FileTransferChunk { transfer_id: u64, file_index: u32, offset: u64, data: Vec<u8> },
-    FileTransferComplete { transfer_id: u64, file_index: u32, checksum: String },
-    FileTransferDone { transfer_id: u64 },
-    FileTransferCancel { transfer_id: u64 },
+    FileTransferOffer {
+        transfer_id: u64,
+        files: Vec<FileInfo>,
+        total_size: u64,
+    },
+    FileTransferAccept {
+        transfer_id: u64,
+    },
+    FileTransferChunk {
+        transfer_id: u64,
+        file_index: u32,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    FileTransferComplete {
+        transfer_id: u64,
+        file_index: u32,
+        checksum: String,
+    },
+    FileTransferDone {
+        transfer_id: u64,
+    },
+    FileTransferCancel {
+        transfer_id: u64,
+    },
 
-    // Wake remote display
+    // Peer user activity: ask the OS to treat the display/session as active.
     WakeDisplay,
 }
 
