@@ -53,6 +53,9 @@ After=network.target
 
 [Service]
 Type=simple
+# Wait until the machine has a routable IPv4 address before starting.
+# If nexdesk starts before Wi-Fi is up, mDNS can advertise an empty/unreachable IP.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do ip route get 1.1.1.1 2>/dev/null | grep -q " src " && exit 0; sleep 1; done; exit 1'
 ExecStart={exe} {args}
 {env_block}
 Restart=always
