@@ -529,6 +529,13 @@ impl ClientTransition {
             Message::MouseButton { .. } if self.active => ClientOutput::Forward(message),
             Message::MouseScroll { .. } if self.active => ClientOutput::Forward(message),
             Message::KeyEvent { .. } if self.active => ClientOutput::Forward(message),
+
+            // A switch-back can deactivate the client before the server's
+            // synthetic release messages arrive on the input stream. Still
+            // forward releases while inactive so macOS/Linux does not keep a
+            // key or mouse button stuck down (observed as endless "." input).
+            Message::KeyEvent { pressed: false, .. } => ClientOutput::Forward(message),
+            Message::MouseButton { pressed: false, .. } => ClientOutput::Forward(message),
             _ => ClientOutput::Ignore,
         }
     }
@@ -1267,6 +1274,36 @@ mod tests {
             ClientOutput::Forward(Message::KeyEvent {
                 keycode: 42,
                 pressed: true,
+                modifiers: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn client_forwards_key_release_after_switch_back() {
+        let mut ct = ClientTransition::new(1920, 1080);
+        ct.handle(Message::SwitchScreen {
+            direction: Direction::Right,
+        });
+        ct.handle(Message::MouseMove { x: 100, y: 500 });
+        for _ in 0..50 {
+            ct.handle(Message::MouseMove { x: 0, y: 0 });
+        }
+        ct.handle(Message::MouseMove { x: -100, y: 0 });
+        for _ in 0..CLIENT_EDGE_DWELL {
+            ct.handle(Message::MouseMove { x: 0, y: 0 });
+        }
+
+        let out = ct.handle(Message::KeyEvent {
+            keycode: 52, // KEY_DOT
+            pressed: false,
+            modifiers: 0,
+        });
+        assert!(matches!(
+            out,
+            ClientOutput::Forward(Message::KeyEvent {
+                keycode: 52,
+                pressed: false,
                 modifiers: 0
             })
         ));
