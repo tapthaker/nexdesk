@@ -21,25 +21,56 @@ const DEFAULT_PORT: u16 = 4242;
 const MOUSE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const USER_ACTIVITY_INTERVAL: Duration = Duration::from_secs(20);
 
-fn track_injected_key(message: &Message, injected_keys: &mut HashSet<u32>) {
-    if let Message::KeyEvent {
-        keycode, pressed, ..
-    } = message
-    {
-        if *pressed {
-            injected_keys.insert(*keycode);
-        } else {
-            injected_keys.remove(keycode);
+fn track_injected_input(
+    message: &Message,
+    injected_keys: &mut HashSet<u32>,
+    injected_buttons: &mut HashSet<u8>,
+) {
+    match message {
+        Message::KeyEvent {
+            keycode, pressed, ..
+        } => {
+            if *pressed {
+                injected_keys.insert(*keycode);
+            } else {
+                injected_keys.remove(keycode);
+            }
         }
+        Message::MouseButton { button, pressed } => {
+            if *pressed {
+                injected_buttons.insert(*button);
+            } else {
+                injected_buttons.remove(button);
+            }
+        }
+        _ => {}
     }
 }
 
-fn release_injected_keys(injector: &mut dyn InputInjector, injected_keys: &mut HashSet<u32>) {
-    if injected_keys.is_empty() {
+fn release_injected_inputs(
+    injector: &mut dyn InputInjector,
+    injected_keys: &mut HashSet<u32>,
+    injected_buttons: &mut HashSet<u8>,
+) {
+    if injected_keys.is_empty() && injected_buttons.is_empty() {
         return;
     }
 
     crate::input::wake::wake_display();
+
+    let mut buttons: Vec<u8> = injected_buttons.iter().copied().collect();
+    buttons.sort_unstable();
+    for button in buttons {
+        let msg = Message::MouseButton {
+            button,
+            pressed: false,
+        };
+        if let Err(e) = injector.inject(&msg) {
+            warn!("Failed to release injected mouse button {}: {}", button, e);
+        } else {
+            injected_buttons.remove(&button);
+        }
+    }
 
     let mut keys: Vec<u32> = injected_keys.iter().copied().collect();
     keys.sort_unstable();
@@ -53,6 +84,26 @@ fn release_injected_keys(injector: &mut dyn InputInjector, injected_keys: &mut H
             warn!("Failed to release injected key {}: {}", keycode, e);
         } else {
             injected_keys.remove(&keycode);
+        }
+    }
+}
+
+fn release_defensive_keyups(injector: &mut dyn InputInjector) {
+    // Last-resort cleanup for cases where our bookkeeping missed a key-down
+    // (e.g. a disconnect/restart race). Key-up events for keys that are not
+    // down are harmless, and this prevents OS-level auto-repeat from getting
+    // stuck on the client.
+    for keycode in 0u32..256 {
+        if crate::input::keymap::evdev_to_macos(keycode).is_none() {
+            continue;
+        }
+        let msg = Message::KeyEvent {
+            keycode,
+            pressed: false,
+            modifiers: 0,
+        };
+        if let Err(e) = injector.inject(&msg) {
+            debug!("Defensive key release failed for {}: {}", keycode, e);
         }
     }
 }
@@ -979,6 +1030,7 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     let mut last_screen_h = my_h;
     let mut screen_check = time::interval(Duration::from_secs(5));
     let mut injected_keys: HashSet<u32> = HashSet::new();
+    let mut injected_buttons: HashSet<u8> = HashSet::new();
 
     loop {
         tokio::select! {
@@ -988,12 +1040,13 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                         let original_message = message.clone();
                         match transition.handle(message) {
                             ClientOutput::Ignore => {
-                                // A switch-back deactivates the client before the server's
-                                // synthetic key-up cleanup can arrive. Still inject key releases
-                                // for keys we previously pressed, or the client OS can be left
-                                // with a sticky key.
-                                if let Message::KeyEvent { keycode, pressed: false, .. } = original_message {
-                                    if injected_keys.contains(&keycode) {
+                                // A switch-back can deactivate the client before cleanup
+                                // releases arrive. Still inject releases for inputs we
+                                // previously pressed, or the client OS can be left sticky.
+                                match original_message {
+                                    Message::KeyEvent { keycode, pressed: false, .. }
+                                        if injected_keys.contains(&keycode) =>
+                                    {
                                         let release = Message::KeyEvent { keycode, pressed: false, modifiers: 0 };
                                         if let Err(e) = injector.inject(&release) {
                                             warn!("Inject key release error: {}", e);
@@ -1001,6 +1054,17 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                             injected_keys.remove(&keycode);
                                         }
                                     }
+                                    Message::MouseButton { button, pressed: false }
+                                        if injected_buttons.contains(&button) =>
+                                    {
+                                        let release = Message::MouseButton { button, pressed: false };
+                                        if let Err(e) = injector.inject(&release) {
+                                            warn!("Inject mouse button release error: {}", e);
+                                        } else {
+                                            injected_buttons.remove(&button);
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                             ClientOutput::Activate => {
@@ -1017,7 +1081,7 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 if let Err(e) = injector.inject(&msg) {
                                     warn!("Inject error: {}", e);
                                 } else {
-                                    track_injected_key(&msg, &mut injected_keys);
+                                    track_injected_input(&msg, &mut injected_keys, &mut injected_buttons);
                                 }
                             }
                             ClientOutput::SwitchBack { direction, inject } => {
@@ -1028,7 +1092,8 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 // Release any remote-held keys immediately on switch-back. The
                                 // server also sends cleanup releases, but those can arrive after
                                 // this transition has become inactive.
-                                release_injected_keys(&mut *injector, &mut injected_keys);
+                                release_injected_inputs(&mut *injector, &mut injected_keys, &mut injected_buttons);
+                                release_defensive_keyups(&mut *injector);
                                 info!("Edge on client: {:?} — requesting switch back", direction);
                                 let switch_msg = Message::SwitchScreen { direction };
                                 send_message(&mut control_send, &switch_msg).await.ok();
@@ -1108,9 +1173,10 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
         }
     }
 
-    // Release any synthetic keys that may still be down if the stream ended
-    // before their key-up events were processed (for example during display sleep).
-    release_injected_keys(&mut *injector, &mut injected_keys);
+    // Release any synthetic input that may still be down if the stream ended
+    // before key-up/button-up events were processed (for example during display sleep).
+    release_injected_inputs(&mut *injector, &mut injected_keys, &mut injected_buttons);
+    release_defensive_keyups(&mut *injector);
 
     // Signal clipboard tasks to shut down
     shutdown_tx.send(true).ok();
