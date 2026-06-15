@@ -52,6 +52,24 @@ fn plist_content(args: &[&str]) -> String {
     )
 }
 
+pub fn print_status() -> Result<()> {
+    let uid = current_uid();
+    let service = format!("gui/{uid}/{LABEL}");
+
+    println!("nexdesk service status (LaunchAgent)\n");
+    print_command("launchctl", &["print", &service])?;
+    print_command("pgrep", &["-a", "nexdesk"])?;
+    print_command("sh", &["-c", "lsof -nP -iUDP:4242 2>/dev/null || true"])?;
+    print_command(
+        "sh",
+        &[
+            "-c",
+            "tail -n 40 /tmp/nexdesk.out.log /tmp/nexdesk.err.log 2>/dev/null || true",
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn install(args: &[&str]) -> Result<()> {
     let path = plist_path();
     if let Some(parent) = path.parent() {
@@ -78,6 +96,36 @@ pub fn install(args: &[&str]) -> Result<()> {
 
 fn current_uid() -> u32 {
     unsafe { libc::getuid() }
+}
+
+fn print_command(program: &str, args: &[&str]) -> Result<()> {
+    println!("\n$ {} {}", program, args.join(" "));
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .wrap_err_with(|| format!("Failed to run {} {}", program, args.join(" ")))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.trim().is_empty() {
+        print!("{}", stdout);
+        if !stdout.ends_with('\n') {
+            println!();
+        }
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        eprint!("{}", stderr);
+        if !stderr.ends_with('\n') {
+            eprintln!();
+        }
+    }
+
+    if !output.status.success() {
+        println!("(exit status: {})", output.status);
+    }
+
+    Ok(())
 }
 
 fn run_launchctl(args: &[&str]) -> Result<()> {

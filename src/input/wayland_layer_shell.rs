@@ -9,7 +9,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::io::FromRawFd;
 use std::time::{Duration, Instant};
 
-use color_eyre::eyre::{Result, WrapErr, eyre};
+use color_eyre::eyre::{eyre, Result, WrapErr};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -18,9 +18,9 @@ use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region,
     wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
-use wayland_client::{
-    Connection, Dispatch, EventQueue, QueueHandle, WEnum,
-    delegate_noop,
+use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, QueueHandle, WEnum};
+use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::{
+    zwp_keyboard_shortcuts_inhibit_manager_v1, zwp_keyboard_shortcuts_inhibitor_v1,
 };
 use wayland_protocols::wp::pointer_constraints::zv1::client::{
     zwp_locked_pointer_v1, zwp_pointer_constraints_v1,
@@ -28,15 +28,8 @@ use wayland_protocols::wp::pointer_constraints::zv1::client::{
 use wayland_protocols::wp::relative_pointer::zv1::client::{
     zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1,
 };
-use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::{
-    zwp_keyboard_shortcuts_inhibit_manager_v1, zwp_keyboard_shortcuts_inhibitor_v1,
-};
-use wayland_protocols::xdg::xdg_output::zv1::client::{
-    zxdg_output_manager_v1, zxdg_output_v1,
-};
-use wayland_protocols_wlr::layer_shell::v1::client::{
-    zwlr_layer_shell_v1, zwlr_layer_surface_v1,
-};
+use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
+use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 use crate::net::protocol::Direction;
 
@@ -45,13 +38,32 @@ use crate::net::protocol::Direction;
 /// Events sent from the Wayland capture task to the server loop.
 #[derive(Debug)]
 pub enum LayerShellEvent {
-    EdgeEnter { direction: Direction },
-    MouseMove { dx: f64, dy: f64 },
-    MouseButton { button: u32, pressed: bool },
-    MouseScroll { dx: f64, dy: f64 },
+    EdgeEnter {
+        direction: Direction,
+    },
+    MouseMove {
+        dx: f64,
+        dy: f64,
+    },
+    MouseButton {
+        button: u32,
+        pressed: bool,
+    },
+    MouseScroll {
+        dx: f64,
+        dy: f64,
+    },
     ScrollEnd,
-    KeyEvent { keycode: u32, pressed: bool },
-    KeyModifiers { depressed: u32, latched: u32, locked: u32, group: u32 },
+    KeyEvent {
+        keycode: u32,
+        pressed: bool,
+    },
+    KeyModifiers {
+        depressed: u32,
+        latched: u32,
+        locked: u32,
+        group: u32,
+    },
 }
 
 /// Commands from the server loop to the Wayland capture task.
@@ -65,20 +77,21 @@ pub enum LayerShellCommand {
 /// protocol is not available (GNOME, KDE, X11 session).
 pub fn try_create(
     trigger_edge: Direction,
-) -> Result<Option<(
-    mpsc::UnboundedReceiver<LayerShellEvent>,
-    mpsc::UnboundedSender<LayerShellCommand>,
-    u32, // screen_width
-    u32, // screen_height
-)>> {
+) -> Result<
+    Option<(
+        mpsc::UnboundedReceiver<LayerShellEvent>,
+        mpsc::UnboundedSender<LayerShellCommand>,
+        u32, // screen_width
+        u32, // screen_height
+    )>,
+> {
     // Must have WAYLAND_DISPLAY to connect
     if std::env::var("WAYLAND_DISPLAY").is_err() {
         debug!("No WAYLAND_DISPLAY set, layer-shell not available");
         return Ok(None);
     }
 
-    let conn = Connection::connect_to_env()
-        .wrap_err("Failed to connect to Wayland display")?;
+    let conn = Connection::connect_to_env().wrap_err("Failed to connect to Wayland display")?;
 
     let display = conn.display();
 
@@ -89,7 +102,8 @@ pub fn try_create(
 
     // Initial registry roundtrip
     display.get_registry(&qh, ());
-    event_queue.roundtrip(&mut state)
+    event_queue
+        .roundtrip(&mut state)
         .wrap_err("Wayland registry roundtrip failed")?;
 
     // Check required protocols
@@ -142,10 +156,12 @@ pub fn try_create(
                 output_info.wl_output.clone(),
             );
         }
-        event_queue.roundtrip(&mut state)
+        event_queue
+            .roundtrip(&mut state)
             .wrap_err("xdg_output roundtrip failed")?;
         // Need a second roundtrip to get the done events
-        event_queue.roundtrip(&mut state)
+        event_queue
+            .roundtrip(&mut state)
             .wrap_err("xdg_output done roundtrip failed")?;
     }
 
@@ -162,13 +178,22 @@ pub fn try_create(
         }
     };
 
-    info!("Layer-shell: screen {}x{}, {} output(s)", screen_w, screen_h, state.outputs.len());
+    info!(
+        "Layer-shell: screen {}x{}, {} output(s)",
+        screen_w,
+        screen_h,
+        state.outputs.len()
+    );
 
     // Create edge surfaces for each output (or one if no outputs)
     let outputs_to_use: Vec<_> = if state.outputs.is_empty() {
         vec![None]
     } else {
-        state.outputs.iter().map(|o| Some(o.wl_output.clone())).collect()
+        state
+            .outputs
+            .iter()
+            .map(|o| Some(o.wl_output.clone()))
+            .collect()
     };
 
     for maybe_output in &outputs_to_use {
@@ -191,9 +216,8 @@ pub fn try_create(
         layer_surface.set_anchor(anchor);
         layer_surface.set_size(w, h);
         layer_surface.set_exclusive_zone(-1); // Don't reserve space
-        layer_surface.set_keyboard_interactivity(
-            zwlr_layer_surface_v1::KeyboardInteractivity::None,
-        );
+        layer_surface
+            .set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
 
         surface.commit();
 
@@ -208,7 +232,8 @@ pub fn try_create(
     }
 
     // Roundtrip to get configure events
-    event_queue.roundtrip(&mut state)
+    event_queue
+        .roundtrip(&mut state)
         .wrap_err("layer surface configure roundtrip failed")?;
 
     // Create properly-sized transparent buffers and attach for configured surfaces
@@ -232,7 +257,8 @@ pub fn try_create(
         }
     }
 
-    event_queue.roundtrip(&mut state)
+    event_queue
+        .roundtrip(&mut state)
         .wrap_err("buffer attach roundtrip failed")?;
 
     // Store globals on state for the async loop
@@ -277,7 +303,8 @@ struct EdgeSurface {
 struct GrabState {
     locked_pointer: zwp_locked_pointer_v1::ZwpLockedPointerV1,
     relative_pointer: zwp_relative_pointer_v1::ZwpRelativePointerV1,
-    shortcuts_inhibitor: Option<zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1>,
+    shortcuts_inhibitor:
+        Option<zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1>,
     surface: wl_surface::WlSurface,
 }
 
@@ -299,7 +326,8 @@ struct WaylandState {
     pointer_constraints: Option<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1>,
     relative_pointer_manager: Option<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1>,
     xdg_output_manager: Option<zxdg_output_manager_v1::ZxdgOutputManagerV1>,
-    shortcuts_inhibit_manager: Option<zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1>,
+    shortcuts_inhibit_manager:
+        Option<zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1>,
 
     // Input objects
     pointer: Option<wl_pointer::WlPointer>,
@@ -456,14 +484,17 @@ impl WaylandState {
         let repeat_interval = Duration::from_millis((1000 / self.repeat_rate.max(1)) as u64);
         let delay = Duration::from_millis(self.repeat_delay as u64);
 
-        self.held_keys.iter().map(|ks| {
-            let elapsed = ks.started.elapsed();
-            if elapsed < delay {
-                ks.started + delay
-            } else {
-                ks.last_repeat + repeat_interval
-            }
-        }).min()
+        self.held_keys
+            .iter()
+            .map(|ks| {
+                let elapsed = ks.started.elapsed();
+                if elapsed < delay {
+                    ks.started + delay
+                } else {
+                    ks.last_repeat + repeat_interval
+                }
+            })
+            .min()
     }
 
     fn fire_repeats(&mut self) {
@@ -481,7 +512,8 @@ impl WaylandState {
                     tx.send(LayerShellEvent::KeyEvent {
                         keycode: ks.keycode,
                         pressed: true,
-                    }).ok()
+                    })
+                    .ok()
                 });
                 ks.last_repeat = now;
             }
@@ -500,47 +532,65 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
         _conn: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
             match interface.as_str() {
                 "wl_compositor" => {
                     let compositor = registry.bind::<wl_compositor::WlCompositor, _, _>(
-                        name, version.min(6), qh, (),
+                        name,
+                        version.min(6),
+                        qh,
+                        (),
                     );
                     state.compositor = Some(compositor);
                 }
                 "zwlr_layer_shell_v1" => {
                     let layer_shell = registry.bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1, _, _>(
-                        name, version.min(4), qh, (),
+                        name,
+                        version.min(4),
+                        qh,
+                        (),
                     );
                     state.layer_shell = Some(layer_shell);
                 }
                 "wl_seat" => {
-                    let seat = registry.bind::<wl_seat::WlSeat, _, _>(
-                        name, version.min(9), qh, (),
-                    );
+                    let seat = registry.bind::<wl_seat::WlSeat, _, _>(name, version.min(9), qh, ());
                     state.seat = Some(seat);
                 }
                 "wl_shm" => {
-                    let shm = registry.bind::<wl_shm::WlShm, _, _>(
-                        name, version.min(1), qh, (),
-                    );
+                    let shm = registry.bind::<wl_shm::WlShm, _, _>(name, version.min(1), qh, ());
                     state.shm = Some(shm);
                 }
                 "zwp_pointer_constraints_v1" => {
-                    let pc = registry.bind::<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1, _, _>(
-                        name, version.min(1), qh, (),
-                    );
+                    let pc = registry
+                        .bind::<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1, _, _>(
+                            name,
+                            version.min(1),
+                            qh,
+                            (),
+                        );
                     state.pointer_constraints = Some(pc);
                 }
                 "zwp_relative_pointer_manager_v1" => {
-                    let rpm = registry.bind::<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1, _, _>(
-                        name, version.min(1), qh, (),
-                    );
+                    let rpm = registry
+                        .bind::<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1, _, _>(
+                            name,
+                            version.min(1),
+                            qh,
+                            (),
+                        );
                     state.relative_pointer_manager = Some(rpm);
                 }
                 "zxdg_output_manager_v1" => {
                     let mgr = registry.bind::<zxdg_output_manager_v1::ZxdgOutputManagerV1, _, _>(
-                        name, version.min(3), qh, (),
+                        name,
+                        version.min(3),
+                        qh,
+                        (),
                     );
                     state.xdg_output_manager = Some(mgr);
                 }
@@ -551,9 +601,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                     state.shortcuts_inhibit_manager = Some(mgr);
                 }
                 "wl_output" => {
-                    let output = registry.bind::<wl_output::WlOutput, _, _>(
-                        name, version.min(4), qh, (),
-                    );
+                    let output =
+                        registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qh, ());
                     state.outputs.push(OutputInfo {
                         wl_output: output,
                         logical_width: 0,
@@ -576,7 +625,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
         qh: &QueueHandle<Self>,
     ) {
         match event {
-            wl_pointer::Event::Enter { serial, surface, .. } => {
+            wl_pointer::Event::Enter {
+                serial, surface, ..
+            } => {
                 state.pointer_serial = serial;
                 if state.is_edge_surface(&surface) && !state.grabbed {
                     debug!("Layer-shell: pointer entered edge surface");
@@ -589,13 +640,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
             wl_pointer::Event::Leave { serial, .. } => {
                 state.pointer_serial = serial;
             }
-            wl_pointer::Event::Button { button, state: btn_state, .. } => {
+            wl_pointer::Event::Button {
+                button,
+                state: btn_state,
+                ..
+            } => {
                 if state.grabbed {
                     let pressed = btn_state == WEnum::Value(wl_pointer::ButtonState::Pressed);
-                    state.send_event(LayerShellEvent::MouseButton {
-                        button,
-                        pressed,
-                    });
+                    state.send_event(LayerShellEvent::MouseButton { button, pressed });
                 }
             }
             wl_pointer::Event::Axis { axis, value, .. } => {
@@ -655,7 +707,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
         _qh: &QueueHandle<Self>,
     ) {
         match event {
-            wl_keyboard::Event::Key { key, state: key_state, .. } => {
+            wl_keyboard::Event::Key {
+                key,
+                state: key_state,
+                ..
+            } => {
                 if state.grabbed {
                     let pressed = key_state == WEnum::Value(wl_keyboard::KeyState::Pressed);
                     state.send_event(LayerShellEvent::KeyEvent {
@@ -681,7 +737,13 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                     }
                 }
             }
-            wl_keyboard::Event::Modifiers { mods_depressed, mods_latched, mods_locked, group, .. } => {
+            wl_keyboard::Event::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+                ..
+            } => {
                 if state.grabbed {
                     state.send_event(LayerShellEvent::KeyModifiers {
                         depressed: mods_depressed,
@@ -710,7 +772,12 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for WaylandState {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        if let zwlr_layer_surface_v1::Event::Configure { serial, width, height } = event {
+        if let zwlr_layer_surface_v1::Event::Configure {
+            serial,
+            width,
+            height,
+        } = event
+        {
             layer_surface.ack_configure(serial);
             debug!("Layer surface configured: {}x{}", width, height);
             for edge in &mut state.edge_surfaces {
@@ -775,20 +842,16 @@ fn edge_anchor_size(direction: Direction) -> (zwlr_layer_surface_v1::Anchor, u32
     match direction {
         Direction::Right => (
             Anchor::Right | Anchor::Top | Anchor::Bottom,
-            1, 0, // 1px wide, fill height
+            1,
+            0, // 1px wide, fill height
         ),
-        Direction::Left => (
-            Anchor::Left | Anchor::Top | Anchor::Bottom,
-            1, 0,
-        ),
+        Direction::Left => (Anchor::Left | Anchor::Top | Anchor::Bottom, 1, 0),
         Direction::Up => (
             Anchor::Top | Anchor::Left | Anchor::Right,
-            0, 1, // fill width, 1px tall
+            0,
+            1, // fill width, 1px tall
         ),
-        Direction::Down => (
-            Anchor::Bottom | Anchor::Left | Anchor::Right,
-            0, 1,
-        ),
+        Direction::Down => (Anchor::Bottom | Anchor::Left | Anchor::Right, 0, 1),
     }
 }
 
@@ -819,7 +882,7 @@ fn is_modifier(keycode: u32) -> bool {
         97 |   // KEY_RIGHTCTRL
         100 |  // KEY_RIGHTALT
         125 |  // KEY_LEFTMETA
-        126    // KEY_RIGHTMETA
+        126 // KEY_RIGHTMETA
     )
 }
 
@@ -833,9 +896,8 @@ async fn run_event_loop(
     wayland_fd: i32,
 ) -> Result<()> {
     // Safety: we own the connection, the fd remains valid for the connection lifetime
-    let async_fd = unsafe {
-        AsyncFd::new(OwnedFd::from_raw_fd(libc::dup(wayland_fd)))
-    }.wrap_err("Failed to create AsyncFd for Wayland")?;
+    let async_fd = unsafe { AsyncFd::new(OwnedFd::from_raw_fd(libc::dup(wayland_fd))) }
+        .wrap_err("Failed to create AsyncFd for Wayland")?;
 
     loop {
         // Calculate next repeat deadline for select timeout

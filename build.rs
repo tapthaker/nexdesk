@@ -9,7 +9,11 @@ fn main() {
         .filter(|o| o.status.success())
         .and_then(|o| {
             let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if v.is_empty() { None } else { Some(v) }
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
         })
         .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".into()));
 

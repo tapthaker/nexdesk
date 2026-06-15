@@ -49,10 +49,9 @@ impl NexdeskConfig {
     pub fn load() -> Result<Self> {
         let path = Self::config_path()?;
         if path.exists() {
-            let contents = std::fs::read_to_string(&path)
-                .wrap_err("Failed to read config file")?;
-            let config: NexdeskConfig = toml::from_str(&contents)
-                .wrap_err("Failed to parse config file")?;
+            let contents = std::fs::read_to_string(&path).wrap_err("Failed to read config file")?;
+            let config: NexdeskConfig =
+                toml::from_str(&contents).wrap_err("Failed to parse config file")?;
             Ok(config)
         } else {
             Ok(Self::default_config())
@@ -61,17 +60,13 @@ impl NexdeskConfig {
 
     pub fn save(&self) -> Result<()> {
         let path = Self::config_path()?;
-        let contents = toml::to_string_pretty(self)
-            .wrap_err("Failed to serialize config")?;
-        std::fs::write(&path, contents)
-            .wrap_err("Failed to write config file")?;
+        let contents = toml::to_string_pretty(self).wrap_err("Failed to serialize config")?;
+        std::fs::write(&path, contents).wrap_err("Failed to write config file")?;
         Ok(())
     }
 
     fn default_config() -> Self {
-        let hostname = gethostname::gethostname()
-            .to_string_lossy()
-            .into_owned();
+        let hostname = gethostname::gethostname().to_string_lossy().into_owned();
         Self {
             hostname,
             port: 4242,

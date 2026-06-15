@@ -18,13 +18,32 @@ pub mod wayland_layer_shell {
     /// Stub types for non-Linux platforms (never instantiated at runtime).
     #[derive(Debug)]
     pub enum LayerShellEvent {
-        EdgeEnter { direction: crate::net::protocol::Direction },
-        MouseMove { dx: f64, dy: f64 },
-        MouseButton { button: u32, pressed: bool },
-        MouseScroll { dx: f64, dy: f64 },
+        EdgeEnter {
+            direction: crate::net::protocol::Direction,
+        },
+        MouseMove {
+            dx: f64,
+            dy: f64,
+        },
+        MouseButton {
+            button: u32,
+            pressed: bool,
+        },
+        MouseScroll {
+            dx: f64,
+            dy: f64,
+        },
         ScrollEnd,
-        KeyEvent { keycode: u32, pressed: bool },
-        KeyModifiers { depressed: u32, latched: u32, locked: u32, group: u32 },
+        KeyEvent {
+            keycode: u32,
+            pressed: bool,
+        },
+        KeyModifiers {
+            depressed: u32,
+            latched: u32,
+            locked: u32,
+            group: u32,
+        },
     }
 
     #[derive(Debug)]
@@ -64,9 +83,7 @@ pub fn request_accessibility() -> bool {
         use core_foundation::string::CFString;
 
         extern "C" {
-            fn AXIsProcessTrustedWithOptions(
-                options: core_foundation::base::CFTypeRef,
-            ) -> bool;
+            fn AXIsProcessTrustedWithOptions(options: core_foundation::base::CFTypeRef) -> bool;
         }
 
         let key = CFString::new("AXTrustedCheckOptionPrompt");

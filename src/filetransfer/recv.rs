@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{eyre, Result};
 use ring::digest;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
@@ -40,9 +40,7 @@ pub async fn receive_files(
     send_msg(&mut send, &accept).await?;
 
     // Create staging directory
-    let staging_dir = tempfile::Builder::new()
-        .prefix("nexdesk-")
-        .tempdir()?;
+    let staging_dir = tempfile::Builder::new().prefix("nexdesk-").tempdir()?;
 
     // Pre-create output paths and hasher contexts
     let mut output_paths: Vec<PathBuf> = Vec::new();
@@ -109,11 +107,8 @@ pub async fn receive_files(
                 // Verify checksum
                 if let Some(ctx) = hashers[idx].take() {
                     let hash = ctx.finish();
-                    let computed: String = hash
-                        .as_ref()
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect();
+                    let computed: String =
+                        hash.as_ref().iter().map(|b| format!("{:02x}", b)).collect();
                     if computed != checksum {
                         warn!(
                             "Checksum mismatch for file {} ({}): expected {}, got {}",
@@ -128,7 +123,11 @@ pub async fn receive_files(
                 if tid != transfer_id {
                     continue;
                 }
-                info!("File transfer {} complete ({} files received)", transfer_id, files.len());
+                info!(
+                    "File transfer {} complete ({} files received)",
+                    transfer_id,
+                    files.len()
+                );
                 break;
             }
             Some(Message::FileTransferCancel { transfer_id: tid }) => {

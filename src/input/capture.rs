@@ -45,13 +45,14 @@ pub fn create_capturer() -> Result<Box<dyn InputCapture>> {
             return crate::input::linux_x11::X11Capturer::new()
                 .map(|c| Box::new(c) as Box<dyn InputCapture>);
         }
-        Err(color_eyre::eyre::eyre!("No display server detected (set DISPLAY or WAYLAND_DISPLAY)"))
+        Err(color_eyre::eyre::eyre!(
+            "No display server detected (set DISPLAY or WAYLAND_DISPLAY)"
+        ))
     }
 
     #[cfg(target_os = "macos")]
     {
-        crate::input::macos::MacOSCapturer::new()
-            .map(|c| Box::new(c) as Box<dyn InputCapture>)
+        crate::input::macos::MacOSCapturer::new().map(|c| Box::new(c) as Box<dyn InputCapture>)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

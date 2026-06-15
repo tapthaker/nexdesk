@@ -18,12 +18,18 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SetupState) {
         lines.push(Line::from("  Your fingerprint:"));
         lines.push(Line::from(Span::styled(
             format!("  {}", fp),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
-        lines.push(Line::from("  Share this fingerprint with peers to verify identity."));
+        lines.push(Line::from(
+            "  Share this fingerprint with peers to verify identity.",
+        ));
     } else {
-        lines.push(Line::from("  A self-signed TLS certificate will be generated for"));
+        lines.push(Line::from(
+            "  A self-signed TLS certificate will be generated for",
+        ));
         lines.push(Line::from("  secure communication between your machines."));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -32,7 +38,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SetupState) {
         )));
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" Certificates "));
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Certificates "),
+    );
     frame.render_widget(paragraph, area);
 }

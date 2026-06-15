@@ -138,7 +138,11 @@ static EVDEV_TO_MACOS: [u16; 256] = {
 pub fn evdev_to_macos(evdev: u32) -> Option<u16> {
     if (evdev as usize) < EVDEV_TO_MACOS.len() {
         let mac = EVDEV_TO_MACOS[evdev as usize];
-        if mac != NONE { Some(mac) } else { None }
+        if mac != NONE {
+            Some(mac)
+        } else {
+            None
+        }
     } else {
         None
     }
@@ -161,7 +165,11 @@ static MACOS_TO_EVDEV: std::sync::LazyLock<[u32; 256]> = std::sync::LazyLock::ne
 pub fn macos_to_evdev(mac: u16) -> Option<u32> {
     if (mac as usize) < MACOS_TO_EVDEV.len() {
         let ev = MACOS_TO_EVDEV[mac as usize];
-        if ev != 0xFFFFFFFF { Some(ev) } else { None }
+        if ev != 0xFFFFFFFF {
+            Some(ev)
+        } else {
+            None
+        }
     } else {
         None
     }
@@ -252,7 +260,7 @@ mod tests {
 
     #[test]
     fn number_row_maps_correctly() {
-        assert_eq!(evdev_to_macos(2), Some(0x12));  // KEY_1
+        assert_eq!(evdev_to_macos(2), Some(0x12)); // KEY_1
         assert_eq!(evdev_to_macos(11), Some(0x1D)); // KEY_0
     }
 

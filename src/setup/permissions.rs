@@ -12,7 +12,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SetupState) {
     if state.accessibility_granted {
         lines.push(Line::from(Span::styled(
             "  Accessibility access granted!",
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
         lines.push(Line::from("  Nexdesk can capture and inject input events."));
@@ -27,10 +29,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SetupState) {
             Style::default().fg(Color::Yellow),
         )));
         lines.push(Line::from(""));
-        lines.push(Line::from("  Nexdesk needs Accessibility access to capture and inject"));
+        lines.push(Line::from(
+            "  Nexdesk needs Accessibility access to capture and inject",
+        ));
         lines.push(Line::from("  keyboard and mouse events."));
         lines.push(Line::from(""));
-        lines.push(Line::from("  A system dialog should have appeared. If not:"));
+        lines.push(Line::from(
+            "  A system dialog should have appeared. If not:",
+        ));
         lines.push(Line::from(Span::styled(
             "    1. Open System Settings > Privacy & Security > Accessibility",
             Style::default().fg(Color::Cyan),
@@ -46,7 +52,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SetupState) {
         )));
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" Permissions "));
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Permissions "),
+    );
     frame.render_widget(paragraph, area);
 }

@@ -72,8 +72,29 @@ fn release_injected_inputs(
         }
     }
 
-    let mut keys: Vec<u32> = injected_keys.iter().copied().collect();
+    // Always include modifiers in cleanup. These are the keys users notice as
+    // "sticky" most often, and relying only on tracked key-downs is brittle if
+    // the disconnect/switch-back races with the last key event.
+    const MODIFIER_KEYS: &[u32] = &[
+        29,  // KEY_LEFTCTRL
+        42,  // KEY_LEFTSHIFT
+        54,  // KEY_RIGHTSHIFT
+        56,  // KEY_LEFTALT
+        58,  // KEY_CAPSLOCK
+        97,  // KEY_RIGHTCTRL
+        100, // KEY_RIGHTALT
+        125, // KEY_LEFTMETA
+        126, // KEY_RIGHTMETA
+    ];
+
+    let mut keys: Vec<u32> = injected_keys
+        .iter()
+        .copied()
+        .chain(MODIFIER_KEYS.iter().copied())
+        .collect();
     keys.sort_unstable();
+    keys.dedup();
+
     for keycode in keys {
         let msg = Message::KeyEvent {
             keycode,
@@ -82,9 +103,8 @@ fn release_injected_inputs(
         };
         if let Err(e) = injector.inject(&msg) {
             warn!("Failed to release injected key {}: {}", keycode, e);
-        } else {
-            injected_keys.remove(&keycode);
         }
+        injected_keys.remove(&keycode);
     }
 }
 

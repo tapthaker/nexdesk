@@ -6,9 +6,9 @@ use objc2_core_foundation::CGPoint;
 
 #[cfg(target_os = "macos")]
 use objc2_core_graphics::{
-    CGDirectDisplayID, CGDisplayPixelsHigh, CGDisplayPixelsWide,
-    CGEvent, CGEventField, CGEventFlags, CGEventSourceStateID, CGEventTapLocation, CGEventType,
-    CGMouseButton, CGEventSource, CGScrollEventUnit,
+    CGDirectDisplayID, CGDisplayPixelsHigh, CGDisplayPixelsWide, CGEvent, CGEventField,
+    CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventType,
+    CGMouseButton, CGScrollEventUnit,
 };
 
 #[cfg(target_os = "macos")]
@@ -58,7 +58,10 @@ impl InputCapture for MacOSCapturer {
     }
 
     fn screen_size(&self) -> Result<(u32, u32)> {
-        Ok((CGDisplayPixelsWide(MAIN_DISPLAY) as u32, CGDisplayPixelsHigh(MAIN_DISPLAY) as u32))
+        Ok((
+            CGDisplayPixelsWide(MAIN_DISPLAY) as u32,
+            CGDisplayPixelsHigh(MAIN_DISPLAY) as u32,
+        ))
     }
 
     fn mouse_buttons(&self) -> Result<u8> {
@@ -72,7 +75,8 @@ impl InputCapture for MacOSCapturer {
         if CGEventSource::button_state(CGEventSourceStateID::HIDSystemState, CGMouseButton::Right) {
             buttons |= 2;
         }
-        if CGEventSource::button_state(CGEventSourceStateID::HIDSystemState, CGMouseButton::Center) {
+        if CGEventSource::button_state(CGEventSourceStateID::HIDSystemState, CGMouseButton::Center)
+        {
             buttons |= 4;
         }
         let _ = source; // keep source alive
@@ -154,14 +158,20 @@ impl MacOSInjector {
         })
     }
 
+    fn modifier_flag(keycode: u32) -> Option<CGEventFlags> {
+        match keycode {
+            EVDEV_KEY_LEFTSHIFT | EVDEV_KEY_RIGHTSHIFT => Some(CGEventFlags::MaskShift),
+            EVDEV_KEY_LEFTCTRL | EVDEV_KEY_RIGHTCTRL => Some(CGEventFlags::MaskControl),
+            EVDEV_KEY_LEFTALT | EVDEV_KEY_RIGHTALT => Some(CGEventFlags::MaskAlternate),
+            EVDEV_KEY_LEFTMETA | EVDEV_KEY_RIGHTMETA => Some(CGEventFlags::MaskCommand),
+            _ => None,
+        }
+    }
+
     /// Update tracked modifier flags based on an evdev keycode press/release.
     fn update_modifier_flags(&mut self, keycode: u32, pressed: bool) {
-        let flag = match keycode {
-            EVDEV_KEY_LEFTSHIFT | EVDEV_KEY_RIGHTSHIFT => CGEventFlags::MaskShift,
-            EVDEV_KEY_LEFTCTRL | EVDEV_KEY_RIGHTCTRL => CGEventFlags::MaskControl,
-            EVDEV_KEY_LEFTALT | EVDEV_KEY_RIGHTALT => CGEventFlags::MaskAlternate,
-            EVDEV_KEY_LEFTMETA | EVDEV_KEY_RIGHTMETA => CGEventFlags::MaskCommand,
-            _ => return,
+        let Some(flag) = Self::modifier_flag(keycode) else {
+            return;
         };
         if pressed {
             self.modifier_flags |= flag;
@@ -189,7 +199,11 @@ impl MacOSInjector {
         unsafe {
             // Use the IOKit/CoreGraphics internal field offsets for system events
             extern "C" {
-                fn CGEventSetIntegerValueField(event: *const std::ffi::c_void, field: u32, value: i64);
+                fn CGEventSetIntegerValueField(
+                    event: *const std::ffi::c_void,
+                    field: u32,
+                    value: i64,
+                );
             }
             let event_ref = &*event as *const CGEvent as *const std::ffi::c_void;
             // Field 133 = event subtype (8 = NX_SUBTYPE_AUX_CONTROL_BUTTON)
@@ -265,12 +279,20 @@ impl InputInjector for MacOSInjector {
                     self.buttons_down &= !(1 << bit);
                 }
                 let (cx, cy) = self.current_position()?;
-                let point = CGPoint { x: cx as f64, y: cy as f64 };
+                let point = CGPoint {
+                    x: cx as f64,
+                    y: cy as f64,
+                };
                 let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
-                let event = CGEvent::new_mouse_event(Some(&source), event_type, point, cg_button)
-                    .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create mouse event"))?;
-                CGEvent::set_integer_value_field(Some(&event), CGEventField::MouseEventClickState, self.click_count);
+                let event =
+                    CGEvent::new_mouse_event(Some(&source), event_type, point, cg_button)
+                        .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create mouse event"))?;
+                CGEvent::set_integer_value_field(
+                    Some(&event),
+                    CGEventField::MouseEventClickState,
+                    self.click_count,
+                );
                 CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
             }
             Message::MouseScroll { dx, dy, phase } => {
@@ -339,10 +361,6 @@ impl InputInjector for MacOSInjector {
                     return Ok(());
                 }
 
-                // Update modifier state BEFORE creating the event so that
-                // modifier key-down events carry their own flag.
-                self.update_modifier_flags(*keycode, *pressed);
-
                 let mac_keycode = match keymap::evdev_to_macos(*keycode) {
                     Some(k) => k,
                     None => {
@@ -352,6 +370,23 @@ impl InputInjector for MacOSInjector {
                 };
                 let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
+
+                // macOS represents modifier transitions as FlagsChanged events.
+                // Posting plain KeyDown/KeyUp for Shift/Ctrl/Option/Command can
+                // leave the global modifier state stuck if a switch-back or
+                // disconnect races with the key release.
+                if Self::modifier_flag(*keycode).is_some() {
+                    self.update_modifier_flags(*keycode, *pressed);
+                    let event =
+                        CGEvent::new_keyboard_event(Some(&source), mac_keycode, *pressed)
+                            .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create key event"))?;
+                    // kCGEventFlagsChanged = 12
+                    CGEvent::set_type(Some(&event), CGEventType(12));
+                    CGEvent::set_flags(Some(&event), self.modifier_flags);
+                    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+                    return Ok(());
+                }
+
                 let event = CGEvent::new_keyboard_event(Some(&source), mac_keycode, *pressed)
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create key event"))?;
                 CGEvent::set_flags(Some(&event), self.modifier_flags);
@@ -383,6 +418,9 @@ impl InputInjector for MacOSInjector {
     }
 
     fn screen_size(&self) -> Result<(u32, u32)> {
-        Ok((CGDisplayPixelsWide(MAIN_DISPLAY) as u32, CGDisplayPixelsHigh(MAIN_DISPLAY) as u32))
+        Ok((
+            CGDisplayPixelsWide(MAIN_DISPLAY) as u32,
+            CGDisplayPixelsHigh(MAIN_DISPLAY) as u32,
+        ))
     }
 }

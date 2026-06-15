@@ -1,4 +1,4 @@
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{eyre, Result};
 use tracing::{info, warn};
 
 /// Returns the platform slug used in GitHub release asset names.
@@ -20,7 +20,11 @@ fn parse_semver(version: &str) -> Option<(u32, u32, u32)> {
     if parts.len() != 3 {
         return None;
     }
-    Some((parts[0].parse().ok()?, parts[1].parse().ok()?, parts[2].parse().ok()?))
+    Some((
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+    ))
 }
 
 /// Returns true if `a` is a newer version than `b`.
@@ -52,8 +56,13 @@ pub async fn self_update(target_version: &str) -> Result<()> {
         return Err(eyre!("Not a clean release version: {}", target_version));
     }
 
-    let platform = platform_slug()
-        .ok_or_else(|| eyre!("Unsupported platform: {}-{}", std::env::consts::OS, std::env::consts::ARCH))?;
+    let platform = platform_slug().ok_or_else(|| {
+        eyre!(
+            "Unsupported platform: {}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
 
     let url = format!(
         "https://github.com/tapthaker/nexdesk/releases/download/{}/nexdesk-{}",
@@ -61,14 +70,17 @@ pub async fn self_update(target_version: &str) -> Result<()> {
     );
     info!("Downloading update from {}", url);
 
-    let response = reqwest::get(&url).await
+    let response = reqwest::get(&url)
+        .await
         .map_err(|e| eyre!("Failed to download update: {}", e))?;
 
     if !response.status().is_success() {
         return Err(eyre!("Download failed with HTTP {}", response.status()));
     }
 
-    let bytes = response.bytes().await
+    let bytes = response
+        .bytes()
+        .await
         .map_err(|e| eyre!("Failed to read response body: {}", e))?;
 
     if bytes.is_empty() {
@@ -77,17 +89,17 @@ pub async fn self_update(target_version: &str) -> Result<()> {
 
     info!("Downloaded {} bytes", bytes.len());
 
-    let exe_path = std::env::current_exe()
-        .map_err(|e| eyre!("Failed to get current exe path: {}", e))?;
+    let exe_path =
+        std::env::current_exe().map_err(|e| eyre!("Failed to get current exe path: {}", e))?;
 
-    let exe_dir = exe_path.parent()
+    let exe_dir = exe_path
+        .parent()
         .ok_or_else(|| eyre!("Current exe has no parent directory"))?;
 
     let tmp_path = exe_dir.join(".nexdesk-update.tmp");
 
     // Write to temp file
-    std::fs::write(&tmp_path, &bytes)
-        .map_err(|e| eyre!("Failed to write temp file: {}", e))?;
+    std::fs::write(&tmp_path, &bytes).map_err(|e| eyre!("Failed to write temp file: {}", e))?;
 
     // Set executable permissions
     #[cfg(unix)]
@@ -137,8 +149,8 @@ pub async fn check_latest_version() -> Result<String> {
 /// on successful update so the service manager (LaunchAgent/systemd) restarts
 /// with the new binary.
 pub async fn update_check_loop() {
-    use std::time::Duration;
     use crate::net::protocol::BUILD_VERSION;
+    use std::time::Duration;
 
     // Skip update checks for dev builds
     if !is_release_version(BUILD_VERSION) {
@@ -169,7 +181,10 @@ pub async fn update_check_loop() {
             continue;
         }
 
-        info!("New version available: {} (current: {})", latest, BUILD_VERSION);
+        info!(
+            "New version available: {} (current: {})",
+            latest, BUILD_VERSION
+        );
         match self_update(&latest).await {
             Ok(()) => {
                 info!("Updated to {}. Exiting for restart...", latest);

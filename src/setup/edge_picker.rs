@@ -14,9 +14,13 @@ use crate::net::protocol::Direction;
 ///
 /// Selection indices: 0=left, 1=right, 2=top, 3=bottom.
 pub fn render_edge_layout(frame: &mut Frame, area: Rect, selection: usize) {
-    let sel = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let sel = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Color::DarkGray);
-    let this = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let this = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
 
     let top = if selection == 2 { sel } else { dim };
     let bot = if selection == 3 { sel } else { dim };
@@ -25,8 +29,8 @@ pub fn render_edge_layout(frame: &mut Frame, area: Rect, selection: usize) {
 
     // Padding to align center/top/bottom boxes with the center column
     let pad = "                "; // 16 spaces
-    let gap = "   ";              // 3 spaces between boxes
-    let ind = "  ";               // 2 spaces indent for left box
+    let gap = "   "; // 3 spaces between boxes
+    let ind = "  "; // 2 spaces indent for left box
 
     let lines = vec![
         Line::from(""),
@@ -69,8 +73,11 @@ pub fn render_edge_layout(frame: &mut Frame, area: Rect, selection: usize) {
         )),
     ];
 
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" Screen Arrangement "));
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Screen Arrangement "),
+    );
     frame.render_widget(paragraph, area);
 }
 
@@ -115,10 +122,9 @@ fn run_picker(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<D
 
             render_edge_layout(frame, chunks[1], selection);
 
-            let footer =
-                Paragraph::new(" ←↑↓→ Select edge | Enter: Confirm | q/Esc: Cancel ")
-                    .alignment(Alignment::Center)
-                    .block(Block::default().borders(Borders::ALL));
+            let footer = Paragraph::new(" ←↑↓→ Select edge | Enter: Confirm | q/Esc: Cancel ")
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL));
             frame.render_widget(footer, chunks[2]);
         })?;
 

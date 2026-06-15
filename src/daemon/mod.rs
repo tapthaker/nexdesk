@@ -22,6 +22,28 @@ pub fn install_service(args: &[&str]) -> Result<()> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = args;
-        Err(color_eyre::eyre::eyre!("Unsupported platform for daemon installation"))
+        Err(color_eyre::eyre::eyre!(
+            "Unsupported platform for daemon installation"
+        ))
+    }
+}
+
+/// Print daemon/process/listener status for troubleshooting.
+pub fn print_status() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        launchagent::print_status()
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        systemd::print_status()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(color_eyre::eyre::eyre!(
+            "Unsupported platform for daemon status"
+        ))
     }
 }

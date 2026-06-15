@@ -4,8 +4,14 @@ use super::app::SetupState;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &SetupState) {
     let roles = vec![
-        ("Server", "Captures input and sends it to clients. Run this on your primary machine."),
-        ("Client", "Receives input from the server. Run this on secondary machines."),
+        (
+            "Server",
+            "Captures input and sends it to clients. Run this on your primary machine.",
+        ),
+        (
+            "Client",
+            "Receives input from the server. Run this on secondary machines.",
+        ),
     ];
 
     let mut lines = vec![
@@ -15,9 +21,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SetupState) {
     ];
 
     for (i, (name, desc)) in roles.iter().enumerate() {
-        let marker = if i == state.role_selection { "▸ " } else { "  " };
+        let marker = if i == state.role_selection {
+            "▸ "
+        } else {
+            "  "
+        };
         let style = if i == state.role_selection {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -38,7 +50,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SetupState) {
         Style::default().fg(Color::DarkGray),
     )));
 
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" Role Selection "));
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Role Selection "),
+    );
     frame.render_widget(paragraph, area);
 }

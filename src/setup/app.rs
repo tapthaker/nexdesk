@@ -15,7 +15,7 @@ use ratatui::{prelude::*, widgets::*};
 use crate::config::NexdeskConfig;
 use crate::net::discovery::{BrowseHandle, DiscoveredPeer};
 
-use super::{welcome, role, network, screens, certificates, permissions, service};
+use super::{certificates, network, permissions, role, screens, service, welcome};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -39,7 +39,13 @@ impl Step {
             },
             Step::Network => Step::Certificates,
             Step::Screens => Step::Certificates,
-            Step::Certificates => if cfg!(target_os = "macos") { Step::Permissions } else { Step::Service },
+            Step::Certificates => {
+                if cfg!(target_os = "macos") {
+                    Step::Permissions
+                } else {
+                    Step::Service
+                }
+            }
             Step::Permissions => Step::Service,
             Step::Service => Step::Done,
             Step::Done => Step::Done,
@@ -57,7 +63,13 @@ impl Step {
                 _ => Step::Network,
             },
             Step::Permissions => Step::Certificates,
-            Step::Service => if cfg!(target_os = "macos") { Step::Permissions } else { Step::Certificates },
+            Step::Service => {
+                if cfg!(target_os = "macos") {
+                    Step::Permissions
+                } else {
+                    Step::Certificates
+                }
+            }
             Step::Done => Step::Service,
         }
     }
@@ -83,13 +95,29 @@ impl Step {
             Step::Screens => 3,
             Step::Certificates => 4,
             Step::Permissions => 5,
-            Step::Service => if cfg!(target_os = "macos") { 6 } else { 5 },
-            Step::Done => if cfg!(target_os = "macos") { 7 } else { 6 },
+            Step::Service => {
+                if cfg!(target_os = "macos") {
+                    6
+                } else {
+                    5
+                }
+            }
+            Step::Done => {
+                if cfg!(target_os = "macos") {
+                    7
+                } else {
+                    6
+                }
+            }
         }
     }
 
     fn total_steps() -> usize {
-        if cfg!(target_os = "macos") { 6 } else { 5 }
+        if cfg!(target_os = "macos") {
+            6
+        } else {
+            5
+        }
     }
 }
 
@@ -158,7 +186,9 @@ pub async fn run() -> Result<()> {
                 for fd in [stdin_fd, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
                     let name = libc::ttyname(fd);
                     if !name.is_null() {
-                        let s = std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned();
+                        let s = std::ffi::CStr::from_ptr(name)
+                            .to_string_lossy()
+                            .into_owned();
                         if s != "/dev/tty" {
                             path = Some(s);
                             break;
@@ -171,7 +201,9 @@ pub async fn run() -> Result<()> {
                 .read(true)
                 .write(true)
                 .open(&tty_path)?;
-            unsafe { libc::dup2(tty.as_raw_fd(), libc::STDIN_FILENO); }
+            unsafe {
+                libc::dup2(tty.as_raw_fd(), libc::STDIN_FILENO);
+            }
             Some(tty)
         } else {
             None
@@ -317,8 +349,11 @@ pub async fn run() -> Result<()> {
                             Step::Role => {
                                 state.role_selection = (state.role_selection + 1).min(1);
                             }
-                            Step::Network if state.use_discovery && !state.discovered_peers.is_empty() => {
-                                state.peer_selection = (state.peer_selection + 1).min(state.discovered_peers.len() - 1);
+                            Step::Network
+                                if state.use_discovery && !state.discovered_peers.is_empty() =>
+                            {
+                                state.peer_selection = (state.peer_selection + 1)
+                                    .min(state.discovered_peers.len() - 1);
                             }
                             Step::Screens => {
                                 state.edge_selection = 3; // bottom
@@ -382,7 +417,12 @@ async fn apply_step(state: &mut SetupState) -> Result<()> {
     match state.step {
         Step::Role => {
             state.config.role = Some(
-                if state.role_selection == 0 { "server" } else { "client" }.to_string(),
+                if state.role_selection == 0 {
+                    "server"
+                } else {
+                    "client"
+                }
+                .to_string(),
             );
             // Stop any previous discovery
             state._browse_handle = None;
@@ -454,7 +494,9 @@ fn render_done(frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(Span::styled(
             "  Setup complete!",
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from("  Your configuration has been saved."),
@@ -462,7 +504,7 @@ fn render_done(frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from("  Run 'nexdesk serve' or 'nexdesk connect <peer>' to get started."),
     ];
-    let paragraph = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title(" Done "));
+    let paragraph =
+        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(" Done "));
     frame.render_widget(paragraph, area);
 }

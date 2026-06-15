@@ -1,9 +1,9 @@
 use color_eyre::eyre::{Result, WrapErr};
+use tracing::debug;
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{self, ConnectionExt as _, Screen, ButtonMask};
+use x11rb::protocol::xproto::{self, ButtonMask, ConnectionExt as _, Screen};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
-use tracing::debug;
 
 use crate::input::capture::InputCapture;
 use crate::input::inject::InputInjector;
@@ -29,12 +29,15 @@ pub struct X11Capturer {
 
 impl X11Capturer {
     pub fn new() -> Result<Self> {
-        let (conn, screen_num) = RustConnection::connect(None)
-            .wrap_err("Failed to connect to X11 display")?;
+        let (conn, screen_num) =
+            RustConnection::connect(None).wrap_err("Failed to connect to X11 display")?;
         let screen = &conn.setup().roots[screen_num];
         let root = root_window(screen);
 
-        debug!("X11 capturer: screen {}x{}", screen.width_in_pixels, screen.height_in_pixels);
+        debug!(
+            "X11 capturer: screen {}x{}",
+            screen.width_in_pixels, screen.height_in_pixels
+        );
 
         Ok(Self {
             conn,
@@ -46,30 +49,48 @@ impl X11Capturer {
 
 impl InputCapture for X11Capturer {
     fn mouse_position(&self) -> Result<(i32, i32)> {
-        let reply = self.conn.query_pointer(self.root)?.reply()
+        let reply = self
+            .conn
+            .query_pointer(self.root)?
+            .reply()
             .wrap_err("Failed to query pointer")?;
         Ok((reply.root_x as i32, reply.root_y as i32))
     }
 
     fn screen_size(&self) -> Result<(u32, u32)> {
-        let reply = self.conn.get_geometry(self.root)?.reply()
+        let reply = self
+            .conn
+            .get_geometry(self.root)?
+            .reply()
             .wrap_err("Failed to query screen geometry")?;
         Ok((reply.width as u32, reply.height as u32))
     }
 
     fn mouse_buttons(&self) -> Result<u8> {
-        let reply = self.conn.query_pointer(self.root)?.reply()
+        let reply = self
+            .conn
+            .query_pointer(self.root)?
+            .reply()
             .wrap_err("Failed to query pointer")?;
         let mask = reply.mask;
         let mut buttons: u8 = 0;
-        if mask.contains(ButtonMask::M1) { buttons |= 1; } // left
-        if mask.contains(ButtonMask::M3) { buttons |= 2; } // right (Button3 in X11)
-        if mask.contains(ButtonMask::M2) { buttons |= 4; } // middle
+        if mask.contains(ButtonMask::M1) {
+            buttons |= 1;
+        } // left
+        if mask.contains(ButtonMask::M3) {
+            buttons |= 2;
+        } // right (Button3 in X11)
+        if mask.contains(ButtonMask::M2) {
+            buttons |= 4;
+        } // middle
         Ok(buttons)
     }
 
     fn poll_key_events(&mut self) -> Result<Vec<Message>> {
-        let reply = self.conn.query_keymap()?.reply()
+        let reply = self
+            .conn
+            .query_keymap()?
+            .reply()
             .wrap_err("Failed to query keymap")?;
         let keymap = reply.keys;
 
@@ -105,21 +126,22 @@ pub struct X11Injector {
 
 impl X11Injector {
     pub fn new() -> Result<Self> {
-        let (conn, screen_num) = RustConnection::connect(None)
-            .wrap_err("Failed to connect to X11 display")?;
+        let (conn, screen_num) =
+            RustConnection::connect(None).wrap_err("Failed to connect to X11 display")?;
 
-        conn.xtest_get_version(2, 1)?.reply()
+        conn.xtest_get_version(2, 1)?
+            .reply()
             .wrap_err("XTest extension not available")?;
 
         let screen = &conn.setup().roots[screen_num];
         let root = root_window(screen);
 
-        debug!("X11 injector: screen {}x{}, XTest available", screen.width_in_pixels, screen.height_in_pixels);
+        debug!(
+            "X11 injector: screen {}x{}, XTest available",
+            screen.width_in_pixels, screen.height_in_pixels
+        );
 
-        Ok(Self {
-            conn,
-            root,
-        })
+        Ok(Self { conn, root })
     }
 }
 
@@ -136,8 +158,13 @@ impl InputInjector for X11Injector {
                     2 => 2,
                     n => *n + 1,
                 };
-                let event_type = if *pressed { BUTTON_PRESS } else { BUTTON_RELEASE };
-                self.conn.xtest_fake_input(event_type, x_button, 0, self.root, 0, 0, 0)?;
+                let event_type = if *pressed {
+                    BUTTON_PRESS
+                } else {
+                    BUTTON_RELEASE
+                };
+                self.conn
+                    .xtest_fake_input(event_type, x_button, 0, self.root, 0, 0, 0)?;
                 self.conn.flush()?;
             }
             Message::MouseScroll { dx, dy, .. } => {
@@ -146,22 +173,43 @@ impl InputInjector for X11Injector {
                 if idy != 0 {
                     let button = if idy > 0 { 4u8 } else { 5u8 };
                     for _ in 0..idy.unsigned_abs() {
-                        self.conn.xtest_fake_input(BUTTON_PRESS, button, 0, self.root, 0, 0, 0)?;
-                        self.conn.xtest_fake_input(BUTTON_RELEASE, button, 0, self.root, 0, 0, 0)?;
+                        self.conn
+                            .xtest_fake_input(BUTTON_PRESS, button, 0, self.root, 0, 0, 0)?;
+                        self.conn.xtest_fake_input(
+                            BUTTON_RELEASE,
+                            button,
+                            0,
+                            self.root,
+                            0,
+                            0,
+                            0,
+                        )?;
                     }
                 }
                 if idx != 0 {
                     let button = if idx > 0 { 7u8 } else { 6u8 };
                     for _ in 0..idx.unsigned_abs() {
-                        self.conn.xtest_fake_input(BUTTON_PRESS, button, 0, self.root, 0, 0, 0)?;
-                        self.conn.xtest_fake_input(BUTTON_RELEASE, button, 0, self.root, 0, 0, 0)?;
+                        self.conn
+                            .xtest_fake_input(BUTTON_PRESS, button, 0, self.root, 0, 0, 0)?;
+                        self.conn.xtest_fake_input(
+                            BUTTON_RELEASE,
+                            button,
+                            0,
+                            self.root,
+                            0,
+                            0,
+                            0,
+                        )?;
                     }
                 }
                 self.conn.flush()?;
             }
-            Message::KeyEvent { keycode, pressed, .. } => {
+            Message::KeyEvent {
+                keycode, pressed, ..
+            } => {
                 let event_type = if *pressed { KEY_PRESS } else { KEY_RELEASE };
-                self.conn.xtest_fake_input(event_type, *keycode as u8, 0, self.root, 0, 0, 0)?;
+                self.conn
+                    .xtest_fake_input(event_type, *keycode as u8, 0, self.root, 0, 0, 0)?;
                 self.conn.flush()?;
             }
             _ => {}
@@ -173,13 +221,17 @@ impl InputInjector for X11Injector {
         let (sw, sh) = self.screen_size()?;
         let x = x.clamp(0, sw as i32 - 1) as i16;
         let y = y.clamp(0, sh as i32 - 1) as i16;
-        self.conn.xtest_fake_input(MOTION_NOTIFY, 0, 0, self.root, x, y, 0)?;
+        self.conn
+            .xtest_fake_input(MOTION_NOTIFY, 0, 0, self.root, x, y, 0)?;
         self.conn.flush()?;
         Ok(())
     }
 
     fn screen_size(&self) -> Result<(u32, u32)> {
-        let reply = self.conn.get_geometry(self.root)?.reply()
+        let reply = self
+            .conn
+            .get_geometry(self.root)?
+            .reply()
             .wrap_err("Failed to query screen geometry")?;
         Ok((reply.width as u32, reply.height as u32))
     }

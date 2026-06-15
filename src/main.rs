@@ -1,11 +1,11 @@
 mod cli;
-mod config;
-mod net;
-mod input;
 mod clipboard;
+mod config;
 mod cursor;
 mod daemon;
 mod filetransfer;
+mod input;
+mod net;
 mod setup;
 
 use clap::Parser;
@@ -19,17 +19,15 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Skip tracing init for setup command — log output corrupts the TUI.
-    if !matches!(cli.command, Command::Setup) {
+    // Skip tracing init for setup/status commands — log output corrupts the TUI/status output.
+    if !matches!(cli.command, Command::Setup | Command::Status) {
         let filter = if cli.verbose {
             EnvFilter::new("nexdesk=debug")
         } else {
             EnvFilter::new("nexdesk=info")
         };
 
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .init();
+        tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 
     match cli.command {
@@ -64,12 +62,15 @@ async fn main() -> Result<()> {
                 } else {
                     let dir = setup::edge_picker::pick_edge()?;
                     let mut cfg = config::NexdeskConfig::load()?;
-                    cfg.switch_edge = Some(match dir {
-                        net::protocol::Direction::Left => "left",
-                        net::protocol::Direction::Right => "right",
-                        net::protocol::Direction::Up => "top",
-                        net::protocol::Direction::Down => "bottom",
-                    }.to_string());
+                    cfg.switch_edge = Some(
+                        match dir {
+                            net::protocol::Direction::Left => "left",
+                            net::protocol::Direction::Right => "right",
+                            net::protocol::Direction::Up => "top",
+                            net::protocol::Direction::Down => "bottom",
+                        }
+                        .to_string(),
+                    );
                     cfg.save()?;
                     dir
                 }
@@ -89,6 +90,9 @@ async fn main() -> Result<()> {
         Command::Setup => {
             setup::run_setup().await?;
         }
+        Command::Status => {
+            daemon::print_status()?;
+        }
         Command::TestInput => {
             input::ensure_accessibility()?;
             use std::io::Write;
@@ -103,7 +107,9 @@ async fn main() -> Result<()> {
                 print!("\rMouse: ({:5}, {:5})  buttons: {:03b}", x, y, btns);
                 for k in &keys {
                     match k {
-                        net::protocol::Message::KeyEvent { keycode, pressed, .. } => {
+                        net::protocol::Message::KeyEvent {
+                            keycode, pressed, ..
+                        } => {
                             print!("  key:{} {}", keycode, if *pressed { "dn" } else { "up" });
                         }
                         net::protocol::Message::MouseScroll { dx, dy, .. } => {

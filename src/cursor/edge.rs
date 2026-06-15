@@ -50,7 +50,10 @@ mod tests {
 
     #[test]
     fn right_edge_at_margin() {
-        assert_eq!(detect_edge(W as i32 - EDGE_MARGIN - 1, 500, W, H), Some(Direction::Right));
+        assert_eq!(
+            detect_edge(W as i32 - EDGE_MARGIN - 1, 500, W, H),
+            Some(Direction::Right)
+        );
     }
 
     #[test]
@@ -75,7 +78,10 @@ mod tests {
 
     #[test]
     fn bottom_edge_at_margin() {
-        assert_eq!(detect_edge(500, H as i32 - EDGE_MARGIN - 1, W, H), Some(Direction::Down));
+        assert_eq!(
+            detect_edge(500, H as i32 - EDGE_MARGIN - 1, W, H),
+            Some(Direction::Down)
+        );
     }
 
     #[test]
@@ -91,7 +97,10 @@ mod tests {
 
     #[test]
     fn corner_priority_right_over_down() {
-        assert_eq!(detect_edge(W as i32 - 1, H as i32 - 1, W, H), Some(Direction::Right));
+        assert_eq!(
+            detect_edge(W as i32 - 1, H as i32 - 1, W, H),
+            Some(Direction::Right)
+        );
     }
 
     #[test]
@@ -101,6 +110,9 @@ mod tests {
 
     #[test]
     fn max_corner_returns_right() {
-        assert_eq!(detect_edge(W as i32 - 1, H as i32 - 1, W, H), Some(Direction::Right));
+        assert_eq!(
+            detect_edge(W as i32 - 1, H as i32 - 1, W, H),
+            Some(Direction::Right)
+        );
     }
 }

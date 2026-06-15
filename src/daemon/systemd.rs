@@ -70,6 +70,29 @@ WantedBy=default.target
     )
 }
 
+pub fn print_status() -> Result<()> {
+    println!("nexdesk service status (systemd user)\n");
+    print_command("systemctl", &["--user", "is-active", "nexdesk.service"])?;
+    print_command("systemctl", &["--user", "is-enabled", "nexdesk.service"])?;
+    print_command(
+        "systemctl",
+        &["--user", "status", "nexdesk.service", "--no-pager"],
+    )?;
+    print_command("pgrep", &["-a", "nexdesk"])?;
+    print_command(
+        "sh",
+        &[
+            "-c",
+            "ss -lunp 2>/dev/null | grep -E '(:4242\\b|nexdesk)' || true",
+        ],
+    )?;
+    print_command(
+        "journalctl",
+        &["--user", "-u", "nexdesk.service", "-n", "40", "--no-pager"],
+    )?;
+    Ok(())
+}
+
 pub fn install(args: &[&str]) -> Result<()> {
     configure_firewall(args);
 
@@ -174,6 +197,36 @@ fn run_sudo_ufw(args: &[&str]) -> Result<()> {
         },
         stderr.trim()
     ))
+}
+
+fn print_command(program: &str, args: &[&str]) -> Result<()> {
+    println!("\n$ {} {}", program, args.join(" "));
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .wrap_err_with(|| format!("Failed to run {} {}", program, args.join(" ")))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.trim().is_empty() {
+        print!("{}", stdout);
+        if !stdout.ends_with('\n') {
+            println!();
+        }
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        eprint!("{}", stderr);
+        if !stderr.ends_with('\n') {
+            eprintln!();
+        }
+    }
+
+    if !output.status.success() {
+        println!("(exit status: {})", output.status);
+    }
+
+    Ok(())
 }
 
 fn run_systemctl(args: &[&str]) -> Result<()> {

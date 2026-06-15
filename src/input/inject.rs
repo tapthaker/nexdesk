@@ -28,8 +28,7 @@ pub fn create_injector() -> Result<Box<dyn InputInjector>> {
 
     #[cfg(target_os = "macos")]
     {
-        crate::input::macos::MacOSInjector::new()
-            .map(|i| Box::new(i) as Box<dyn InputInjector>)
+        crate::input::macos::MacOSInjector::new().map(|i| Box::new(i) as Box<dyn InputInjector>)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

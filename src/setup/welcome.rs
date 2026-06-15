@@ -5,7 +5,9 @@ pub fn render(frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(Span::styled(
             "  Welcome to Nexdesk!",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from("  Nexdesk lets you share your mouse, keyboard, and clipboard"),
@@ -19,7 +21,7 @@ pub fn render(frame: &mut Frame, area: Rect) {
         )),
     ];
 
-    let paragraph = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title(" Welcome "));
+    let paragraph =
+        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(" Welcome "));
     frame.render_widget(paragraph, area);
 }

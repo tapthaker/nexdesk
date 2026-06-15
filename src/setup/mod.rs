@@ -1,12 +1,12 @@
 mod app;
-mod welcome;
-mod role;
-mod network;
-mod screens;
 mod certificates;
-mod permissions;
-mod service;
 pub mod edge_picker;
+mod network;
+mod permissions;
+mod role;
+mod screens;
+mod service;
+mod welcome;
 
 use color_eyre::eyre::Result;
 

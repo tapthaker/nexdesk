@@ -33,10 +33,7 @@ pub async fn send_files(connection: &quinn::Connection, files: Vec<PathBuf>) -> 
     }
 
     // Filter to only regular files
-    let files: Vec<PathBuf> = files
-        .into_iter()
-        .filter(|p| p.is_file())
-        .collect();
+    let files: Vec<PathBuf> = files.into_iter().filter(|p| p.is_file()).collect();
 
     if files.is_empty() {
         debug!("No regular files to transfer");
@@ -73,10 +70,7 @@ pub async fn send_files(connection: &quinn::Connection, files: Vec<PathBuf>) -> 
             return Ok(());
         }
         other => {
-            warn!(
-                "Unexpected response to file transfer offer: {:?}",
-                other
-            );
+            warn!("Unexpected response to file transfer offer: {:?}", other);
             return Ok(());
         }
     }
