@@ -58,8 +58,11 @@ pub enum Command {
     /// Launch the TUI setup wizard
     Setup,
 
-    /// Show service/process/listener status for troubleshooting
+    /// Show a short service/process/listener status summary
     Status,
+
+    /// Show detailed service diagnostics and recent logs
+    Log,
 
     /// Test input capture (prints mouse position for 10 seconds)
     TestInput,

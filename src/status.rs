@@ -1,0 +1,67 @@
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use color_eyre::eyre::{Result, WrapErr};
+use serde::{Deserialize, Serialize};
+
+use crate::config::NexdeskConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeStatus {
+    pub role: String,
+    pub state: String,
+    pub pid: u32,
+    pub updated_at: u64,
+    pub local_addr: Option<String>,
+    pub peer_addr: Option<String>,
+    pub peer_name: Option<String>,
+    pub peer_screen: Option<String>,
+    pub peer_build: Option<String>,
+}
+
+impl RuntimeStatus {
+    pub fn new(role: impl Into<String>, state: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            state: state.into(),
+            pid: std::process::id(),
+            updated_at: now_secs(),
+            local_addr: None,
+            peer_addr: None,
+            peer_name: None,
+            peer_screen: None,
+            peer_build: None,
+        }
+    }
+}
+
+pub fn status_path() -> Result<PathBuf> {
+    Ok(NexdeskConfig::config_dir()?.join("runtime-status.json"))
+}
+
+pub fn write_status(mut status: RuntimeStatus) -> Result<()> {
+    status.updated_at = now_secs();
+    let path = status_path()?;
+    let bytes = serde_json::to_vec_pretty(&status).wrap_err("Failed to encode runtime status")?;
+    std::fs::write(&path, bytes)
+        .wrap_err_with(|| format!("Failed to write runtime status: {}", path.display()))?;
+    Ok(())
+}
+
+pub fn load_status() -> Result<Option<RuntimeStatus>> {
+    let path = status_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(&path)
+        .wrap_err_with(|| format!("Failed to read runtime status: {}", path.display()))?;
+    let status = serde_json::from_str(&contents).wrap_err("Failed to parse runtime status")?;
+    Ok(Some(status))
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}

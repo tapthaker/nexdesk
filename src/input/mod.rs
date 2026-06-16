@@ -1,6 +1,7 @@
 pub mod capture;
 pub mod inject;
 pub mod keymap;
+pub mod session;
 pub mod wake;
 
 #[cfg(target_os = "linux")]

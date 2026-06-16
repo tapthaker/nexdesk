@@ -16,10 +16,12 @@ use crate::net::discovery;
 use crate::net::protocol::{self, Message, ScreenLayout, BUILD_VERSION, PROTOCOL_VERSION};
 use crate::net::tls;
 use crate::net::transition::{ClientOutput, ClientTransition, ServerOutput, ServerTransition};
+use crate::status::{self, RuntimeStatus};
 
 const DEFAULT_PORT: u16 = 4242;
 const MOUSE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const USER_ACTIVITY_INTERVAL: Duration = Duration::from_secs(20);
+const LOCAL_LOCK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 fn track_injected_input(
     message: &Message,
@@ -145,6 +147,9 @@ pub async fn serve(port: u16, trigger_edge: Option<crate::net::protocol::Directi
     let endpoint = Endpoint::server(server_config, addr)?;
 
     info!("QUIC server listening on {}", addr);
+    let mut runtime = RuntimeStatus::new("server", "listening");
+    runtime.local_addr = Some(addr.to_string());
+    status::write_status(runtime).ok();
 
     let (cert, _) = tls::load_or_generate_certs()?;
     let server_fingerprint = tls::fingerprint(&cert);
@@ -350,6 +355,11 @@ async fn handle_server_connection(
     // Input polling + edge detection + forwarding
     let capturer = Arc::new(std::sync::Mutex::new(capturer));
     info!("Peer screen: {}x{}", peer_screen.width, peer_screen.height);
+    let mut runtime = RuntimeStatus::new("server", "connected");
+    runtime.peer_addr = Some(remote.to_string());
+    runtime.peer_screen = Some(format!("{}x{}", peer_screen.width, peer_screen.height));
+    runtime.peer_build = Some("unknown".to_string());
+    status::write_status(runtime).ok();
     let mut transition = ServerTransition::new(trigger_edge, peer_screen);
 
     // Spawn file transfer acceptor (receives files from client via new bi-streams)
@@ -392,6 +402,7 @@ async fn handle_server_connection(
     let mut last_screen_w = screen_w;
     let mut last_screen_h = screen_h;
     let mut screen_check = time::interval(Duration::from_secs(5));
+    let mut local_lock_check = time::interval(LOCAL_LOCK_CHECK_INTERVAL);
 
     let mut prev_mouse_pos: (i32, i32) = (0, 0);
     let mut last_user_activity_sent = Instant::now() - USER_ACTIVITY_INTERVAL;
@@ -726,6 +737,29 @@ async fn handle_server_connection(
                     }
                 }
             }
+            _ = local_lock_check.tick(), if transition.is_active() => {
+                if crate::input::session::is_session_locked() {
+                    warn!("Local session locked while sharing — releasing remote control so Linux can be unlocked locally");
+                    let messages = transition.deactivate_for_shortcut();
+                    if !messages.is_empty() {
+                        let mut sender = input_send.lock().await;
+                        for msg in messages {
+                            send_message_uni(&mut sender, &msg).await.ok();
+                        }
+                    }
+                    if use_layer_shell {
+                        #[cfg(target_os = "linux")]
+                        if let Some(ref tx) = capture_tx {
+                            use crate::input::wayland_layer_shell::LayerShellCommand;
+                            tx.send(LayerShellCommand::Release).ok();
+                        }
+                        capturer.lock().unwrap().set_keyboard_grab(false).ok();
+                        layer_shell_keyboard_grabbed = false;
+                    } else {
+                        capturer.lock().unwrap().set_grab(false).ok();
+                    }
+                }
+            }
             _ = screen_check.tick() => {
                 let size = capturer.lock().unwrap().screen_size().unwrap_or((last_screen_w, last_screen_h));
                 if size.0 != last_screen_w || size.1 != last_screen_h {
@@ -746,6 +780,9 @@ async fn handle_server_connection(
 
     // Always release grab when connection ends (client crash, disconnect, etc.)
     info!("Connection ended, releasing input grab");
+    let mut runtime = RuntimeStatus::new("server", "listening");
+    runtime.peer_addr = Some(format!("last disconnected: {}", remote));
+    status::write_status(runtime).ok();
     if use_layer_shell {
         #[cfg(target_os = "linux")]
         if let Some(ref tx) = capture_tx {
@@ -785,6 +822,9 @@ pub async fn connect(addr: Option<&str>) -> Result<()> {
         };
 
         info!("Connecting to nexdesk server at {}", target_addr);
+        let mut runtime = RuntimeStatus::new("client", "connecting");
+        runtime.peer_addr = Some(target_addr.to_string());
+        status::write_status(runtime).ok();
         let ep = endpoint.clone();
         let handle = tokio::spawn(async move { connect_once(&ep, target_addr).await });
         match handle.await {
@@ -792,6 +832,9 @@ pub async fn connect(addr: Option<&str>) -> Result<()> {
             Ok(Err(e)) => warn!("Connection error: {}", e),
             Err(join_err) => error!("Connection panicked: {}", join_err),
         }
+        let mut runtime = RuntimeStatus::new("client", "disconnected");
+        runtime.peer_addr = Some(target_addr.to_string());
+        status::write_status(runtime).ok();
 
         info!("Reconnecting in 2s...");
         time::sleep(Duration::from_secs(2)).await;
@@ -804,6 +847,9 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     let connection = connect_with_retry(endpoint, addr).await?;
 
     info!("Connected to {}", addr);
+    let mut runtime = RuntimeStatus::new("client", "connected");
+    runtime.peer_addr = Some(addr.to_string());
+    status::write_status(runtime).ok();
 
     // Create input injector early so we can send screen size in handshake
     let mut injector = crate::input::inject::create_injector()?;
@@ -885,6 +931,12 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
             }
 
             let ver = build_version.unwrap_or_else(|| "unknown".to_string());
+            let mut runtime = RuntimeStatus::new("client", "connected");
+            runtime.peer_addr = Some(addr.to_string());
+            runtime.peer_name = Some(hostname);
+            runtime.peer_screen = Some(format!("{}x{}", screen.width, screen.height));
+            runtime.peer_build = Some(ver.clone());
+            status::write_status(runtime).ok();
             (screen, ver)
         }
         other => {

@@ -4,6 +4,8 @@ use std::process::Command;
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use tracing::info;
 
+use crate::status;
+
 const LABEL: &str = "com.nexdesk.agent";
 
 fn plist_path() -> PathBuf {
@@ -55,8 +57,39 @@ fn plist_content(args: &[&str]) -> String {
 pub fn print_status() -> Result<()> {
     let uid = current_uid();
     let service = format!("gui/{uid}/{LABEL}");
+    let loaded = command_stdout("launchctl", &["print", &service]).is_ok();
+    let process = command_stdout("pgrep", &["-a", "nexdesk"]).ok();
+    let listener = command_stdout("sh", &["-c", "lsof -nP -iUDP:4242 2>/dev/null || true"])
+        .unwrap_or_default();
 
-    println!("nexdesk service status (LaunchAgent)\n");
+    println!("nexdesk status");
+    println!("Service : {}", if loaded { "loaded" } else { "not loaded" });
+    println!(
+        "Process : {}",
+        process
+            .as_deref()
+            .and_then(|p| p.lines().next())
+            .unwrap_or("not running")
+    );
+    println!(
+        "Listener: {}",
+        if listener.trim().is_empty() {
+            "not listening on UDP 4242"
+        } else {
+            "listening on UDP 4242"
+        }
+    );
+    print_connection_summary();
+    println!("Logs    : /tmp/nexdesk.out.log, /tmp/nexdesk.err.log");
+    println!("\nFor logs: nexdesk log");
+    Ok(())
+}
+
+pub fn print_log() -> Result<()> {
+    let uid = current_uid();
+    let service = format!("gui/{uid}/{LABEL}");
+
+    println!("nexdesk service log (LaunchAgent)\n");
     print_command("launchctl", &["print", &service])?;
     print_command("pgrep", &["-a", "nexdesk"])?;
     print_command("sh", &["-c", "lsof -nP -iUDP:4242 2>/dev/null || true"])?;
@@ -96,6 +129,48 @@ pub fn install(args: &[&str]) -> Result<()> {
 
 fn current_uid() -> u32 {
     unsafe { libc::getuid() }
+}
+
+fn print_connection_summary() {
+    match status::load_status().ok().flatten() {
+        Some(s) => {
+            let peer = s
+                .peer_name
+                .as_deref()
+                .or(s.peer_addr.as_deref())
+                .unwrap_or("unknown");
+            let addr = s.peer_addr.as_deref().unwrap_or("unknown");
+            let screen = s.peer_screen.as_deref().unwrap_or("unknown screen");
+            match s.state.as_str() {
+                "connected" => println!("Connected: {} ({}) — {}", peer, addr, screen),
+                "connecting" => println!("Connected: connecting to {}", addr),
+                "listening" => println!("Connected: no client connected"),
+                "disconnected" => println!("Connected: disconnected from {}", addr),
+                other => println!("Connected: {}", other),
+            }
+        }
+        None => println!("Connected: unknown"),
+    }
+}
+
+fn command_stdout(program: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .wrap_err_with(|| format!("Failed to run {} {}", program, args.join(" ")))?;
+
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(eyre!(
+        "{} {} exited with {}: {}",
+        program,
+        args.join(" "),
+        output.status,
+        stderr.trim()
+    ))
 }
 
 fn print_command(program: &str, args: &[&str]) -> Result<()> {

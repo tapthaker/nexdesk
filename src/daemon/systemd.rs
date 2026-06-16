@@ -4,6 +4,8 @@ use std::process::Command;
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use tracing::{info, warn};
 
+use crate::status;
+
 const SERVICE_NAME: &str = "nexdesk";
 const SESSION_ENV_VARS: &[&str] = &[
     "DISPLAY",
@@ -71,7 +73,52 @@ WantedBy=default.target
 }
 
 pub fn print_status() -> Result<()> {
-    println!("nexdesk service status (systemd user)\n");
+    let active = command_stdout("systemctl", &["--user", "is-active", "nexdesk.service"])
+        .unwrap_or_else(|_| "unknown".into());
+    let enabled = command_stdout("systemctl", &["--user", "is-enabled", "nexdesk.service"])
+        .unwrap_or_else(|_| "unknown".into());
+    let process = command_stdout("pgrep", &["-a", "nexdesk"]).ok();
+    let listener = command_stdout(
+        "sh",
+        &[
+            "-c",
+            "ss -lunp 2>/dev/null | grep -E '(:4242\\b|nexdesk)' || true",
+        ],
+    )
+    .unwrap_or_default();
+
+    println!("nexdesk status");
+    println!(
+        "Service : {}",
+        if active == "active" {
+            "running"
+        } else {
+            active.as_str()
+        }
+    );
+    println!("Startup : {}", enabled);
+    println!(
+        "Process : {}",
+        process
+            .as_deref()
+            .and_then(|p| p.lines().next())
+            .unwrap_or("not running")
+    );
+    println!(
+        "Listener: {}",
+        if listener.trim().is_empty() {
+            "not listening on UDP 4242"
+        } else {
+            "listening on UDP 4242"
+        }
+    );
+    print_connection_summary();
+    println!("\nFor logs: nexdesk log");
+    Ok(())
+}
+
+pub fn print_log() -> Result<()> {
+    println!("nexdesk service log (systemd user)\n");
     print_command("systemctl", &["--user", "is-active", "nexdesk.service"])?;
     print_command("systemctl", &["--user", "is-enabled", "nexdesk.service"])?;
     print_command(
@@ -195,6 +242,48 @@ fn run_sudo_ufw(args: &[&str]) -> Result<()> {
         } else {
             format!("\n{}", stdout.trim())
         },
+        stderr.trim()
+    ))
+}
+
+fn print_connection_summary() {
+    match status::load_status().ok().flatten() {
+        Some(s) => {
+            let peer = s
+                .peer_name
+                .as_deref()
+                .or(s.peer_addr.as_deref())
+                .unwrap_or("unknown");
+            let addr = s.peer_addr.as_deref().unwrap_or("unknown");
+            let screen = s.peer_screen.as_deref().unwrap_or("unknown screen");
+            match s.state.as_str() {
+                "connected" => println!("Connected: {} ({}) — {}", peer, addr, screen),
+                "connecting" => println!("Connected: connecting to {}", addr),
+                "listening" => println!("Connected: no client connected"),
+                "disconnected" => println!("Connected: disconnected from {}", addr),
+                other => println!("Connected: {}", other),
+            }
+        }
+        None => println!("Connected: unknown"),
+    }
+}
+
+fn command_stdout(program: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .wrap_err_with(|| format!("Failed to run {} {}", program, args.join(" ")))?;
+
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(eyre!(
+        "{} {} exited with {}: {}",
+        program,
+        args.join(" "),
+        output.status,
         stderr.trim()
     ))
 }

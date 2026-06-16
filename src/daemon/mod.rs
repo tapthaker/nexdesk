@@ -28,7 +28,7 @@ pub fn install_service(args: &[&str]) -> Result<()> {
     }
 }
 
-/// Print daemon/process/listener status for troubleshooting.
+/// Print a short daemon/process/listener status summary.
 pub fn print_status() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -44,6 +44,26 @@ pub fn print_status() -> Result<()> {
     {
         Err(color_eyre::eyre::eyre!(
             "Unsupported platform for daemon status"
+        ))
+    }
+}
+
+/// Print detailed daemon diagnostics and recent logs.
+pub fn print_log() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        launchagent::print_log()
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        systemd::print_log()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(color_eyre::eyre::eyre!(
+            "Unsupported platform for daemon logs"
         ))
     }
 }

@@ -7,6 +7,7 @@ mod filetransfer;
 mod input;
 mod net;
 mod setup;
+mod status;
 
 use clap::Parser;
 use cli::{Cli, Command};
@@ -19,8 +20,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Skip tracing init for setup/status commands — log output corrupts the TUI/status output.
-    if !matches!(cli.command, Command::Setup | Command::Status) {
+    // Skip tracing init for setup/status/log commands — log output corrupts the TUI/status output.
+    if !matches!(cli.command, Command::Setup | Command::Status | Command::Log) {
         let filter = if cli.verbose {
             EnvFilter::new("nexdesk=debug")
         } else {
@@ -92,6 +93,9 @@ async fn main() -> Result<()> {
         }
         Command::Status => {
             daemon::print_status()?;
+        }
+        Command::Log => {
+            daemon::print_log()?;
         }
         Command::TestInput => {
             input::ensure_accessibility()?;
