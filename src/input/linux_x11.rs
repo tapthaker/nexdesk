@@ -20,6 +20,11 @@ fn root_window(screen: &Screen) -> xproto::Window {
     screen.root
 }
 
+/// Translate an X11 keycode to the protocol keycode (evdev/Linux input-event-code).
+fn x11_to_evdev_keycode(x11: u32) -> Option<u32> {
+    x11.checked_sub(8)
+}
+
 /// X11-based input capturer using XQueryPointer and XQueryKeymap.
 pub struct X11Capturer {
     conn: RustConnection,
@@ -100,21 +105,56 @@ impl InputCapture for X11Capturer {
             let new = keymap[byte_idx];
             if old != new {
                 for bit in 0..8 {
-                    let keycode = (byte_idx * 8 + bit) as u32;
+                    let x_keycode = (byte_idx * 8 + bit) as u32;
                     let was_pressed = (old >> bit) & 1 != 0;
                     let is_pressed = (new >> bit) & 1 != 0;
                     if was_pressed != is_pressed {
-                        events.push(Message::KeyEvent {
-                            keycode,
-                            pressed: is_pressed,
-                            modifiers: 0, // TODO: track modifiers
-                        });
+                        if let Some(keycode) = x11_to_evdev_keycode(x_keycode) {
+                            events.push(Message::KeyEvent {
+                                keycode,
+                                pressed: is_pressed,
+                                modifiers: 0, // TODO: track modifiers
+                            });
+                        }
                     }
                 }
             }
         }
         self.prev_keymap = keymap;
         Ok(events)
+    }
+}
+
+/// Translate a protocol keycode (evdev/Linux input-event-code) to an X11 keycode.
+///
+/// XTest expects X11 keycodes, not evdev keycodes. On the standard evdev/libinput
+/// Xorg mapping, X11 keycodes are evdev keycodes offset by 8. Sending raw evdev
+/// codes can land on unrelated X11 keysyms (including XF86 media keys), which can
+/// cause surprising side effects such as play/pause toggles during cleanup.
+fn evdev_to_x11_keycode(evdev: u32) -> Option<u8> {
+    let x11 = evdev.checked_add(8)?;
+    u8::try_from(x11).ok().filter(|code| *code >= 8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{evdev_to_x11_keycode, x11_to_evdev_keycode};
+
+    #[test]
+    fn evdev_to_x11_uses_standard_offset() {
+        assert_eq!(evdev_to_x11_keycode(57), Some(65)); // KEY_SPACE
+        assert_eq!(evdev_to_x11_keycode(164), Some(172)); // KEY_PLAYPAUSE
+    }
+
+    #[test]
+    fn x11_to_evdev_uses_standard_offset() {
+        assert_eq!(x11_to_evdev_keycode(65), Some(57)); // KEY_SPACE
+        assert_eq!(x11_to_evdev_keycode(172), Some(164)); // KEY_PLAYPAUSE
+    }
+
+    #[test]
+    fn invalid_x11_keycode_is_ignored() {
+        assert_eq!(x11_to_evdev_keycode(7), None);
     }
 }
 
@@ -207,9 +247,13 @@ impl InputInjector for X11Injector {
             Message::KeyEvent {
                 keycode, pressed, ..
             } => {
+                let Some(x_keycode) = evdev_to_x11_keycode(*keycode) else {
+                    debug!("Ignoring evdev keycode outside X11 range: {}", keycode);
+                    return Ok(());
+                };
                 let event_type = if *pressed { KEY_PRESS } else { KEY_RELEASE };
                 self.conn
-                    .xtest_fake_input(event_type, *keycode as u8, 0, self.root, 0, 0, 0)?;
+                    .xtest_fake_input(event_type, x_keycode, 0, self.root, 0, 0, 0)?;
                 self.conn.flush()?;
             }
             _ => {}
