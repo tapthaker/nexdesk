@@ -182,37 +182,37 @@ impl MacOSInjector {
 
     /// Post an NSSystemDefined media key event (volume, brightness, play, etc.)
     fn post_media_key_event(&self, nx_keytype: i32, pressed: bool) -> color_eyre::eyre::Result<()> {
+        const NX_SYSDEFINED: u32 = 14;
+        const NX_SUBTYPE_AUX_CONTROL_BUTTONS: i64 = 8;
+        const NX_KEYDOWN: i64 = 0x0A;
+        const NX_KEYUP: i64 = 0x0B;
+        // These are the private-but-stable CGEvent fields used by
+        // NSSystemDefined / NX_SUBTYPE_AUX_CONTROL_BUTTONS events.
+        const CG_EVENT_SUBTYPE_FIELD: CGEventField = CGEventField(133);
+        const CG_EVENT_DATA1_FIELD: CGEventField = CGEventField(134);
+        const CG_EVENT_DATA2_FIELD: CGEventField = CGEventField(135);
+
         let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
         let event = CGEvent::new(Some(&source))
             .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEvent"))?;
-        // NX_SYSDEFINED = 14
-        CGEvent::set_type(Some(&event), CGEventType(14));
-        // data1 layout: (keytype << 16) | (flags << 8)
-        // flags: 0x0A = key down, 0x0B = key up
-        let flags: i64 = if pressed { 0x0A } else { 0x0B };
-        let data1: i64 = ((nx_keytype as i64) << 16) | (flags << 8);
-        // CGEventField 85 = misc int field used for data1, 86 = data2
-        // But the proper way is to set the event's integer fields directly.
-        // kCGEventField 0x57 (87) is sometimes used, but the standard approach
-        // uses specific field offsets for NSSystemDefined events.
-        unsafe {
-            // Use the IOKit/CoreGraphics internal field offsets for system events
-            extern "C" {
-                fn CGEventSetIntegerValueField(
-                    event: *const std::ffi::c_void,
-                    field: u32,
-                    value: i64,
-                );
-            }
-            let event_ref = &*event as *const CGEvent as *const std::ffi::c_void;
-            // Field 133 = event subtype (8 = NX_SUBTYPE_AUX_CONTROL_BUTTON)
-            CGEventSetIntegerValueField(event_ref, 133, 8);
-            // Field 134 = data1
-            CGEventSetIntegerValueField(event_ref, 134, data1);
-            // Field 135 = data2
-            CGEventSetIntegerValueField(event_ref, 135, -1);
-        }
+
+        CGEvent::set_type(Some(&event), CGEventType(NX_SYSDEFINED));
+
+        // data1 layout for aux-control-button events:
+        //   high word: NX_KEYTYPE_*
+        //   next byte: NX_KEYDOWN / NX_KEYUP
+        let key_state = if pressed { NX_KEYDOWN } else { NX_KEYUP };
+        let data1 = ((nx_keytype as i64) << 16) | (key_state << 8);
+
+        CGEvent::set_integer_value_field(
+            Some(&event),
+            CG_EVENT_SUBTYPE_FIELD,
+            NX_SUBTYPE_AUX_CONTROL_BUTTONS,
+        );
+        CGEvent::set_integer_value_field(Some(&event), CG_EVENT_DATA1_FIELD, data1);
+        CGEvent::set_integer_value_field(Some(&event), CG_EVENT_DATA2_FIELD, -1);
+
         CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
         Ok(())
     }
