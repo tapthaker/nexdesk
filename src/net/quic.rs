@@ -22,6 +22,9 @@ const DEFAULT_PORT: u16 = 4242;
 const MOUSE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const USER_ACTIVITY_INTERVAL: Duration = Duration::from_secs(20);
 const LOCAL_LOCK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const CLIENT_LATENCY_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+const CLIENT_LATENCY_RESTART_THRESHOLD: Duration = Duration::from_secs(3);
+const CLIENT_LATENCY_RESTART_STRIKES: u8 = 3;
 
 fn track_injected_input(
     message: &Message,
@@ -138,6 +141,21 @@ async fn send_user_activity(send: &mut SendStream, last_sent: &mut Instant) {
     if send_message(send, &Message::WakeDisplay).await.is_ok() {
         *last_sent = Instant::now();
     }
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn restart_current_process() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let args: Vec<String> = std::env::args().collect();
+    use std::os::unix::process::CommandExt;
+    let err = std::process::Command::new(exe).args(&args[1..]).exec();
+    Err(eyre!("Failed to restart process: {}", err))
 }
 
 /// Run a QUIC server that captures local mouse and sends events to clients.
@@ -957,11 +975,7 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                 Ok(()) => {
                     info!("Updated to {}. Restarting...", server_build_version);
                     connection.close(0u32.into(), b"updating");
-                    let exe = std::env::current_exe()?;
-                    let args: Vec<String> = std::env::args().collect();
-                    use std::os::unix::process::CommandExt;
-                    let err = std::process::Command::new(exe).args(&args[1..]).exec();
-                    return Err(eyre!("Failed to restart after update: {}", err));
+                    return restart_current_process();
                 }
                 Err(e) => {
                     warn!(
@@ -1101,6 +1115,10 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     let mut last_screen_w = my_w;
     let mut last_screen_h = my_h;
     let mut screen_check = time::interval(Duration::from_secs(5));
+    let mut latency_check = time::interval(CLIENT_LATENCY_CHECK_INTERVAL);
+    let mut pending_latency_ping: Option<(u64, Instant)> = None;
+    let mut latency_strikes: u8 = 0;
+    let mut restart_for_latency = false;
     let mut injected_keys: HashSet<u32> = HashSet::new();
     let mut injected_buttons: HashSet<u8> = HashSet::new();
 
@@ -1204,6 +1222,25 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                             break;
                         }
                     }
+                    Ok(Some(Message::HeartbeatAck { timestamp })) => {
+                        if let Some((pending_timestamp, sent_at)) = pending_latency_ping {
+                            if timestamp == pending_timestamp {
+                                let rtt = sent_at.elapsed();
+                                pending_latency_ping = None;
+                                if rtt > CLIENT_LATENCY_RESTART_THRESHOLD {
+                                    latency_strikes = latency_strikes.saturating_add(1);
+                                    warn!(
+                                        "Client latency watchdog: RTT {:.0}ms (strike {}/{})",
+                                        rtt.as_secs_f64() * 1000.0,
+                                        latency_strikes,
+                                        CLIENT_LATENCY_RESTART_STRIKES
+                                    );
+                                } else {
+                                    latency_strikes = 0;
+                                }
+                            }
+                        }
+                    }
                     Ok(Some(Message::ScreenResize { screen })) => {
                         info!("Server screen changed: {}x{}", screen.width, screen.height);
                         server_screen = screen;
@@ -1223,6 +1260,35 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                         warn!("Control stream error: {}", e);
                         break;
                     }
+                }
+            }
+            _ = latency_check.tick() => {
+                if let Some((_, sent_at)) = pending_latency_ping {
+                    if sent_at.elapsed() > CLIENT_LATENCY_RESTART_THRESHOLD {
+                        latency_strikes = latency_strikes.saturating_add(1);
+                        warn!(
+                            "Client latency watchdog: heartbeat pending for {:.0}ms (strike {}/{})",
+                            sent_at.elapsed().as_secs_f64() * 1000.0,
+                            latency_strikes,
+                            CLIENT_LATENCY_RESTART_STRIKES
+                        );
+                        pending_latency_ping = None;
+                    }
+                }
+
+                if latency_strikes >= CLIENT_LATENCY_RESTART_STRIKES {
+                    warn!("Client latency watchdog: sustained lag detected; restarting client process");
+                    restart_for_latency = true;
+                    break;
+                }
+
+                if pending_latency_ping.is_none() {
+                    let timestamp = unix_millis();
+                    if let Err(e) = send_message(&mut control_send, &Message::Heartbeat { timestamp }).await {
+                        warn!("Client latency watchdog failed to send heartbeat: {}", e);
+                        break;
+                    }
+                    pending_latency_ping = Some((timestamp, Instant::now()));
                 }
             }
             _ = screen_check.tick() => {
@@ -1255,6 +1321,10 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
 
     // Gracefully close the connection
     connection.close(0u32.into(), b"disconnected");
+
+    if restart_for_latency {
+        return restart_current_process();
+    }
 
     // Suppress unused variable warning
     let _ = server_screen;
