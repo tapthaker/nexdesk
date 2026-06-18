@@ -1151,8 +1151,8 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     let mut injected_buttons: HashSet<u8> = HashSet::new();
     let mut activation_started: Option<Instant> = None;
     let mut activation_input_messages: u64 = 0;
-    let mut activation_forward_moves: u64 = 0;
-    let mut activation_first_forward_logged = false;
+    let mut activation_inject_moves: u64 = 0;
+    let mut activation_first_inject_logged = false;
 
     loop {
         tokio::select! {
@@ -1196,29 +1196,27 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 info!("Server sharing mouse");
                                 activation_started = Some(Instant::now());
                                 activation_input_messages = 0;
-                                activation_forward_moves = 0;
-                                activation_first_forward_logged = false;
+                                activation_inject_moves = 0;
+                                activation_first_inject_logged = false;
                                 request_wake_display();
                             }
                             ClientOutput::InjectMove { x, y } => {
+                                activation_inject_moves += 1;
+                                if let Some(started) = activation_started {
+                                    if !activation_first_inject_logged {
+                                        activation_first_inject_logged = true;
+                                        info!(
+                                            "Activation diagnostics: first injected mouse move after {:.0}ms",
+                                            started.elapsed().as_secs_f64() * 1000.0
+                                        );
+                                    }
+                                }
                                 let msg = Message::MouseMove { x, y };
-                                if let Err(e) = inject_with_timing(&mut *injector, &msg, "initial move") {
+                                if let Err(e) = inject_with_timing(&mut *injector, &msg, "mouse move") {
                                     warn!("Inject mouse move error: {}", e);
                                 }
                             }
                             ClientOutput::Forward(msg) => {
-                                if matches!(msg, Message::MouseMove { .. }) {
-                                    activation_forward_moves += 1;
-                                    if let Some(started) = activation_started {
-                                        if !activation_first_forward_logged {
-                                            activation_first_forward_logged = true;
-                                            info!(
-                                                "Activation diagnostics: first forwarded mouse move after {:.0}ms",
-                                                started.elapsed().as_secs_f64() * 1000.0
-                                            );
-                                        }
-                                    }
-                                }
                                 if let Err(e) = inject_with_timing(&mut *injector, &msg, "forward") {
                                     warn!("Inject error: {}", e);
                                 } else {
@@ -1317,10 +1315,10 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                 if activation_started.is_some_and(|started| started.elapsed() >= Duration::from_secs(10)) {
                     let elapsed = activation_started.unwrap().elapsed();
                     info!(
-                        "Activation diagnostics: {:.0}s summary: input_messages={}, forwarded_mouse_moves={}",
+                        "Activation diagnostics: {:.0}s summary: input_messages={}, injected_mouse_moves={}",
                         elapsed.as_secs_f64(),
                         activation_input_messages,
-                        activation_forward_moves
+                        activation_inject_moves
                     );
                     activation_started = None;
                 }
