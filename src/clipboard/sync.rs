@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use color_eyre::eyre::{eyre, Result};
 use ring::digest;
-use tracing::{info, warn};
+use tracing::{debug, info};
 
 use crate::net::protocol::{ClipboardContent, Message};
 
@@ -22,7 +22,7 @@ impl ClipboardSync {
         let text = match read_clipboard() {
             Ok(t) => t,
             Err(e) => {
-                warn!("Failed to read clipboard: {}", e);
+                debug!("Clipboard text unavailable: {}", e);
                 return Ok(None);
             }
         };
@@ -58,7 +58,7 @@ impl ClipboardSync {
 
     /// Suggested polling interval.
     pub fn poll_interval() -> Duration {
-        Duration::from_millis(250)
+        Duration::from_secs(1)
     }
 }
 
