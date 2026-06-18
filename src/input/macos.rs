@@ -219,7 +219,7 @@ impl MacOSInjector {
         CGEvent::set_integer_value_field(Some(&event), CG_EVENT_DATA1_FIELD, data1);
         CGEvent::set_integer_value_field(Some(&event), CG_EVENT_DATA2_FIELD, -1);
 
-        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+        CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
         Ok(())
     }
 
@@ -235,7 +235,7 @@ impl MacOSInjector {
             .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
         let event = CGEvent::new_mouse_event(Some(&source), event_type, point, button)
             .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create mouse event"))?;
-        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+        CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
         Ok(())
     }
 
@@ -299,7 +299,7 @@ impl InputInjector for MacOSInjector {
                     CGEventField::MouseEventClickState,
                     self.click_count,
                 );
-                CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+                CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
             }
             Message::MouseScroll { dx, dy, phase } => {
                 use crate::net::protocol::ScrollPhase;
@@ -319,7 +319,7 @@ impl InputInjector for MacOSInjector {
                         0,
                     )
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create scroll event"))?;
-                    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+                    CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
                 }
 
                 // Horizontal scroll: continuous trackpad events with phases.
@@ -355,7 +355,7 @@ impl InputInjector for MacOSInjector {
                         CGEventField::ScrollWheelEventScrollPhase,
                         cg_phase,
                     );
-                    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+                    CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
                 }
             }
             Message::KeyEvent {
@@ -389,14 +389,14 @@ impl InputInjector for MacOSInjector {
                     // kCGEventFlagsChanged = 12
                     CGEvent::set_type(Some(&event), CGEventType(12));
                     CGEvent::set_flags(Some(&event), self.modifier_flags);
-                    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+                    CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
                     return Ok(());
                 }
 
                 let event = CGEvent::new_keyboard_event(Some(&source), mac_keycode, *pressed)
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create key event"))?;
                 CGEvent::set_flags(Some(&event), self.modifier_flags);
-                CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+                CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
             }
             _ => {}
         }

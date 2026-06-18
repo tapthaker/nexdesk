@@ -68,7 +68,7 @@ pub fn tickle_input_system() {
             loc,
             CGMouseButton::Left,
         ) {
-            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&move_event));
+            CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&move_event));
         }
     }
 }
