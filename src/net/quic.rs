@@ -1017,8 +1017,24 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
 
     let mut transition = ClientTransition::new(my_w, my_h);
 
-    // Shutdown signal for clipboard tasks
+    // Shutdown signal for background tasks
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+    // Keep macOS synthetic input path warm while connected. This is a no-op on
+    // other platforms and does not visibly move the cursor.
+    let mut shutdown_rx_warm = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                    crate::input::wake::tickle_input_system();
+                }
+                _ = shutdown_rx_warm.changed() => {
+                    break;
+                }
+            }
+        }
+    });
 
     // Accept clipboard stream (bidirectional, second bi-stream from server)
     let (clip_send, mut clip_recv) =

@@ -39,6 +39,40 @@ impl Drop for InteractivePowerAssertion {
     }
 }
 
+/// Keep the HID/WindowServer input path warm without visibly moving the cursor.
+///
+/// Some macOS systems accept synthetic mouse events immediately after idle but
+/// do not reflect them smoothly for several seconds. Posting a no-op pointer
+/// event periodically while connected keeps that path hot.
+pub fn tickle_input_system() {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_core_graphics::{
+            CGEvent, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
+            CGEventType, CGMouseButton,
+        };
+
+        let Some(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+            return;
+        };
+        let Some(event) = CGEvent::new(Some(&source)) else {
+            return;
+        };
+        let loc = CGEvent::location(Some(&event));
+        unsafe {
+            CGWarpMouseCursorPosition(loc);
+        }
+        if let Some(move_event) = CGEvent::new_mouse_event(
+            Some(&source),
+            CGEventType::MouseMoved,
+            loc,
+            CGMouseButton::Left,
+        ) {
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&move_event));
+        }
+    }
+}
+
 /// Wake the display from sleep when remote input arrives.
 ///
 /// On macOS, uses IOKit to declare user activity, which is the same mechanism
@@ -77,6 +111,8 @@ pub fn wake_display() {
 
 #[cfg(target_os = "macos")]
 use core_foundation::string::CFStringRef;
+#[cfg(target_os = "macos")]
+use objc2_core_foundation::CGPoint;
 
 #[cfg(target_os = "macos")]
 #[link(name = "IOKit", kind = "framework")]
@@ -95,6 +131,12 @@ extern "C" {
     ) -> i32;
 
     fn IOPMAssertionRelease(assertion_id: u32) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGWarpMouseCursorPosition(new_cursor_position: CGPoint) -> i32;
 }
 
 #[cfg(target_os = "macos")]
