@@ -1149,12 +1149,19 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     let mut restart_for_latency = false;
     let mut injected_keys: HashSet<u32> = HashSet::new();
     let mut injected_buttons: HashSet<u8> = HashSet::new();
+    let mut activation_started: Option<Instant> = None;
+    let mut activation_input_messages: u64 = 0;
+    let mut activation_forward_moves: u64 = 0;
+    let mut activation_first_forward_logged = false;
 
     loop {
         tokio::select! {
             msg = recv_message_uni(&mut input_recv) => {
                 match msg {
                     Ok(Some(message)) => {
+                        if activation_started.is_some() {
+                            activation_input_messages += 1;
+                        }
                         let original_message = message.clone();
                         match transition.handle(message) {
                             ClientOutput::Ignore => {
@@ -1187,6 +1194,10 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                             }
                             ClientOutput::Activate => {
                                 info!("Server sharing mouse");
+                                activation_started = Some(Instant::now());
+                                activation_input_messages = 0;
+                                activation_forward_moves = 0;
+                                activation_first_forward_logged = false;
                                 request_wake_display();
                             }
                             ClientOutput::InjectMove { x, y } => {
@@ -1196,6 +1207,18 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 }
                             }
                             ClientOutput::Forward(msg) => {
+                                if matches!(msg, Message::MouseMove { .. }) {
+                                    activation_forward_moves += 1;
+                                    if let Some(started) = activation_started {
+                                        if !activation_first_forward_logged {
+                                            activation_first_forward_logged = true;
+                                            info!(
+                                                "Activation diagnostics: first forwarded mouse move after {:.0}ms",
+                                                started.elapsed().as_secs_f64() * 1000.0
+                                            );
+                                        }
+                                    }
+                                }
                                 if let Err(e) = inject_with_timing(&mut *injector, &msg, "forward") {
                                     warn!("Inject error: {}", e);
                                 } else {
@@ -1291,6 +1314,17 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                 }
             }
             _ = latency_check.tick() => {
+                if activation_started.is_some_and(|started| started.elapsed() >= Duration::from_secs(10)) {
+                    let elapsed = activation_started.unwrap().elapsed();
+                    info!(
+                        "Activation diagnostics: {:.0}s summary: input_messages={}, forwarded_mouse_moves={}",
+                        elapsed.as_secs_f64(),
+                        activation_input_messages,
+                        activation_forward_moves
+                    );
+                    activation_started = None;
+                }
+
                 if let Some((_, sent_at)) = pending_latency_ping {
                     if sent_at.elapsed() > CLIENT_LATENCY_RESTART_THRESHOLD {
                         latency_strikes = latency_strikes.saturating_add(1);
