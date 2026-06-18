@@ -35,5 +35,40 @@ fn main() {
                 println!("cargo:rustc-link-search=native={}/usr/lib", sdk_path);
             }
         }
+
+        // macOS 15+ gates Bonjour/mDNS behind the Local Network privacy
+        // permission. A command-line binary still needs an embedded Info.plist
+        // with the local-network usage string and advertised/browsed Bonjour
+        // service types, otherwise the permission prompt may never appear and
+        // discovery silently fails.
+        let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+        let plist_path = out_dir.join("nexdesk-Info.plist");
+        std::fs::write(
+            &plist_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>works.earendil.nexdesk</string>
+    <key>CFBundleName</key>
+    <string>Nexdesk</string>
+    <key>CFBundleDisplayName</key>
+    <string>Nexdesk</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Nexdesk uses the local network to discover and connect to your other computer.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_nexdesk._udp</string>
+    </array>
+</dict>
+</plist>
+"#,
+        )
+        .expect("write macOS Info.plist");
+        println!(
+            "cargo:rustc-link-arg=-Wl,-sectcreate,__TEXT,__info_plist,{}",
+            plist_path.display()
+        );
     }
 }

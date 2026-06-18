@@ -71,27 +71,18 @@ impl ClipboardSync {
 
 #[cfg(target_os = "macos")]
 fn read_clipboard() -> Result<String> {
-    let output = std::process::Command::new("pbpaste")
-        .output()
-        .map_err(|e| eyre!("pbpaste: {}", e))?;
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| eyre!("clipboard init: {}", e))?;
+    clipboard
+        .get_text()
+        .map_err(|e| eyre!("clipboard read: {}", e))
 }
 
 #[cfg(target_os = "macos")]
 fn write_clipboard(text: &str) -> Result<()> {
-    use std::io::Write;
-    let mut child = std::process::Command::new("pbcopy")
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| eyre!("pbcopy: {}", e))?;
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(text.as_bytes())
-        .map_err(|e| eyre!("pbcopy write: {}", e))?;
-    child.wait().map_err(|e| eyre!("pbcopy wait: {}", e))?;
-    Ok(())
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| eyre!("clipboard init: {}", e))?;
+    clipboard
+        .set_text(text.to_owned())
+        .map_err(|e| eyre!("clipboard write: {}", e))
 }
 
 #[cfg(target_os = "linux")]

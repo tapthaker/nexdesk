@@ -69,3 +69,4 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 objc2-core-graphics = "0.3"
 objc2-core-foundation = "0.3"
 core-foundation = "0.10"
+arboard = { version = "3", default-features = false }
