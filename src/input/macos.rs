@@ -26,6 +26,12 @@ use crate::net::protocol::Message;
 #[cfg(target_os = "macos")]
 const MAIN_DISPLAY: CGDirectDisplayID = 0;
 
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGWarpMouseCursorPosition(new_cursor_position: CGPoint) -> i32;
+}
+
 /// macOS input capturer using CoreGraphics.
 #[cfg(target_os = "macos")]
 pub struct MacOSCapturer {
@@ -413,6 +419,12 @@ impl InputInjector for MacOSInjector {
         } else {
             (CGEventType::MouseMoved, CGMouseButton::Left)
         };
+        if matches!(event_type, CGEventType::MouseMoved) {
+            let ret = unsafe { CGWarpMouseCursorPosition(CGPoint { x, y }) };
+            if ret != 0 {
+                debug!("CGWarpMouseCursorPosition returned {}", ret);
+            }
+        }
         self.post_mouse_event(event_type, x, y, button)?;
         Ok(())
     }
