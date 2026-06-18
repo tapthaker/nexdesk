@@ -52,6 +52,31 @@ fn track_injected_input(
     }
 }
 
+fn request_wake_display() {
+    // IOPMAssertionDeclareUserActivity can occasionally block for seconds after
+    // macOS has been idle. Never run it on the hot input/control path.
+    std::thread::spawn(crate::input::wake::wake_display);
+}
+
+fn inject_with_timing(
+    injector: &mut dyn InputInjector,
+    msg: &Message,
+    context: &str,
+) -> Result<()> {
+    let started = Instant::now();
+    let result = injector.inject(msg);
+    let elapsed = started.elapsed();
+    if elapsed > Duration::from_millis(100) {
+        warn!(
+            "Slow input injection during {}: {:.0}ms ({:?})",
+            context,
+            elapsed.as_secs_f64() * 1000.0,
+            msg
+        );
+    }
+    result
+}
+
 fn release_injected_inputs(
     injector: &mut dyn InputInjector,
     injected_keys: &mut HashSet<u32>,
@@ -61,7 +86,7 @@ fn release_injected_inputs(
         return;
     }
 
-    crate::input::wake::wake_display();
+    request_wake_display();
 
     let mut buttons: Vec<u8> = injected_buttons.iter().copied().collect();
     buttons.sort_unstable();
@@ -717,7 +742,7 @@ async fn handle_server_connection(
                         send_message(&mut control_send, &ack).await?;
                     }
                     Ok(Some(Message::SwitchScreen { direction })) => {
-                        crate::input::wake::wake_display();
+                        request_wake_display();
                         info!("Client requested switch back: {:?}", direction);
                         let messages = transition.on_switch_back();
                         if !messages.is_empty() {
@@ -1162,16 +1187,16 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                             }
                             ClientOutput::Activate => {
                                 info!("Server sharing mouse");
-                                crate::input::wake::wake_display();
+                                request_wake_display();
                             }
                             ClientOutput::InjectMove { x, y } => {
                                 let msg = Message::MouseMove { x, y };
-                                if let Err(e) = injector.inject(&msg) {
+                                if let Err(e) = inject_with_timing(&mut *injector, &msg, "initial move") {
                                     warn!("Inject mouse move error: {}", e);
                                 }
                             }
                             ClientOutput::Forward(msg) => {
-                                if let Err(e) = injector.inject(&msg) {
+                                if let Err(e) = inject_with_timing(&mut *injector, &msg, "forward") {
                                     warn!("Inject error: {}", e);
                                 } else {
                                     track_injected_input(&msg, &mut injected_keys, &mut injected_buttons);
@@ -1180,7 +1205,7 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                             ClientOutput::SwitchBack { direction, inject } => {
                                 if let Some((x, y)) = inject {
                                     let msg = Message::MouseMove { x, y };
-                                    injector.inject(&msg).ok();
+                                    inject_with_timing(&mut *injector, &msg, "switch back").ok();
                                 }
                                 // Release any remote-held keys immediately on switch-back. The
                                 // server also sends cleanup releases, but those can arrive after
@@ -1250,7 +1275,7 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                     }
                     Ok(Some(Message::WakeDisplay)) => {
                         debug!("Peer user active — keeping this system awake");
-                        crate::input::wake::wake_display();
+                        request_wake_display();
                     }
                     Ok(Some(other)) => {
                         debug!("Control message: {:?}", other);
