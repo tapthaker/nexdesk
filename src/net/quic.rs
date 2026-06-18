@@ -176,11 +176,12 @@ fn unix_millis() -> u64 {
 }
 
 fn restart_current_process() -> Result<()> {
-    let exe = std::env::current_exe()?;
-    let args: Vec<String> = std::env::args().collect();
-    use std::os::unix::process::CommandExt;
-    let err = std::process::Command::new(exe).args(&args[1..]).exec();
-    Err(eyre!("Failed to restart process: {}", err))
+    // Do not use exec(). macOS IOPM assertions are process-scoped and exec keeps
+    // the same PID alive, so assertions created by the old image can leak across
+    // self-updates/watchdog restarts. Exit cleanly and let LaunchAgent/systemd
+    // restart the service with a fresh process.
+    info!("Exiting for service-manager restart");
+    std::process::exit(0);
 }
 
 /// Run a QUIC server that captures local mouse and sends events to clients.
