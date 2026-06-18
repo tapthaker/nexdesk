@@ -5,7 +5,7 @@ use crate::net::protocol::{Direction, Message, ScreenLayout};
 
 // --- Constants ---
 
-const EDGE_DWELL_THRESHOLD: u32 = 50;
+const EDGE_DWELL_THRESHOLD: u32 = 8;
 const SERVER_EDGE_COOLDOWN: u32 = 125;
 const INSET: i32 = 20;
 const CLIENT_EDGE_DWELL: u32 = 8;
