@@ -865,6 +865,9 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     let connection = connect_with_retry(endpoint, addr).await?;
 
     info!("Connected to {}", addr);
+    let _power_assertion = crate::input::wake::InteractivePowerAssertion::new(
+        "nexdesk connected client",
+    );
     let mut runtime = RuntimeStatus::new("client", "connected");
     runtime.peer_addr = Some(addr.to_string());
     status::write_status(runtime).ok();
