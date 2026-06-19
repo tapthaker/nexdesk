@@ -119,8 +119,11 @@ impl Drop for MacOSHidInjector {
 #[cfg(target_os = "macos")]
 impl MacOSHidInjector {
     pub fn new() -> Result<Self> {
+        info!("Initializing experimental IOHIDUserDevice injector");
         let mouse = create_hid_device("Nexdesk Virtual Mouse", 2, 1, MOUSE_REPORT_DESCRIPTOR)?;
+        info!("Created IOHID virtual mouse device");
         let keyboard = create_hid_device("Nexdesk Virtual Keyboard", 1, 6, KEYBOARD_REPORT_DESCRIPTOR)?;
+        info!("Created IOHID virtual keyboard device");
         let fallback = MacOSInjector::new()?;
         let (cursor_x, cursor_y) = current_position().unwrap_or((0, 0));
         info!("Using experimental IOHIDUserDevice injector on macOS");
@@ -200,61 +203,99 @@ impl InputInjector for MacOSHidInjector {
 #[cfg(target_os = "macos")]
 fn create_hid_device(name: &str, usage_page: i32, usage: i32, descriptor: &[u8]) -> Result<IOHIDUserDeviceRef> {
     unsafe {
+        info!(
+            "Creating IOHIDUserDevice: name='{}' usage_page={} usage={} descriptor_len={}",
+            name,
+            usage_page,
+            usage,
+            descriptor.len()
+        );
+
         let dict = CFDictionaryCreateMutable(
             ptr::null(),
             0,
             &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
             &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
         );
-        if dict.is_null() { return Err(eyre!("CFDictionaryCreateMutable failed")); }
+        if dict.is_null() { return Err(eyre!("CFDictionaryCreateMutable failed for {}", name)); }
 
-        set_string(dict, "Transport", "Virtual");
-        set_string(dict, "Product", name);
-        set_i32(dict, "VendorID", 0x1209);
-        set_i32(dict, "ProductID", if usage == 1 { 0x4242 } else { 0x4243 });
-        set_i32(dict, "VersionNumber", 1);
-        set_i32(dict, "PrimaryUsagePage", usage_page);
-        set_i32(dict, "PrimaryUsage", usage);
-        set_data(dict, "ReportDescriptor", descriptor);
+        set_string(dict, name, "Transport", "Virtual")?;
+        set_string(dict, name, "Manufacturer", "Nexdesk")?;
+        set_string(dict, name, "Product", name)?;
+        set_string(dict, name, "SerialNumber", if usage == 1 { "nexdesk-mouse" } else { "nexdesk-keyboard" })?;
+        set_i32(dict, name, "VendorID", 0x1209)?;
+        set_i32(dict, name, "ProductID", if usage == 1 { 0x4242 } else { 0x4243 })?;
+        set_i32(dict, name, "VersionNumber", 1)?;
+        set_i32(dict, name, "PrimaryUsagePage", usage_page)?;
+        set_i32(dict, name, "PrimaryUsage", usage)?;
+        set_i32(dict, name, "MaxInputReportSize", 64)?;
+        set_data(dict, name, "ReportDescriptor", descriptor)?;
 
+        info!("Calling IOHIDUserDeviceCreate for {}", name);
         let device = IOHIDUserDeviceCreate(ptr::null(), dict as *const c_void);
         CFRelease(dict as CFTypeRef);
-        if device.is_null() { return Err(eyre!("IOHIDUserDeviceCreate failed")); }
+        if device.is_null() {
+            return Err(eyre!(
+                "IOHIDUserDeviceCreate returned null for {} (usage_page={}, usage={}, descriptor_len={})",
+                name,
+                usage_page,
+                usage,
+                descriptor.len()
+            ));
+        }
         Ok(device)
     }
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn set_string(dict: CFMutableDictionaryRef, key: &str, value: &str) {
-    let k = cf_string(key);
-    let v = cf_string(value);
+unsafe fn set_string(dict: CFMutableDictionaryRef, device_name: &str, key: &str, value: &str) -> Result<()> {
+    let k = cf_string(key)?;
+    let v = cf_string(value)?;
+    info!("IOHID property for {}: {}='{}'", device_name, key, value);
     CFDictionarySetValue(dict, k as *const c_void, v as *const c_void);
     CFRelease(k as CFTypeRef);
     CFRelease(v as CFTypeRef);
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn set_i32(dict: CFMutableDictionaryRef, key: &str, value: i32) {
-    let k = cf_string(key);
+unsafe fn set_i32(dict: CFMutableDictionaryRef, device_name: &str, key: &str, value: i32) -> Result<()> {
+    let k = cf_string(key)?;
     let n = CFNumberCreate(ptr::null(), K_CF_NUMBER_SINT32_TYPE, &value as *const _ as *const c_void);
+    if n.is_null() {
+        CFRelease(k as CFTypeRef);
+        return Err(eyre!("CFNumberCreate failed for {} property {}", device_name, key));
+    }
+    info!("IOHID property for {}: {}={}", device_name, key, value);
     CFDictionarySetValue(dict, k as *const c_void, n as *const c_void);
     CFRelease(k as CFTypeRef);
     CFRelease(n as CFTypeRef);
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn set_data(dict: CFMutableDictionaryRef, key: &str, value: &[u8]) {
-    let k = cf_string(key);
+unsafe fn set_data(dict: CFMutableDictionaryRef, device_name: &str, key: &str, value: &[u8]) -> Result<()> {
+    let k = cf_string(key)?;
     let d = CFDataCreate(ptr::null(), value.as_ptr(), value.len() as c_long);
+    if d.is_null() {
+        CFRelease(k as CFTypeRef);
+        return Err(eyre!("CFDataCreate failed for {} property {}", device_name, key));
+    }
+    info!("IOHID property for {}: {}=<{} bytes>", device_name, key, value.len());
     CFDictionarySetValue(dict, k as *const c_void, d as *const c_void);
     CFRelease(k as CFTypeRef);
     CFRelease(d as CFTypeRef);
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn cf_string(value: &str) -> CFStringRef {
-    let c = CString::new(value).unwrap();
-    CFStringCreateWithCString(ptr::null(), c.as_ptr(), K_CF_STRING_ENCODING_UTF8)
+unsafe fn cf_string(value: &str) -> Result<CFStringRef> {
+    let c = CString::new(value).map_err(|e| eyre!("CString failed for '{}': {}", value, e))?;
+    let s = CFStringCreateWithCString(ptr::null(), c.as_ptr(), K_CF_STRING_ENCODING_UTF8);
+    if s.is_null() {
+        return Err(eyre!("CFStringCreateWithCString failed for '{}'", value));
+    }
+    Ok(s)
 }
 
 #[cfg(target_os = "macos")]
