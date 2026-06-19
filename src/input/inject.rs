@@ -28,6 +28,12 @@ pub fn create_injector() -> Result<Box<dyn InputInjector>> {
 
     #[cfg(target_os = "macos")]
     {
+        if std::env::var("NEXDESK_MACOS_INJECTOR").ok().as_deref() == Some("hid") {
+            match crate::input::macos_hid::MacOSHidInjector::new() {
+                Ok(i) => return Ok(Box::new(i) as Box<dyn InputInjector>),
+                Err(e) => tracing::warn!("Experimental HID injector unavailable: {}; falling back to CGEvent", e),
+            }
+        }
         crate::input::macos::MacOSInjector::new().map(|i| Box::new(i) as Box<dyn InputInjector>)
     }
 

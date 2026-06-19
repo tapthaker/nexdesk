@@ -56,6 +56,8 @@ pub mod wayland_layer_shell {
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "macos")]
+pub mod macos_hid;
 
 /// Check if accessibility permission is currently granted (no prompt).
 /// Always returns true on non-macOS platforms.
