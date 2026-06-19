@@ -47,6 +47,9 @@ extern "C" {
     fn CFStringCreateWithCString(alloc: CFAllocatorRef, c_str: *const c_char, encoding: u32) -> CFStringRef;
     fn CFNumberCreate(alloc: CFAllocatorRef, the_type: c_int, value_ptr: *const c_void) -> CFNumberRef;
     fn CFDataCreate(alloc: CFAllocatorRef, bytes: *const u8, length: c_long) -> CFDataRef;
+    static kCFTypeDictionaryKeyCallBacks: c_void;
+    static kCFTypeDictionaryValueCallBacks: c_void;
+
     fn CFDictionaryCreateMutable(
         allocator: CFAllocatorRef,
         capacity: c_long,
@@ -197,7 +200,12 @@ impl InputInjector for MacOSHidInjector {
 #[cfg(target_os = "macos")]
 fn create_hid_device(name: &str, usage_page: i32, usage: i32, descriptor: &[u8]) -> Result<IOHIDUserDeviceRef> {
     unsafe {
-        let dict = CFDictionaryCreateMutable(ptr::null(), 0, ptr::null(), ptr::null());
+        let dict = CFDictionaryCreateMutable(
+            ptr::null(),
+            0,
+            &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
+            &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+        );
         if dict.is_null() { return Err(eyre!("CFDictionaryCreateMutable failed")); }
 
         set_string(dict, "Transport", "Virtual");
