@@ -120,7 +120,7 @@ impl Drop for MacOSHidInjector {
 impl MacOSHidInjector {
     pub fn new() -> Result<Self> {
         info!("Initializing experimental IOHIDUserDevice injector");
-        let mouse = create_hid_device("Nexdesk Virtual Mouse", 2, 1, MOUSE_REPORT_DESCRIPTOR)?;
+        let mouse = create_hid_device("Nexdesk Virtual Mouse", 1, 2, MOUSE_REPORT_DESCRIPTOR)?;
         info!("Created IOHID virtual mouse device");
         let keyboard = create_hid_device("Nexdesk Virtual Keyboard", 1, 6, KEYBOARD_REPORT_DESCRIPTOR)?;
         info!("Created IOHID virtual keyboard device");
@@ -222,9 +222,9 @@ fn create_hid_device(name: &str, usage_page: i32, usage: i32, descriptor: &[u8])
         set_string(dict, name, "Transport", "Virtual")?;
         set_string(dict, name, "Manufacturer", "Nexdesk")?;
         set_string(dict, name, "Product", name)?;
-        set_string(dict, name, "SerialNumber", if usage == 1 { "nexdesk-mouse" } else { "nexdesk-keyboard" })?;
+        set_string(dict, name, "SerialNumber", if usage == 2 { "nexdesk-mouse" } else { "nexdesk-keyboard" })?;
         set_i32(dict, name, "VendorID", 0x1209)?;
-        set_i32(dict, name, "ProductID", if usage == 1 { 0x4242 } else { 0x4243 })?;
+        set_i32(dict, name, "ProductID", if usage == 2 { 0x4242 } else { 0x4243 })?;
         set_i32(dict, name, "VersionNumber", 1)?;
         set_i32(dict, name, "PrimaryUsagePage", usage_page)?;
         set_i32(dict, name, "PrimaryUsage", usage)?;
