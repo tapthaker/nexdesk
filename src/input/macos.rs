@@ -2,7 +2,7 @@
 use color_eyre::eyre::Result;
 
 #[cfg(target_os = "macos")]
-use objc2_core_foundation::CGPoint;
+use objc2_core_foundation::{CFRetained, CGPoint};
 
 #[cfg(target_os = "macos")]
 use objc2_core_graphics::{
@@ -12,7 +12,10 @@ use objc2_core_graphics::{
 };
 
 #[cfg(target_os = "macos")]
-use tracing::{debug, warn};
+use std::os::raw::{c_int, c_uint};
+
+#[cfg(target_os = "macos")]
+use tracing::{debug, info};
 
 #[cfg(target_os = "macos")]
 use crate::input::capture::InputCapture;
@@ -30,6 +33,22 @@ const MAIN_DISPLAY: CGDirectDisplayID = 0;
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGWarpMouseCursorPosition(new_cursor_position: CGPoint) -> i32;
+    fn CGPostMouseEvent(
+        mouse_cursor_position: CGPoint,
+        update_mouse_cursor_position: c_int,
+        button_count: c_uint,
+        mouse_button_down: c_int,
+        ...
+    ) -> i32;
+    fn CGPostScrollWheelEvent(wheel_count: c_uint, wheel1: i32, ...) -> i32;
+    fn CGPostKeyboardEvent(key_char: u16, virtual_key: u16, key_down: c_int) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PostMode {
+    CGEvent,
+    LegacyQuartz,
 }
 
 /// macOS input capturer using CoreGraphics.
@@ -145,6 +164,12 @@ pub struct MacOSInjector {
     last_click: Option<(std::time::Instant, u8)>,
     /// Current click count (1=single, 2=double, 3=triple)
     click_count: i64,
+    /// CGEvent source state used for synthesized events.
+    source_state: CGEventSourceStateID,
+    /// CGEvent tap location used for synthesized events.
+    tap_location: CGEventTapLocation,
+    /// Posting API used for ordinary mouse/keyboard/scroll events.
+    post_mode: PostMode,
 }
 
 #[cfg(target_os = "macos")]
@@ -152,7 +177,40 @@ impl MacOSInjector {
     pub fn new() -> Result<Self> {
         let screen_width = CGDisplayPixelsWide(MAIN_DISPLAY) as u32;
         let screen_height = CGDisplayPixelsHigh(MAIN_DISPLAY) as u32;
-        debug!("macOS injector: screen {}x{}", screen_width, screen_height);
+        let source_state = match std::env::var("NEXDESK_MACOS_EVENT_SOURCE")
+            .unwrap_or_else(|_| "hid".into())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "combined" | "session" => CGEventSourceStateID::CombinedSessionState,
+            "private" => CGEventSourceStateID::Private,
+            _ => CGEventSourceStateID::HIDSystemState,
+        };
+        let tap_location = match std::env::var("NEXDESK_MACOS_EVENT_TAP")
+            .unwrap_or_else(|_| "session".into())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "hid" => CGEventTapLocation::HIDEventTap,
+            "annotated" => CGEventTapLocation::AnnotatedSessionEventTap,
+            _ => CGEventTapLocation::SessionEventTap,
+        };
+        let post_mode = match std::env::var("NEXDESK_MACOS_POST_MODE")
+            .unwrap_or_else(|_| "cgevent".into())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "legacy" | "quartz" | "cgpost" => PostMode::LegacyQuartz,
+            _ => PostMode::CGEvent,
+        };
+        info!(
+            "macOS injector: screen {}x{}, source_state={}, tap_location={}, post_mode={:?}",
+            screen_width,
+            screen_height,
+            source_state.0,
+            tap_location.0,
+            post_mode
+        );
 
         Ok(Self {
             screen_width,
@@ -161,6 +219,9 @@ impl MacOSInjector {
             buttons_down: 0,
             last_click: None,
             click_count: 0,
+            source_state,
+            tap_location,
+            post_mode,
         })
     }
 
@@ -186,6 +247,20 @@ impl MacOSInjector {
         }
     }
 
+    fn event_source(&self) -> Result<CFRetained<CGEventSource>> {
+        let source = CGEventSource::new(self.source_state)
+            .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
+        // Avoid CoreGraphics' default local-event suppression window. This is
+        // documented for remote-operation events and is harmless if the delay is
+        // unrelated, but gives us a cheap A/B point for idle wake sluggishness.
+        CGEventSource::set_local_events_suppression_interval(Some(&source), 0.0);
+        Ok(source)
+    }
+
+    fn post_event(&self, event: &CGEvent) {
+        CGEvent::post(self.tap_location, Some(event));
+    }
+
     /// Post an NSSystemDefined media key event (volume, brightness, play, etc.)
     fn post_media_key_event(&self, nx_keytype: i32, pressed: bool) -> color_eyre::eyre::Result<()> {
         const NX_SYSDEFINED: u32 = 14;
@@ -198,8 +273,7 @@ impl MacOSInjector {
         const CG_EVENT_DATA1_FIELD: CGEventField = CGEventField(134);
         const CG_EVENT_DATA2_FIELD: CGEventField = CGEventField(135);
 
-        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-            .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
+        let source = self.event_source()?;
         let event = CGEvent::new(Some(&source))
             .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEvent"))?;
 
@@ -219,7 +293,7 @@ impl MacOSInjector {
         CGEvent::set_integer_value_field(Some(&event), CG_EVENT_DATA1_FIELD, data1);
         CGEvent::set_integer_value_field(Some(&event), CG_EVENT_DATA2_FIELD, -1);
 
-        CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
+        self.post_event(&event);
         Ok(())
     }
 
@@ -231,21 +305,45 @@ impl MacOSInjector {
         button: CGMouseButton,
     ) -> Result<()> {
         let point = CGPoint { x, y };
-        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-            .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
+        let source = self.event_source()?;
         let event = CGEvent::new_mouse_event(Some(&source), event_type, point, button)
             .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create mouse event"))?;
-        CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
+        self.post_event(&event);
         Ok(())
     }
 
     fn current_position(&self) -> Result<(i32, i32)> {
-        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-            .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
+        let source = self.event_source()?;
         let event = CGEvent::new(Some(&source))
             .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEvent"))?;
         let loc = CGEvent::location(Some(&event));
         Ok((loc.x as i32, loc.y as i32))
+    }
+
+    fn post_legacy_mouse_state(&self, x: f64, y: f64) {
+        let left = if self.buttons_down & 1 != 0 { 1 } else { 0 };
+        let right = if self.buttons_down & 2 != 0 { 1 } else { 0 };
+        let middle = if self.buttons_down & 4 != 0 { 1 } else { 0 };
+        let ret = unsafe { CGPostMouseEvent(CGPoint { x, y }, 1, 3, left, right, middle) };
+        if ret != 0 {
+            debug!("CGPostMouseEvent returned {}", ret);
+        }
+    }
+
+    fn post_legacy_scroll(&self, dx: f64, dy: f64) {
+        let wheel1 = -(dy as i32);
+        let wheel2 = -(dx as i32);
+        let ret = unsafe { CGPostScrollWheelEvent(2, wheel1, wheel2) };
+        if ret != 0 {
+            debug!("CGPostScrollWheelEvent returned {}", ret);
+        }
+    }
+
+    fn post_legacy_key(&self, mac_keycode: u16, pressed: bool) {
+        let ret = unsafe { CGPostKeyboardEvent(0, mac_keycode, if pressed { 1 } else { 0 }) };
+        if ret != 0 {
+            debug!("CGPostKeyboardEvent returned {}", ret);
+        }
     }
 }
 
@@ -285,12 +383,15 @@ impl InputInjector for MacOSInjector {
                     self.buttons_down &= !(1 << bit);
                 }
                 let (cx, cy) = self.current_position()?;
+                if self.post_mode == PostMode::LegacyQuartz {
+                    self.post_legacy_mouse_state(cx as f64, cy as f64);
+                    return Ok(());
+                }
                 let point = CGPoint {
                     x: cx as f64,
                     y: cy as f64,
                 };
-                let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-                    .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
+                let source = self.event_source()?;
                 let event =
                     CGEvent::new_mouse_event(Some(&source), event_type, point, cg_button)
                         .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create mouse event"))?;
@@ -299,13 +400,17 @@ impl InputInjector for MacOSInjector {
                     CGEventField::MouseEventClickState,
                     self.click_count,
                 );
-                CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
+                self.post_event(&event);
             }
             Message::MouseScroll { dx, dy, phase } => {
                 use crate::net::protocol::ScrollPhase;
 
-                let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-                    .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
+                let source = self.event_source()?;
+
+                if self.post_mode == PostMode::LegacyQuartz {
+                    self.post_legacy_scroll(*dx, *dy);
+                    return Ok(());
+                }
 
                 // Vertical scroll: pixel-based events without the continuous
                 // flag. This works in all apps including Firefox.
@@ -319,7 +424,7 @@ impl InputInjector for MacOSInjector {
                         0,
                     )
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create scroll event"))?;
-                    CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
+                    self.post_event(&event);
                 }
 
                 // Horizontal scroll: continuous trackpad events with phases.
@@ -355,7 +460,7 @@ impl InputInjector for MacOSInjector {
                         CGEventField::ScrollWheelEventScrollPhase,
                         cg_phase,
                     );
-                    CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
+                    self.post_event(&event);
                 }
             }
             Message::KeyEvent {
@@ -374,8 +479,13 @@ impl InputInjector for MacOSInjector {
                         return Ok(());
                     }
                 };
-                let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-                    .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
+                let source = self.event_source()?;
+
+                if self.post_mode == PostMode::LegacyQuartz {
+                    self.update_modifier_flags(*keycode, *pressed);
+                    self.post_legacy_key(mac_keycode, *pressed);
+                    return Ok(());
+                }
 
                 // macOS represents modifier transitions as FlagsChanged events.
                 // Posting plain KeyDown/KeyUp for Shift/Ctrl/Option/Command can
@@ -389,14 +499,14 @@ impl InputInjector for MacOSInjector {
                     // kCGEventFlagsChanged = 12
                     CGEvent::set_type(Some(&event), CGEventType(12));
                     CGEvent::set_flags(Some(&event), self.modifier_flags);
-                    CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
+                    self.post_event(&event);
                     return Ok(());
                 }
 
                 let event = CGEvent::new_keyboard_event(Some(&source), mac_keycode, *pressed)
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create key event"))?;
                 CGEvent::set_flags(Some(&event), self.modifier_flags);
-                CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
+                self.post_event(&event);
             }
             _ => {}
         }
@@ -419,6 +529,10 @@ impl InputInjector for MacOSInjector {
         } else {
             (CGEventType::MouseMoved, CGMouseButton::Left)
         };
+        if self.post_mode == PostMode::LegacyQuartz {
+            self.post_legacy_mouse_state(x, y);
+            return Ok(());
+        }
         if matches!(event_type, CGEventType::MouseMoved) {
             let ret = unsafe { CGWarpMouseCursorPosition(CGPoint { x, y }) };
             if ret != 0 {
