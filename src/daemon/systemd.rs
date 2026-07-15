@@ -220,6 +220,21 @@ pub fn print_log() -> Result<()> {
     Ok(())
 }
 
+pub fn start() -> Result<()> {
+    if !service_file_path().is_file() {
+        return Err(eyre!(
+            "Nexdesk background service is not installed. Run `nexdesk setup` first."
+        ));
+    }
+
+    run_systemctl(&["--user", "daemon-reload"]).wrap_err("Failed to reload systemd user units")?;
+    run_systemctl(&["--user", "start", &format!("{SERVICE_NAME}.service")])
+        .wrap_err("Failed to start systemd user service")?;
+
+    println!("Nexdesk background service started.");
+    Ok(())
+}
+
 pub fn install(args: &[&str]) -> Result<()> {
     // Validate and render before side effects such as firewall changes. If the
     // service arguments are invalid/oversized, installation should fail without

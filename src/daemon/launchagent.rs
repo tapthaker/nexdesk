@@ -191,6 +191,29 @@ pub fn print_log() -> Result<()> {
     Ok(())
 }
 
+pub fn start() -> Result<()> {
+    let path = plist_path();
+    if !path.is_file() {
+        return Err(eyre!(
+            "Nexdesk background service is not installed. Run `nexdesk setup` first."
+        ));
+    }
+
+    let uid = current_uid();
+    let domain = format!("gui/{uid}");
+    let service = format!("{domain}/{LABEL}");
+
+    run_launchctl(&["enable", &service]).wrap_err("Failed to enable LaunchAgent")?;
+    if command_stdout("launchctl", &["print", &service]).is_err() {
+        run_launchctl(&["bootstrap", &domain, path.to_string_lossy().as_ref()])
+            .wrap_err("Failed to bootstrap LaunchAgent")?;
+    }
+    run_launchctl(&["kickstart", &service]).wrap_err("Failed to start LaunchAgent")?;
+
+    println!("Nexdesk background service started.");
+    Ok(())
+}
+
 pub fn install(args: &[&str]) -> Result<()> {
     let path = plist_path();
     let parent = path

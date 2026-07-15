@@ -55,8 +55,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Skip tracing init for setup/status/log commands — log output corrupts the TUI/status output.
-    if !matches!(cli.command, Command::Setup | Command::Status | Command::Log) {
+    // Skip tracing init for setup/service commands — log output corrupts their user-facing output.
+    if !matches!(
+        cli.command,
+        Command::Setup | Command::Start | Command::Status | Command::Log
+    ) {
         let filter = if cli.verbose {
             EnvFilter::new("nexdesk=debug")
         } else {
@@ -119,6 +122,9 @@ async fn main() -> Result<()> {
         }
         Command::Setup => {
             setup::run_setup().await?;
+        }
+        Command::Start => {
+            daemon::start_service()?;
         }
         Command::Status => {
             daemon::print_status()?;

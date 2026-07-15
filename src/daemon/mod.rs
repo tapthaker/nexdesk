@@ -28,6 +28,26 @@ pub fn install_service(args: &[&str]) -> Result<()> {
     }
 }
 
+/// Start the previously installed daemon/service.
+pub fn start_service() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        launchagent::start()
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        systemd::start()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(color_eyre::eyre::eyre!(
+            "Unsupported platform for starting the daemon"
+        ))
+    }
+}
+
 /// Print a short daemon/process/listener status summary.
 pub fn print_status() -> Result<()> {
     #[cfg(target_os = "macos")]

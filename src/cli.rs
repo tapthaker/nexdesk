@@ -58,6 +58,9 @@ pub enum Command {
     /// Launch the TUI setup wizard
     Setup,
 
+    /// Start the installed background service
+    Start,
+
     /// Show a short service/process/listener status summary
     Status,
 
