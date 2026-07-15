@@ -12,7 +12,7 @@ mod status;
 use std::io::IsTerminal;
 
 use clap::Parser;
-use cli::{Cli, Command};
+use cli::{Cli, Command, DaemonCommand};
 use color_eyre::eyre::Result;
 use tracing_subscriber::EnvFilter;
 
@@ -43,7 +43,7 @@ fn direction_from_config_edge_or_error(edge: &str) -> Result<net::protocol::Dire
     direction_from_config_edge(edge).ok_or_else(|| {
         let edge = status::terminal_safe(edge, status::MAX_STATUS_DISPLAY_BYTES);
         color_eyre::eyre::eyre!(
-            "Invalid configured switch edge {:?}. Run `nexdesk setup` or start with `nexdesk serve --edge <left|right|up|down>`.",
+            "Invalid configured switch edge {:?}. Run `nexdesk daemon setup` or start with `nexdesk serve --edge <left|right|up|down>`.",
             edge
         )
     })
@@ -56,17 +56,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Skip tracing init for setup/service commands — log output corrupts their user-facing output.
-    if !matches!(
-        cli.command,
-        Command::Setup | Command::Start | Command::Status | Command::Log
-    ) {
+    if !matches!(cli.command, Command::Daemon { .. } | Command::Log) {
         let filter = if cli.verbose {
             EnvFilter::new("nexdesk=debug")
         } else {
             EnvFilter::new("nexdesk=info")
         };
 
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(std::io::stderr().is_terminal())
+            .init();
     }
 
     match cli.command {
@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
                 } else {
                     if !std::io::stdin().is_terminal() {
                         return Err(color_eyre::eyre::eyre!(
-                            "No switch edge configured and no interactive terminal is available. Run `nexdesk setup` or start with `nexdesk serve --edge <left|right|up|down>`."
+                            "No switch edge configured and no interactive terminal is available. Run `nexdesk daemon setup` or start with `nexdesk serve --edge <left|right|up|down>`."
                         ));
                     }
                     let dir = setup::edge_picker::pick_edge()?;
@@ -120,18 +120,14 @@ async fn main() -> Result<()> {
         Command::Trust { fingerprint } => {
             net::tls::trust_fingerprint(&fingerprint)?;
         }
-        Command::Setup => {
-            setup::run_setup().await?;
-        }
-        Command::Start => {
-            daemon::start_service()?;
-        }
-        Command::Status => {
-            daemon::print_status()?;
-        }
-        Command::Log => {
-            daemon::print_log()?;
-        }
+        Command::Daemon { command } => match command {
+            DaemonCommand::Setup => setup::run_setup().await?,
+            DaemonCommand::Start => daemon::start_service()?,
+            DaemonCommand::Stop => daemon::stop_service()?,
+            DaemonCommand::Status => daemon::print_status()?,
+            DaemonCommand::Log => daemon::print_log()?,
+        },
+        Command::Log => daemon::print_log()?,
         Command::TestInput => {
             input::ensure_accessibility()?;
             use std::io::Write;
@@ -207,7 +203,7 @@ mod tests {
     fn invalid_configured_switch_edge_is_an_error() {
         let err = direction_from_config_edge_or_error("sideways").unwrap_err();
         assert!(err.to_string().contains("Invalid configured switch edge"));
-        assert!(err.to_string().contains("nexdesk setup"));
+        assert!(err.to_string().contains("nexdesk daemon setup"));
     }
 
     #[test]

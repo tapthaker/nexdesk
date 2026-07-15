@@ -431,7 +431,7 @@ mod tests {
             "connect"
         ));
         assert!(!command_line_matches_role(
-            "/usr/local/bin/nexdesk status",
+            "/usr/local/bin/nexdesk daemon status",
             "serve"
         ));
         assert!(!command_line_matches_role(
@@ -439,7 +439,7 @@ mod tests {
             "connect"
         ));
         assert!(!command_line_matches_role(
-            "/usr/local/bin/nexdesk status serve",
+            "/usr/local/bin/nexdesk daemon status serve",
             "serve"
         ));
         assert!(command_line_matches_role(

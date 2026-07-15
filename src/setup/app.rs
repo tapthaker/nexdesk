@@ -42,7 +42,7 @@ fn normalize_manual_addr(value: &str) -> Option<String> {
 fn service_client_addr_arg(addr: &str) -> Result<String> {
     normalize_manual_addr(addr).ok_or_else(|| {
         color_eyre::eyre::eyre!(
-            "Invalid configured server address {:?}. Run `nexdesk setup` and choose a server address again.",
+            "Invalid configured server address {:?}. Run `nexdesk daemon setup` and choose a server address again.",
             crate::status::terminal_safe(addr, crate::status::MAX_STATUS_DISPLAY_BYTES)
         )
     })
@@ -477,11 +477,11 @@ fn service_args_for_config(config: &NexdeskConfig) -> Result<Vec<String>> {
             None => vec!["connect".to_string()],
         }),
         Some(role) => Err(color_eyre::eyre::eyre!(
-            "Invalid configured role {:?}. Run `nexdesk setup` and choose server or client.",
+            "Invalid configured role {:?}. Run `nexdesk daemon setup` and choose server or client.",
             crate::status::terminal_safe(role, crate::status::MAX_STATUS_DISPLAY_BYTES)
         )),
         None => Err(color_eyre::eyre::eyre!(
-            "No role configured. Run `nexdesk setup` and choose server or client."
+            "No role configured. Run `nexdesk daemon setup` and choose server or client."
         )),
     }
 }

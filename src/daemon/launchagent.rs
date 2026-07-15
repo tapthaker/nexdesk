@@ -67,6 +67,53 @@ fn log_paths() -> Result<(PathBuf, PathBuf)> {
     Ok((dir.join("nexdesk.out.log"), dir.join("nexdesk.err.log")))
 }
 
+/// Upgrade LaunchAgents created by older versions that wrote unbounded logs to /tmp.
+fn migrate_legacy_log_paths(path: &Path) -> Result<bool> {
+    let mut contents = std::fs::read_to_string(path)
+        .wrap_err_with(|| format!("Failed to read LaunchAgent plist: {}", path.display()))?;
+    if contents.len() > MAX_LAUNCHAGENT_PLIST_BYTES {
+        return Err(eyre!(
+            "LaunchAgent plist too large: {} bytes (max {})",
+            contents.len(),
+            MAX_LAUNCHAGENT_PLIST_BYTES
+        ));
+    }
+
+    let (stdout_log, stderr_log) = log_paths()?;
+    let replacements = [
+        ("/tmp/nexdesk.out.log", stdout_log.to_string_lossy()),
+        ("/tmp/nexdesk.err.log", stderr_log.to_string_lossy()),
+    ];
+    let mut changed = false;
+    for (legacy, current) in replacements {
+        if contents.contains(legacy) {
+            contents = contents.replace(legacy, &xml_escape(&current));
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(false);
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| eyre!("Invalid LaunchAgent path: {}", path.display()))?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(&format!("{LABEL}.plist."))
+        .tempfile_in(parent)
+        .wrap_err("Failed to create temporary LaunchAgent plist")?;
+    restrict_plist_file_permissions(tmp.path())?;
+    tmp.write_all(contents.as_bytes())
+        .wrap_err("Failed to update LaunchAgent log paths")?;
+    tmp.as_file_mut().sync_all()?;
+    tmp.persist(path)
+        .map_err(|e| e.error)
+        .wrap_err("Failed to replace LaunchAgent plist")?;
+    restrict_plist_file_permissions(path)?;
+    sync_directory(parent)?;
+    Ok(true)
+}
+
 fn plist_arg_entries(args: &[&str]) -> Result<String> {
     args.iter()
         .map(|arg| {
@@ -140,7 +187,7 @@ pub fn print_status() -> Result<()> {
     let listener_cmd = format!("lsof -nP -iUDP:{port} 2>/dev/null || true");
     let listener = command_stdout("sh", &["-c", &listener_cmd]).unwrap_or_default();
 
-    println!("nexdesk status");
+    println!("nexdesk daemon status");
     println!("Service : {}", if loaded { "loaded" } else { "not loaded" });
     println!(
         "Process : {}",
@@ -164,7 +211,7 @@ pub fn print_status() -> Result<()> {
         stdout_log.display(),
         stderr_log.display()
     );
-    println!("\nFor logs: nexdesk log");
+    println!("\nFor logs: nexdesk log (or nexdesk daemon log)");
     Ok(())
 }
 
@@ -195,7 +242,7 @@ pub fn start() -> Result<()> {
     let path = plist_path();
     if !path.is_file() {
         return Err(eyre!(
-            "Nexdesk background service is not installed. Run `nexdesk setup` first."
+            "Nexdesk background service is not installed. Run `nexdesk daemon setup` first."
         ));
     }
 
@@ -203,6 +250,13 @@ pub fn start() -> Result<()> {
     let domain = format!("gui/{uid}");
     let service = format!("{domain}/{LABEL}");
 
+    // Existing installations may still point at /tmp even though newer binaries
+    // report the Application Support paths. Rewrite and reload those plists.
+    if migrate_legacy_log_paths(&path)? && command_stdout("launchctl", &["print", &service]).is_ok()
+    {
+        run_launchctl(&["bootout", &domain, path.to_string_lossy().as_ref()])
+            .wrap_err("Failed to reload LaunchAgent after migrating log paths")?;
+    }
     run_launchctl(&["enable", &service]).wrap_err("Failed to enable LaunchAgent")?;
     if command_stdout("launchctl", &["print", &service]).is_err() {
         run_launchctl(&["bootstrap", &domain, path.to_string_lossy().as_ref()])
@@ -211,6 +265,24 @@ pub fn start() -> Result<()> {
     run_launchctl(&["kickstart", &service]).wrap_err("Failed to start LaunchAgent")?;
 
     println!("Nexdesk background service started.");
+    Ok(())
+}
+
+pub fn stop() -> Result<()> {
+    let path = plist_path();
+    if !path.is_file() {
+        return Err(eyre!(
+            "Nexdesk background service is not installed. Run `nexdesk daemon setup` first."
+        ));
+    }
+
+    let domain = format!("gui/{}", current_uid());
+    let service = format!("{domain}/{LABEL}");
+    if command_stdout("launchctl", &["print", &service]).is_ok() {
+        run_launchctl(&["bootout", &domain, path.to_string_lossy().as_ref()])
+            .wrap_err("Failed to stop LaunchAgent")?;
+    }
+    println!("Nexdesk background service stopped.");
     Ok(())
 }
 

@@ -239,5 +239,5 @@ if [ "$NON_INTERACTIVE" != true ] && [ -c /dev/tty ]; then
   # Redirect stdin from /dev/tty so the TUI gets a real terminal.
   # The shell keeps /dev/tty open for the process lifetime, which is
   # important for macOS kqueue-based event polling in crossterm.
-  nexdesk setup < /dev/tty
+  nexdesk daemon setup < /dev/tty
 fi

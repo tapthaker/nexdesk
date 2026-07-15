@@ -171,7 +171,7 @@ pub fn print_status() -> Result<()> {
     let listener_cmd = format!("ss -lunp 2>/dev/null | grep -E ':{port}\\b' || true");
     let listener = command_stdout("sh", &["-c", &listener_cmd]).unwrap_or_default();
 
-    println!("nexdesk status");
+    println!("nexdesk daemon status");
     println!(
         "Service : {}",
         if active == "active" {
@@ -197,7 +197,7 @@ pub fn print_status() -> Result<()> {
         }
     );
     print_connection_summary();
-    println!("\nFor logs: nexdesk log");
+    println!("\nFor logs: nexdesk log (or nexdesk daemon log)");
     Ok(())
 }
 
@@ -223,7 +223,7 @@ pub fn print_log() -> Result<()> {
 pub fn start() -> Result<()> {
     if !service_file_path().is_file() {
         return Err(eyre!(
-            "Nexdesk background service is not installed. Run `nexdesk setup` first."
+            "Nexdesk background service is not installed. Run `nexdesk daemon setup` first."
         ));
     }
 
@@ -232,6 +232,19 @@ pub fn start() -> Result<()> {
         .wrap_err("Failed to start systemd user service")?;
 
     println!("Nexdesk background service started.");
+    Ok(())
+}
+
+pub fn stop() -> Result<()> {
+    if !service_file_path().is_file() {
+        return Err(eyre!(
+            "Nexdesk background service is not installed. Run `nexdesk daemon setup` first."
+        ));
+    }
+
+    run_systemctl(&["--user", "stop", &format!("{SERVICE_NAME}.service")])
+        .wrap_err("Failed to stop systemd user service")?;
+    println!("Nexdesk background service stopped.");
     Ok(())
 }
 
