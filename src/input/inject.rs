@@ -18,6 +18,21 @@ pub trait InputInjector: Send {
 pub fn create_injector() -> Result<Box<dyn InputInjector>> {
     #[cfg(target_os = "linux")]
     {
+        let injector_override = std::env::var("NEXDESK_LINUX_INJECTOR")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+
+        if injector_override == "x11" {
+            return crate::input::linux_x11::X11Injector::new()
+                .map(|i| Box::new(i) as Box<dyn InputInjector>);
+        }
+
+        if is_wayland {
+            return crate::input::linux_wayland::WaylandInjector::new()
+                .map(|i| Box::new(i) as Box<dyn InputInjector>);
+        }
+
         if std::env::var("DISPLAY").is_ok() {
             return crate::input::linux_x11::X11Injector::new()
                 .map(|i| Box::new(i) as Box<dyn InputInjector>);
@@ -31,7 +46,10 @@ pub fn create_injector() -> Result<Box<dyn InputInjector>> {
         if std::env::var("NEXDESK_MACOS_INJECTOR").ok().as_deref() == Some("hid") {
             match crate::input::macos_hid::MacOSHidInjector::new() {
                 Ok(i) => return Ok(Box::new(i) as Box<dyn InputInjector>),
-                Err(e) => tracing::warn!("Experimental HID injector unavailable: {}; falling back to CGEvent", e),
+                Err(e) => tracing::warn!(
+                    "Experimental HID injector unavailable: {}; falling back to CGEvent",
+                    e
+                ),
             }
         }
         crate::input::macos::MacOSInjector::new().map(|i| Box::new(i) as Box<dyn InputInjector>)

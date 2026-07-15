@@ -1,3 +1,20 @@
+fn sanitize_cargo_env_value(value: &str, max_bytes: usize, default: &str) -> String {
+    let mut sanitized = String::new();
+    for ch in value.chars() {
+        let ch = if ch.is_control() { '-' } else { ch };
+        let len = ch.len_utf8();
+        if sanitized.len().saturating_add(len) > max_bytes {
+            break;
+        }
+        sanitized.push(ch);
+    }
+    if sanitized.is_empty() {
+        default.to_string()
+    } else {
+        sanitized
+    }
+}
+
 fn main() {
     // Burn git-derived version into the binary.
     // Uses `git describe --tags --always --dirty` to produce e.g. "v0.1.2",
@@ -17,6 +34,7 @@ fn main() {
         })
         .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".into()));
 
+    let version = sanitize_cargo_env_value(&version, 128, "unknown");
     println!("cargo:rustc-env=NEXDESK_VERSION={}", version);
     // Re-run if HEAD changes (new commit or tag)
     println!("cargo:rerun-if-changed=.git/HEAD");

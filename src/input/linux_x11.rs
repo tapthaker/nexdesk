@@ -1,4 +1,4 @@
-use color_eyre::eyre::{Result, WrapErr};
+use color_eyre::eyre::{eyre, Result, WrapErr};
 use tracing::debug;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{self, ButtonMask, ConnectionExt as _, Screen};
@@ -15,6 +15,7 @@ const KEY_RELEASE: u8 = 3;
 const BUTTON_PRESS: u8 = 4;
 const BUTTON_RELEASE: u8 = 5;
 const MOTION_NOTIFY: u8 = 6;
+const MAX_X11_SCROLL_STEPS_PER_MESSAGE: i32 = 120;
 
 fn root_window(screen: &Screen) -> xproto::Window {
     screen.root
@@ -136,9 +137,36 @@ fn evdev_to_x11_keycode(evdev: u32) -> Option<u8> {
     u8::try_from(x11).ok().filter(|code| *code >= 8)
 }
 
+fn x11_motion_coord(value: i32, screen_len: u32) -> Result<i16> {
+    if screen_len == 0 {
+        return Err(eyre!("Invalid X11 screen dimension: {}", screen_len));
+    }
+    let upper = (screen_len as i64 - 1).min(i16::MAX as i64) as i32;
+    Ok(value.clamp(0, upper) as i16)
+}
+
+fn consume_scroll_steps(remainder: &mut f64, delta: f64) -> i32 {
+    if !delta.is_finite() {
+        return 0;
+    }
+    let total = *remainder + delta;
+    let steps = total.trunc().clamp(
+        -(MAX_X11_SCROLL_STEPS_PER_MESSAGE as f64),
+        MAX_X11_SCROLL_STEPS_PER_MESSAGE as f64,
+    ) as i32;
+    *remainder = if steps.unsigned_abs() == MAX_X11_SCROLL_STEPS_PER_MESSAGE as u32 {
+        0.0
+    } else {
+        total - steps as f64
+    };
+    steps
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{evdev_to_x11_keycode, x11_to_evdev_keycode};
+    use super::{
+        consume_scroll_steps, evdev_to_x11_keycode, x11_motion_coord, x11_to_evdev_keycode,
+    };
 
     #[test]
     fn evdev_to_x11_uses_standard_offset() {
@@ -156,12 +184,55 @@ mod tests {
     fn invalid_x11_keycode_is_ignored() {
         assert_eq!(x11_to_evdev_keycode(7), None);
     }
+
+    #[test]
+    fn x11_motion_coord_clamps_to_i16_range() {
+        assert_eq!(x11_motion_coord(40_000, 50_000).unwrap(), i16::MAX);
+        assert_eq!(x11_motion_coord(-1, 50_000).unwrap(), 0);
+        assert_eq!(x11_motion_coord(100, 200).unwrap(), 100);
+    }
+
+    #[test]
+    fn x11_motion_coord_rejects_zero_dimension() {
+        assert!(x11_motion_coord(0, 0).is_err());
+    }
+
+    #[test]
+    fn scroll_step_consumption_preserves_fractional_deltas() {
+        let mut remainder = 0.0;
+        assert_eq!(consume_scroll_steps(&mut remainder, 0.4), 0);
+        assert_eq!(consume_scroll_steps(&mut remainder, 0.4), 0);
+        assert_eq!(consume_scroll_steps(&mut remainder, 0.4), 1);
+        assert!((remainder - 0.2).abs() < f64::EPSILON);
+        assert_eq!(consume_scroll_steps(&mut remainder, -0.7), 0);
+        assert!((remainder + 0.5).abs() < f64::EPSILON);
+        assert_eq!(consume_scroll_steps(&mut remainder, -0.7), -1);
+        assert!((remainder + 0.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn scroll_step_consumption_ignores_non_finite_deltas() {
+        let mut remainder = 0.25;
+        assert_eq!(consume_scroll_steps(&mut remainder, f64::NAN), 0);
+        assert_eq!(remainder, 0.25);
+    }
+
+    #[test]
+    fn scroll_step_consumption_caps_extreme_protocol_deltas() {
+        let mut remainder = 0.25;
+        assert_eq!(consume_scroll_steps(&mut remainder, 10_000.0), 120);
+        assert_eq!(remainder, 0.0);
+        assert_eq!(consume_scroll_steps(&mut remainder, -10_000.0), -120);
+        assert_eq!(remainder, 0.0);
+    }
 }
 
 /// X11-based input injector using XTest extension.
 pub struct X11Injector {
     conn: RustConnection,
     root: xproto::Window,
+    scroll_x_remainder: f64,
+    scroll_y_remainder: f64,
 }
 
 impl X11Injector {
@@ -181,7 +252,12 @@ impl X11Injector {
             screen.width_in_pixels, screen.height_in_pixels
         );
 
-        Ok(Self { conn, root })
+        Ok(Self {
+            conn,
+            root,
+            scroll_x_remainder: 0.0,
+            scroll_y_remainder: 0.0,
+        })
     }
 }
 
@@ -208,8 +284,8 @@ impl InputInjector for X11Injector {
                 self.conn.flush()?;
             }
             Message::MouseScroll { dx, dy, .. } => {
-                let idy = *dy as i32;
-                let idx = *dx as i32;
+                let idy = consume_scroll_steps(&mut self.scroll_y_remainder, *dy);
+                let idx = consume_scroll_steps(&mut self.scroll_x_remainder, *dx);
                 if idy != 0 {
                     let button = if idy > 0 { 4u8 } else { 5u8 };
                     for _ in 0..idy.unsigned_abs() {
@@ -263,8 +339,11 @@ impl InputInjector for X11Injector {
 
     fn move_mouse(&mut self, x: i32, y: i32) -> Result<()> {
         let (sw, sh) = self.screen_size()?;
-        let x = x.clamp(0, sw as i32 - 1) as i16;
-        let y = y.clamp(0, sh as i32 - 1) as i16;
+        if sw == 0 || sh == 0 {
+            return Err(eyre!("Invalid X11 screen size: {}x{}", sw, sh));
+        }
+        let x = x11_motion_coord(x, sw)?;
+        let y = x11_motion_coord(y, sh)?;
         self.conn
             .xtest_fake_input(MOTION_NOTIFY, 0, 0, self.root, x, y, 0)?;
         self.conn.flush()?;

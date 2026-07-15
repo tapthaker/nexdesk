@@ -238,20 +238,21 @@ pub fn try_create(
 
     // Create properly-sized transparent buffers and attach for configured surfaces
     for edge in &state.edge_surfaces {
-        if edge.configured && edge.configured_width > 0 && edge.configured_height > 0 {
-            let stride = edge.configured_width * 4;
-            let buf_size = (stride * edge.configured_height) as usize;
+        if edge.configured {
+            let Some((width, height, stride, buf_size)) =
+                layer_buffer_geometry(edge.configured_width, edge.configured_height)
+            else {
+                warn!(
+                    "Skipping layer-shell edge buffer with invalid compositor size {}x{}",
+                    edge.configured_width, edge.configured_height
+                );
+                continue;
+            };
+
             let fd = create_shm_file(buf_size)?;
             let pool = shm.create_pool(fd.as_fd(), buf_size as i32, &qh, ());
-            let buffer = pool.create_buffer(
-                0,
-                edge.configured_width as i32,
-                edge.configured_height as i32,
-                stride as i32,
-                wl_shm::Format::Argb8888,
-                &qh,
-                (),
-            );
+            let buffer =
+                pool.create_buffer(0, width, height, stride, wl_shm::Format::Argb8888, &qh, ());
             edge.surface.attach(Some(&buffer), 0, 0);
             edge.surface.commit();
         }
@@ -436,11 +437,17 @@ impl WaylandState {
         // Get relative pointer
         let relative_pointer = rpm.get_relative_pointer(pointer, qh, ());
 
-        // Inhibit shortcuts if available
-        let shortcuts_inhibitor = self.shortcuts_inhibit_manager.as_ref().map(|mgr| {
-            let seat = self.seat.as_ref().unwrap();
-            mgr.inhibit_shortcuts(surface, seat, qh, ())
-        });
+        // Inhibit shortcuts if both the protocol and seat are available. Global
+        // discovery order is compositor-dependent, so do not assume a seat is
+        // present just because the inhibitor manager was advertised.
+        let shortcuts_inhibitor = match (&self.shortcuts_inhibit_manager, &self.seat) {
+            (Some(mgr), Some(seat)) => Some(mgr.inhibit_shortcuts(surface, seat, qh, ())),
+            (Some(_), None) => {
+                debug!("Layer-shell: shortcuts inhibitor available before seat; skipping inhibit");
+                None
+            }
+            _ => None,
+        };
 
         self.grab = Some(GrabState {
             locked_pointer,
@@ -478,11 +485,11 @@ impl WaylandState {
     }
 
     fn next_repeat_deadline(&self) -> Option<Instant> {
-        if self.repeat_rate == 0 || self.held_keys.is_empty() {
+        let repeat_interval = repeat_interval(self.repeat_rate)?;
+        if self.held_keys.is_empty() {
             return None;
         }
-        let repeat_interval = Duration::from_millis((1000 / self.repeat_rate.max(1)) as u64);
-        let delay = Duration::from_millis(self.repeat_delay as u64);
+        let delay = repeat_delay_duration(self.repeat_delay);
 
         self.held_keys
             .iter()
@@ -498,12 +505,11 @@ impl WaylandState {
     }
 
     fn fire_repeats(&mut self) {
-        if self.repeat_rate == 0 {
+        let Some(repeat_interval) = repeat_interval(self.repeat_rate) else {
             return;
-        }
+        };
         let now = Instant::now();
-        let repeat_interval = Duration::from_millis((1000 / self.repeat_rate.max(1)) as u64);
-        let delay = Duration::from_millis(self.repeat_delay as u64);
+        let delay = repeat_delay_duration(self.repeat_delay);
 
         for ks in &mut self.held_keys {
             let elapsed = now.duration_since(ks.started);
@@ -837,6 +843,18 @@ delegate_noop!(WaylandState: ignore zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyb
 
 // --- Helpers ---
 
+fn repeat_interval(rate: i32) -> Option<Duration> {
+    if rate <= 0 {
+        return None;
+    }
+    let millis = (1000 / u64::try_from(rate).ok()?).max(1);
+    Some(Duration::from_millis(millis))
+}
+
+fn repeat_delay_duration(delay: i32) -> Duration {
+    Duration::from_millis(u64::try_from(delay.max(0)).unwrap_or(0))
+}
+
 fn edge_anchor_size(direction: Direction) -> (zwlr_layer_surface_v1::Anchor, u32, u32) {
     use zwlr_layer_surface_v1::Anchor;
     match direction {
@@ -853,6 +871,26 @@ fn edge_anchor_size(direction: Direction) -> (zwlr_layer_surface_v1::Anchor, u32
         ),
         Direction::Down => (Anchor::Bottom | Anchor::Left | Anchor::Right, 0, 1),
     }
+}
+
+const MAX_LAYER_SHM_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+
+fn layer_buffer_geometry(width: u32, height: u32) -> Option<(i32, i32, i32, usize)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let stride = width.checked_mul(4)?;
+    let size = usize::try_from(u64::from(stride).checked_mul(u64::from(height))?).ok()?;
+    if size > MAX_LAYER_SHM_BUFFER_BYTES
+        || width > i32::MAX as u32
+        || height > i32::MAX as u32
+        || stride > i32::MAX as u32
+    {
+        return None;
+    }
+
+    Some((width as i32, height as i32, stride as i32, size))
 }
 
 /// Create a shared memory file for the 1px transparent buffer.
@@ -884,6 +922,34 @@ fn is_modifier(keycode: u32) -> bool {
         125 |  // KEY_LEFTMETA
         126 // KEY_RIGHTMETA
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_repeat_timing_handles_malformed_compositor_values() {
+        assert_eq!(repeat_interval(0), None);
+        assert_eq!(repeat_interval(-10), None);
+        assert_eq!(repeat_interval(25), Some(Duration::from_millis(40)));
+        assert_eq!(repeat_interval(2_000), Some(Duration::from_millis(1)));
+        assert_eq!(repeat_delay_duration(-1), Duration::from_millis(0));
+        assert_eq!(repeat_delay_duration(600), Duration::from_millis(600));
+    }
+
+    #[test]
+    fn layer_buffer_geometry_rejects_invalid_or_oversized_compositor_sizes() {
+        assert_eq!(layer_buffer_geometry(0, 1), None);
+        assert_eq!(layer_buffer_geometry(1, 0), None);
+        assert_eq!(layer_buffer_geometry(u32::MAX, 1), None);
+        assert_eq!(layer_buffer_geometry(1, u32::MAX), None);
+        assert_eq!(
+            layer_buffer_geometry(4096, 4096),
+            Some((4096, 4096, 16_384, MAX_LAYER_SHM_BUFFER_BYTES))
+        );
+        assert_eq!(layer_buffer_geometry(4097, 4096), None);
+    }
 }
 
 // --- Async Event Loop ---

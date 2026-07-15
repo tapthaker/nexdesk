@@ -10,6 +10,35 @@ const SERVER_EDGE_COOLDOWN: u32 = 125;
 const INSET: i32 = 20;
 const CLIENT_EDGE_DWELL: u32 = 8;
 
+fn lower_inset(len: i32) -> i32 {
+    if len <= 0 {
+        0
+    } else {
+        INSET.clamp(0, len - 1)
+    }
+}
+
+fn upper_inset(len: i32) -> i32 {
+    if len <= 0 {
+        0
+    } else {
+        (len - 1 - INSET).clamp(0, len - 1)
+    }
+}
+
+fn clamp_with_inset(value: i32, len: i32) -> i32 {
+    if len <= 0 {
+        return 0;
+    }
+    let lo = lower_inset(len);
+    let hi = upper_inset(len);
+    if lo <= hi {
+        value.clamp(lo, hi)
+    } else {
+        value.clamp(0, len - 1)
+    }
+}
+
 // Do not synthesize keyboard repeat in nexdesk. The client OS will repeat
 // naturally after a forwarded key-down. Synthesizing repeat here is dangerous:
 // if the Linux capturer misses a key-up during a switch-back/grab transition,
@@ -128,7 +157,7 @@ impl ServerTransition {
             return None;
         };
 
-        if self.trigger_edge.map_or(true, |edge| edge == direction) {
+        if self.trigger_edge.is_none_or(|edge| edge == direction) {
             Some(direction)
         } else {
             None
@@ -161,10 +190,10 @@ impl ServerTransition {
         let pw = self.peer_screen.width as i32;
         let ph = self.peer_screen.height as i32;
         let (rx, ry) = match direction {
-            Direction::Right => (INSET, ph / 2),
-            Direction::Left => (pw - 1 - INSET, ph / 2),
-            Direction::Down => (pw / 2, INSET),
-            Direction::Up => (pw / 2, ph - 1 - INSET),
+            Direction::Right => (lower_inset(pw), ph / 2),
+            Direction::Left => (upper_inset(pw), ph / 2),
+            Direction::Down => (pw / 2, lower_inset(ph)),
+            Direction::Up => (pw / 2, upper_inset(ph)),
         };
 
         vec![
@@ -231,6 +260,17 @@ impl ServerTransition {
             };
         }
 
+        if sw == 0 || sh == 0 {
+            self.edge_dwell = 0;
+            if self.active {
+                self.active = false;
+                return ServerOutput::ForceRelease {
+                    messages: self.release_pressed_keys(),
+                };
+            }
+            return ServerOutput::Idle;
+        }
+
         if let Some(dir) = self.shortcut_direction() {
             if self.active {
                 self.active = false;
@@ -250,10 +290,10 @@ impl ServerTransition {
                 let pw = self.peer_screen.width as i32;
                 let ph = self.peer_screen.height as i32;
                 let (rx, ry) = match dir {
-                    Direction::Right => (INSET, ph / 2),
-                    Direction::Left => (pw - 1 - INSET, ph / 2),
-                    Direction::Down => (pw / 2, INSET),
-                    Direction::Up => (pw / 2, ph - 1 - INSET),
+                    Direction::Right => (lower_inset(pw), ph / 2),
+                    Direction::Left => (upper_inset(pw), ph / 2),
+                    Direction::Down => (pw / 2, lower_inset(ph)),
+                    Direction::Up => (pw / 2, upper_inset(ph)),
                 };
 
                 return ServerOutput::Activate {
@@ -271,7 +311,7 @@ impl ServerTransition {
 
         if !self.active {
             let at_edge = edge::detect_edge(clamped_x, clamped_y, sw, sh)
-                .filter(|d| self.trigger_edge.map_or(true, |e| *d == e));
+                .filter(|d| self.trigger_edge.is_none_or(|e| *d == e));
 
             if self.edge_cooldown > 0 {
                 self.edge_cooldown -= 1;
@@ -293,10 +333,10 @@ impl ServerTransition {
                 let pw = self.peer_screen.width as i32;
                 let ph = self.peer_screen.height as i32;
                 let (rx, ry) = match dir {
-                    Direction::Right => (INSET, my.clamp(INSET, ph - 1 - INSET)),
-                    Direction::Left => (pw - 1 - INSET, my.clamp(INSET, ph - 1 - INSET)),
-                    Direction::Down => (mx.clamp(INSET, pw - 1 - INSET), INSET),
-                    Direction::Up => (mx.clamp(INSET, pw - 1 - INSET), ph - 1 - INSET),
+                    Direction::Right => (lower_inset(pw), clamp_with_inset(my, ph)),
+                    Direction::Left => (upper_inset(pw), clamp_with_inset(my, ph)),
+                    Direction::Down => (clamp_with_inset(mx, pw), lower_inset(ph)),
+                    Direction::Up => (clamp_with_inset(mx, pw), upper_inset(ph)),
                 };
 
                 let messages = vec![
@@ -315,8 +355,8 @@ impl ServerTransition {
             let mut messages = Vec::new();
 
             // Mouse movement (relative deltas)
-            let dx = mx - self.last_x;
-            let dy = my - self.last_y;
+            let dx = mx.saturating_sub(self.last_x);
+            let dy = my.saturating_sub(self.last_y);
             if dx != 0 || dy != 0 {
                 messages.push(Message::MouseMove { x: dx, y: dy });
                 self.last_x = mx;
@@ -346,7 +386,9 @@ impl ServerTransition {
     }
 
     pub fn update_peer_screen(&mut self, screen: ScreenLayout) {
-        self.peer_screen = screen;
+        if screen.width > 0 && screen.height > 0 {
+            self.peer_screen = screen;
+        }
     }
 
     /// Deactivate because the client hit its return edge.
@@ -425,6 +467,9 @@ impl ClientTransition {
     }
 
     pub fn update_screen_size(&mut self, w: u32, h: u32) {
+        if w == 0 || h == 0 {
+            return;
+        }
         self.screen_w = w;
         self.screen_h = h;
         self.cursor_x = self.cursor_x.clamp(0, w as i32 - 1);
@@ -447,8 +492,8 @@ impl ClientTransition {
                     self.cursor_y = y;
                     self.first_move = false;
                 } else {
-                    self.cursor_x += x;
-                    self.cursor_y += y;
+                    self.cursor_x = self.cursor_x.saturating_add(x);
+                    self.cursor_y = self.cursor_y.saturating_add(y);
                 }
                 self.cursor_x = self.cursor_x.clamp(0, self.screen_w as i32 - 1);
                 self.cursor_y = self.cursor_y.clamp(0, self.screen_h as i32 - 1);
@@ -501,13 +546,6 @@ impl ClientTransition {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn server_screen() -> ScreenLayout {
-        ScreenLayout {
-            width: 1920,
-            height: 1080,
-        }
-    }
 
     fn peer_screen() -> ScreenLayout {
         ScreenLayout {
@@ -639,6 +677,24 @@ mod tests {
         } else {
             panic!("Expected Forward");
         }
+    }
+
+    #[test]
+    fn server_delta_saturates_extreme_positions() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        activate_server(&mut st);
+        st.last_x = i32::MIN;
+        st.last_y = i32::MAX;
+
+        let out = st.poll(i32::MAX, i32::MIN, 1920, 1080, 0, vec![]);
+        assert!(matches!(
+            out,
+            ServerOutput::Forward { messages }
+                if messages.iter().any(|m| matches!(
+                    m,
+                    Message::MouseMove { x: i32::MAX, y: i32::MIN }
+                ))
+        ));
     }
 
     #[test]
@@ -1053,6 +1109,36 @@ mod tests {
     }
 
     #[test]
+    fn client_relative_move_saturates_before_clamping() {
+        let mut ct = ClientTransition::new(1920, 1080);
+        ct.handle(Message::SwitchScreen {
+            direction: Direction::Right,
+        });
+        ct.handle(Message::MouseMove {
+            x: i32::MAX,
+            y: i32::MIN,
+        });
+        let out = ct.handle(Message::MouseMove { x: i32::MAX, y: -1 });
+        if let ClientOutput::InjectMove { x, y } = out {
+            assert_eq!(x, 1919);
+            assert_eq!(y, 0);
+        } else {
+            panic!("Expected InjectMove");
+        }
+    }
+
+    #[test]
+    fn client_ignores_zero_sized_screen_update() {
+        let mut ct = ClientTransition::new(1920, 1080);
+        ct.update_screen_size(0, 1080);
+        assert_eq!(ct.screen_w, 1920);
+        assert_eq!(ct.screen_h, 1080);
+        ct.update_screen_size(1920, 0);
+        assert_eq!(ct.screen_w, 1920);
+        assert_eq!(ct.screen_h, 1080);
+    }
+
+    #[test]
     fn client_cooldown_prevents_edge_detection() {
         let mut ct = ClientTransition::new(1920, 1080);
         ct.handle(Message::SwitchScreen {
@@ -1334,6 +1420,55 @@ mod tests {
     }
 
     // ===== activate_instant Tests =====
+
+    #[test]
+    fn server_ignores_zero_sized_peer_screen_update() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        st.update_peer_screen(ScreenLayout {
+            width: 0,
+            height: 1440,
+        });
+        assert_eq!(st.peer_screen.width, 2560);
+        assert_eq!(st.peer_screen.height, 1440);
+        st.update_peer_screen(ScreenLayout {
+            width: 1920,
+            height: 0,
+        });
+        assert_eq!(st.peer_screen.width, 2560);
+        assert_eq!(st.peer_screen.height, 1440);
+    }
+
+    #[test]
+    fn server_activation_handles_tiny_peer_screen() {
+        let mut st = ServerTransition::new(
+            Some(Direction::Right),
+            ScreenLayout {
+                width: 10,
+                height: 10,
+            },
+        );
+        for _ in 0..EDGE_DWELL_THRESHOLD {
+            st.poll(1919, 500, 1920, 1080, 0, vec![]);
+        }
+        assert!(st.is_active());
+    }
+
+    #[test]
+    fn server_ignores_zero_sized_local_screen() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        let out = st.poll(0, 0, 0, 1080, 0, vec![]);
+        assert!(matches!(out, ServerOutput::Idle));
+        assert!(!st.is_active());
+    }
+
+    #[test]
+    fn server_deactivates_on_zero_sized_local_screen() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        activate_server(&mut st);
+        let out = st.poll(0, 0, 1920, 0, 0, vec![]);
+        assert!(matches!(out, ServerOutput::ForceRelease { .. }));
+        assert!(!st.is_active());
+    }
 
     #[test]
     fn server_activate_instant_right() {

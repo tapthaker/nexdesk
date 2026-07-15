@@ -4,12 +4,12 @@ use std::path::PathBuf;
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use evdev::{AbsoluteAxisType, Device, InputEventKind, Key, RelativeAxisType};
-use tracing::{debug, warn};
+use tracing::debug;
 use x11rb::connection::Connection;
 
 use crate::input::capture::InputCapture;
 use crate::input::inject::InputInjector;
-use crate::net::protocol::Message;
+use crate::net::protocol::{Message, MAX_KEYCODE, MAX_SCROLL_DELTA};
 
 #[derive(Debug, Clone)]
 enum PointerKind {
@@ -92,8 +92,8 @@ fn find_pointer_devices(
                         .flatten();
 
                     if let (Some(ax), Some(ay)) = (abs_info_x, abs_info_y) {
-                        let x_range = (ax.maximum - ax.minimum).max(1) as f64;
-                        let y_range = (ay.maximum - ay.minimum).max(1) as f64;
+                        let x_range = abs_axis_range(ax.minimum, ax.maximum);
+                        let y_range = abs_axis_range(ay.minimum, ay.maximum);
                         debug!(
                             "Found absolute pointer: {} ({}) x:[{}..{}] y:[{}..{}]",
                             name,
@@ -125,6 +125,113 @@ fn find_pointer_devices(
     }
 
     Ok((found, claimed))
+}
+
+fn saturating_i32_add(current: i32, delta: i32) -> i32 {
+    current.saturating_add(delta)
+}
+
+fn abs_axis_range(minimum: i32, maximum: i32) -> f64 {
+    i64::from(maximum).saturating_sub(i64::from(minimum)).max(1) as f64
+}
+
+fn abs_axis_delta(current: i32, previous: i32) -> f64 {
+    (i64::from(current) - i64::from(previous)) as f64
+}
+
+fn set_fd_nonblocking(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn add_scroll_delta(accumulator: &mut f64, delta: f64) {
+    if !delta.is_finite() {
+        return;
+    }
+    *accumulator = (*accumulator + delta).clamp(-MAX_SCROLL_DELTA, MAX_SCROLL_DELTA);
+}
+
+fn protocol_keycode(code: u32) -> Option<u32> {
+    (code <= MAX_KEYCODE).then_some(code)
+}
+
+fn update_protocol_key_state(pressed_keys: &mut HashSet<u32>, code: u32, pressed: bool) {
+    let Some(keycode) = protocol_keycode(code) else {
+        return;
+    };
+    if pressed {
+        pressed_keys.insert(keycode);
+    } else {
+        pressed_keys.remove(&keycode);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_add_saturates() {
+        assert_eq!(saturating_i32_add(i32::MAX, 1), i32::MAX);
+        assert_eq!(saturating_i32_add(i32::MIN, -1), i32::MIN);
+        assert_eq!(saturating_i32_add(10, -3), 7);
+    }
+
+    #[test]
+    fn absolute_axis_range_does_not_overflow() {
+        assert_eq!(abs_axis_range(0, 100), 100.0);
+        assert_eq!(abs_axis_range(100, 0), 1.0);
+        assert_eq!(abs_axis_range(i32::MIN, i32::MAX), 4_294_967_295.0);
+    }
+
+    #[test]
+    fn absolute_axis_delta_does_not_overflow() {
+        assert_eq!(abs_axis_delta(100, 40), 60.0);
+        assert_eq!(abs_axis_delta(i32::MAX, i32::MIN), 4_294_967_295.0);
+        assert_eq!(abs_axis_delta(i32::MIN, i32::MAX), -4_294_967_295.0);
+    }
+
+    #[test]
+    fn set_fd_nonblocking_reports_invalid_fd() {
+        assert!(set_fd_nonblocking(-1).is_err());
+    }
+
+    #[test]
+    fn scroll_accumulator_clamps_to_protocol_limit() {
+        let mut acc = MAX_SCROLL_DELTA - 1.0;
+        add_scroll_delta(&mut acc, 10.0);
+        assert_eq!(acc, MAX_SCROLL_DELTA);
+
+        add_scroll_delta(&mut acc, f64::NAN);
+        assert_eq!(acc, MAX_SCROLL_DELTA);
+
+        add_scroll_delta(&mut acc, -MAX_SCROLL_DELTA * 3.0);
+        assert_eq!(acc, -MAX_SCROLL_DELTA);
+    }
+
+    #[test]
+    fn keycode_filter_matches_protocol_range() {
+        assert_eq!(protocol_keycode(MAX_KEYCODE), Some(MAX_KEYCODE));
+        assert_eq!(protocol_keycode(MAX_KEYCODE + 1), None);
+    }
+
+    #[test]
+    fn pressed_key_state_ignores_unsupported_codes() {
+        let mut keys = HashSet::new();
+        update_protocol_key_state(&mut keys, MAX_KEYCODE, true);
+        update_protocol_key_state(&mut keys, MAX_KEYCODE + 1, true);
+        assert_eq!(keys, HashSet::from([MAX_KEYCODE]));
+        update_protocol_key_state(&mut keys, MAX_KEYCODE + 1, false);
+        assert_eq!(keys, HashSet::from([MAX_KEYCODE]));
+        update_protocol_key_state(&mut keys, MAX_KEYCODE, false);
+        assert!(keys.is_empty());
+    }
 }
 
 fn has_keyboard_or_media_keys(device: &Device) -> bool {
@@ -210,11 +317,8 @@ impl WaylandCapturer {
             let device = Device::open(path)
                 .wrap_err_with(|| format!("Failed to open {}", path.display()))?;
             // Set non-blocking via fcntl so poll doesn't block the async runtime
-            let fd = device.as_raw_fd();
-            unsafe {
-                let flags = libc::fcntl(fd, libc::F_GETFL);
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
+            set_fd_nonblocking(device.as_raw_fd())
+                .wrap_err_with(|| format!("Failed to set {} non-blocking", path.display()))?;
             devices.push(PointerDevice {
                 device,
                 kind: kind.clone(),
@@ -231,11 +335,9 @@ impl WaylandCapturer {
         for path in &kb_paths {
             let device = Device::open(path)
                 .wrap_err_with(|| format!("Failed to open keyboard {}", path.display()))?;
-            let fd = device.as_raw_fd();
-            unsafe {
-                let flags = libc::fcntl(fd, libc::F_GETFL);
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
+            set_fd_nonblocking(device.as_raw_fd()).wrap_err_with(|| {
+                format!("Failed to set keyboard {} non-blocking", path.display())
+            })?;
             keyboard_devices.push(device);
         }
 
@@ -295,18 +397,24 @@ impl WaylandCapturer {
                                     let val = event.value();
                                     match axis {
                                         RelativeAxisType::REL_X => {
-                                            self.cursor_x += val;
+                                            self.cursor_x = saturating_i32_add(self.cursor_x, val);
                                         }
                                         RelativeAxisType::REL_Y => {
-                                            self.cursor_y += val;
+                                            self.cursor_y = saturating_i32_add(self.cursor_y, val);
                                         }
                                         RelativeAxisType::REL_WHEEL => {
                                             // Vertical scroll: positive = up
-                                            self.scroll_acc_y += val as f64 * Self::WHEEL_PIXELS;
+                                            add_scroll_delta(
+                                                &mut self.scroll_acc_y,
+                                                val as f64 * Self::WHEEL_PIXELS,
+                                            );
                                         }
                                         RelativeAxisType::REL_HWHEEL => {
                                             // Horizontal scroll: positive = right
-                                            self.scroll_acc_x += val as f64 * Self::WHEEL_PIXELS;
+                                            add_scroll_delta(
+                                                &mut self.scroll_acc_x,
+                                                val as f64 * Self::WHEEL_PIXELS,
+                                            );
                                         }
                                         _ => {}
                                     }
@@ -328,22 +436,28 @@ impl WaylandCapturer {
                                             match axis {
                                                 AbsoluteAxisType::ABS_X => {
                                                     if let Some(prev) = pdev.last_abs_x {
-                                                        let delta = (val - prev) as f64
+                                                        let delta = abs_axis_delta(val, prev)
                                                             / abs_x_range
                                                             * sw
                                                             * Self::TOUCHPAD_SCROLL_SPEED;
-                                                        self.scroll_acc_x += delta;
+                                                        add_scroll_delta(
+                                                            &mut self.scroll_acc_x,
+                                                            delta,
+                                                        );
                                                     }
                                                     pdev.last_abs_x = Some(val);
                                                 }
                                                 AbsoluteAxisType::ABS_Y => {
                                                     if let Some(prev) = pdev.last_abs_y {
-                                                        let delta = (val - prev) as f64
+                                                        let delta = abs_axis_delta(val, prev)
                                                             / abs_y_range
                                                             * sh
                                                             * Self::TOUCHPAD_SCROLL_SPEED;
                                                         // Negate: finger moving down → content scrolls up (natural scrolling)
-                                                        self.scroll_acc_y -= delta;
+                                                        add_scroll_delta(
+                                                            &mut self.scroll_acc_y,
+                                                            -delta,
+                                                        );
                                                     }
                                                     pdev.last_abs_y = Some(val);
                                                 }
@@ -354,21 +468,27 @@ impl WaylandCapturer {
                                             match axis {
                                                 AbsoluteAxisType::ABS_X => {
                                                     if let Some(prev) = pdev.last_abs_x {
-                                                        let delta = (val - prev) as f64
+                                                        let delta = abs_axis_delta(val, prev)
                                                             / abs_x_range
                                                             * sw
                                                             * Self::TOUCHPAD_SPEED;
-                                                        self.cursor_x += delta as i32;
+                                                        self.cursor_x = saturating_i32_add(
+                                                            self.cursor_x,
+                                                            delta as i32,
+                                                        );
                                                     }
                                                     pdev.last_abs_x = Some(val);
                                                 }
                                                 AbsoluteAxisType::ABS_Y => {
                                                     if let Some(prev) = pdev.last_abs_y {
-                                                        let delta = (val - prev) as f64
+                                                        let delta = abs_axis_delta(val, prev)
                                                             / abs_y_range
                                                             * sh
                                                             * Self::TOUCHPAD_SPEED;
-                                                        self.cursor_y += delta as i32;
+                                                        self.cursor_y = saturating_i32_add(
+                                                            self.cursor_y,
+                                                            delta as i32,
+                                                        );
                                                     }
                                                     pdev.last_abs_y = Some(val);
                                                 }
@@ -439,12 +559,14 @@ impl WaylandCapturer {
                                             }
                                         }
                                         _ => {
-                                            // Keyboard key tracking
-                                            if pressed {
-                                                self.pressed_keys.insert(code);
-                                            } else {
-                                                self.pressed_keys.remove(&code);
-                                            }
+                                            // Keyboard key tracking. Keep only protocol-supported
+                                            // keycodes in long-lived state so device-specific or
+                                            // pointer-only evdev codes cannot accumulate forever.
+                                            update_protocol_key_state(
+                                                &mut self.pressed_keys,
+                                                code,
+                                                pressed,
+                                            );
                                         }
                                     }
                                 }
@@ -476,11 +598,7 @@ impl WaylandCapturer {
                             if let InputEventKind::Key(key) = event.kind() {
                                 let code = key.code() as u32;
                                 let pressed = event.value() != 0;
-                                if pressed {
-                                    self.pressed_keys.insert(code);
-                                } else {
-                                    self.pressed_keys.remove(&code);
-                                }
+                                update_protocol_key_state(&mut self.pressed_keys, code, pressed);
                             }
                         }
                         if !got_any {
@@ -509,22 +627,43 @@ impl InputCapture for WaylandCapturer {
     }
 
     fn set_grab(&mut self, grab: bool) -> Result<()> {
-        for pdev in &mut self.devices {
-            if grab {
-                pdev.device
-                    .grab()
-                    .wrap_err("Failed to grab pointer device")?;
-            } else {
-                pdev.device
-                    .ungrab()
-                    .wrap_err("Failed to ungrab pointer device")?;
+        if grab {
+            for idx in 0..self.devices.len() {
+                if let Err(e) = self.devices[idx].device.grab() {
+                    for pdev in self.devices.iter_mut().take(idx) {
+                        pdev.device.ungrab().ok();
+                    }
+                    return Err(eyre!("Failed to grab pointer device {}: {}", idx, e));
+                }
             }
-        }
-        for kdev in &mut self.keyboard_devices {
-            if grab {
-                kdev.grab().wrap_err("Failed to grab keyboard device")?;
-            } else {
-                kdev.ungrab().wrap_err("Failed to ungrab keyboard device")?;
+            for idx in 0..self.keyboard_devices.len() {
+                if let Err(e) = self.keyboard_devices[idx].grab() {
+                    for kdev in self.keyboard_devices.iter_mut().take(idx) {
+                        kdev.ungrab().ok();
+                    }
+                    for pdev in &mut self.devices {
+                        pdev.device.ungrab().ok();
+                    }
+                    return Err(eyre!("Failed to grab keyboard device {}: {}", idx, e));
+                }
+            }
+        } else {
+            let mut errors = Vec::new();
+            for (idx, pdev) in self.devices.iter_mut().enumerate() {
+                if let Err(e) = pdev.device.ungrab() {
+                    errors.push(format!("pointer {idx}: {e}"));
+                }
+            }
+            for (idx, kdev) in self.keyboard_devices.iter_mut().enumerate() {
+                if let Err(e) = kdev.ungrab() {
+                    errors.push(format!("keyboard {idx}: {e}"));
+                }
+            }
+            if !errors.is_empty() {
+                return Err(eyre!(
+                    "Failed to ungrab input devices: {}",
+                    errors.join(", ")
+                ));
             }
         }
         self.grabbed = grab;
@@ -538,11 +677,27 @@ impl InputCapture for WaylandCapturer {
     }
 
     fn set_keyboard_grab(&mut self, grab: bool) -> Result<()> {
-        for kdev in &mut self.keyboard_devices {
-            if grab {
-                kdev.grab().wrap_err("Failed to grab keyboard device")?;
-            } else {
-                kdev.ungrab().wrap_err("Failed to ungrab keyboard device")?;
+        if grab {
+            for idx in 0..self.keyboard_devices.len() {
+                if let Err(e) = self.keyboard_devices[idx].grab() {
+                    for kdev in self.keyboard_devices.iter_mut().take(idx) {
+                        kdev.ungrab().ok();
+                    }
+                    return Err(eyre!("Failed to grab keyboard device {}: {}", idx, e));
+                }
+            }
+        } else {
+            let mut errors = Vec::new();
+            for (idx, kdev) in self.keyboard_devices.iter_mut().enumerate() {
+                if let Err(e) = kdev.ungrab() {
+                    errors.push(format!("keyboard {idx}: {e}"));
+                }
+            }
+            if !errors.is_empty() {
+                return Err(eyre!(
+                    "Failed to ungrab keyboard devices: {}",
+                    errors.join(", ")
+                ));
             }
         }
         debug!(
@@ -562,8 +717,12 @@ impl InputCapture for WaylandCapturer {
         let mut events = Vec::new();
         for &code in &self.pressed_keys {
             if !old_keys.contains(&code) {
+                let Some(keycode) = protocol_keycode(code) else {
+                    debug!("Ignoring unsupported evdev keycode: {}", code);
+                    continue;
+                };
                 events.push(Message::KeyEvent {
-                    keycode: code,
+                    keycode,
                     pressed: true,
                     modifiers: 0,
                 });
@@ -571,8 +730,12 @@ impl InputCapture for WaylandCapturer {
         }
         for &code in &old_keys {
             if !self.pressed_keys.contains(&code) {
+                let Some(keycode) = protocol_keycode(code) else {
+                    debug!("Ignoring unsupported evdev keycode release: {}", code);
+                    continue;
+                };
                 events.push(Message::KeyEvent {
-                    keycode: code,
+                    keycode,
                     pressed: false,
                     modifiers: 0,
                 });
@@ -602,18 +765,19 @@ pub struct WaylandInjector;
 
 impl WaylandInjector {
     pub fn new() -> Result<Self> {
-        Ok(Self)
+        Err(eyre!(
+            "Wayland input injection is not implemented; run a true X11 session or set NEXDESK_LINUX_INJECTOR=x11 to force the experimental XTest/XWayland injector"
+        ))
     }
 }
 
 impl InputInjector for WaylandInjector {
     fn inject(&mut self, _event: &Message) -> Result<()> {
-        warn!("Wayland input injection not yet implemented");
-        Ok(())
+        Err(eyre!("Wayland input injection is not implemented"))
     }
 
     fn move_mouse(&mut self, _x: i32, _y: i32) -> Result<()> {
-        Ok(())
+        Err(eyre!("Wayland input injection is not implemented"))
     }
 
     fn screen_size(&self) -> Result<(u32, u32)> {

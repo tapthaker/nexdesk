@@ -12,7 +12,10 @@ use color_eyre::eyre::{eyre, Result};
 #[cfg(target_os = "macos")]
 use objc2_core_foundation::CGPoint;
 #[cfg(target_os = "macos")]
-use objc2_core_graphics::{CGDirectDisplayID, CGDisplayPixelsHigh, CGDisplayPixelsWide, CGEvent, CGEventSource, CGEventSourceStateID};
+use objc2_core_graphics::{
+    CGDirectDisplayID, CGDisplayPixelsHigh, CGDisplayPixelsWide, CGEvent, CGEventSource,
+    CGEventSourceStateID,
+};
 #[cfg(target_os = "macos")]
 use tracing::{info, warn};
 
@@ -25,6 +28,7 @@ use crate::net::protocol::Message;
 
 #[cfg(target_os = "macos")]
 const MAIN_DISPLAY: CGDirectDisplayID = 0;
+const MAX_HID_BOOT_KEYS: usize = 6;
 
 #[cfg(target_os = "macos")]
 type CFAllocatorRef = *const c_void;
@@ -44,8 +48,16 @@ type IOHIDUserDeviceRef = *mut c_void;
 #[cfg(target_os = "macos")]
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
-    fn CFStringCreateWithCString(alloc: CFAllocatorRef, c_str: *const c_char, encoding: u32) -> CFStringRef;
-    fn CFNumberCreate(alloc: CFAllocatorRef, the_type: c_int, value_ptr: *const c_void) -> CFNumberRef;
+    fn CFStringCreateWithCString(
+        alloc: CFAllocatorRef,
+        c_str: *const c_char,
+        encoding: u32,
+    ) -> CFStringRef;
+    fn CFNumberCreate(
+        alloc: CFAllocatorRef,
+        the_type: c_int,
+        value_ptr: *const c_void,
+    ) -> CFNumberRef;
     fn CFDataCreate(alloc: CFAllocatorRef, bytes: *const u8, length: c_long) -> CFDataRef;
     static kCFTypeDictionaryKeyCallBacks: c_void;
     static kCFTypeDictionaryValueCallBacks: c_void;
@@ -63,8 +75,15 @@ extern "C" {
 #[cfg(target_os = "macos")]
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
-    fn IOHIDUserDeviceCreate(allocator: CFAllocatorRef, properties: *const c_void) -> IOHIDUserDeviceRef;
-    fn IOHIDUserDeviceHandleReport(device: IOHIDUserDeviceRef, report: *const u8, report_length: c_long) -> i32;
+    fn IOHIDUserDeviceCreate(
+        allocator: CFAllocatorRef,
+        properties: *const c_void,
+    ) -> IOHIDUserDeviceRef;
+    fn IOHIDUserDeviceHandleReport(
+        device: IOHIDUserDeviceRef,
+        report: *const u8,
+        report_length: c_long,
+    ) -> i32;
 }
 
 #[cfg(target_os = "macos")]
@@ -74,21 +93,17 @@ const K_CF_NUMBER_SINT32_TYPE: c_int = 3;
 
 #[cfg(target_os = "macos")]
 const MOUSE_REPORT_DESCRIPTOR: &[u8] = &[
-    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00,
-    0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01,
-    0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05,
-    0x81, 0x03, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38,
-    0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06,
-    0xC0, 0xC0,
+    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x03,
+    0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x03,
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03,
+    0x81, 0x06, 0xC0, 0xC0,
 ];
 
 #[cfg(target_os = "macos")]
 const KEYBOARD_REPORT_DESCRIPTOR: &[u8] = &[
-    0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0,
-    0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08,
-    0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x95, 0x06,
-    0x75, 0x08, 0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00,
-    0x29, 0x65, 0x81, 0x00, 0xC0,
+    0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01,
+    0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x95, 0x06, 0x75, 0x08,
+    0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00, 0xC0,
 ];
 
 #[cfg(target_os = "macos")]
@@ -109,6 +124,7 @@ unsafe impl Send for MacOSHidInjector {}
 #[cfg(target_os = "macos")]
 impl Drop for MacOSHidInjector {
     fn drop(&mut self) {
+        self.release_all_inputs();
         unsafe {
             CFRelease(self.mouse as CFTypeRef);
             CFRelease(self.keyboard as CFTypeRef);
@@ -122,30 +138,92 @@ impl MacOSHidInjector {
         info!("Initializing experimental IOHIDUserDevice injector");
         let mouse = create_hid_device("Nexdesk Virtual Mouse", 1, 2, MOUSE_REPORT_DESCRIPTOR)?;
         info!("Created IOHID virtual mouse device");
-        let keyboard = create_hid_device("Nexdesk Virtual Keyboard", 1, 6, KEYBOARD_REPORT_DESCRIPTOR)?;
+        let keyboard =
+            create_hid_device("Nexdesk Virtual Keyboard", 1, 6, KEYBOARD_REPORT_DESCRIPTOR)?;
         info!("Created IOHID virtual keyboard device");
         let fallback = MacOSInjector::new()?;
         let (cursor_x, cursor_y) = current_position().unwrap_or((0, 0));
         info!("Using experimental IOHIDUserDevice injector on macOS");
-        Ok(Self { mouse, keyboard, fallback, cursor_x, cursor_y, buttons: 0, modifiers: 0, keys: HashSet::new() })
+        Ok(Self {
+            mouse,
+            keyboard,
+            fallback,
+            cursor_x,
+            cursor_y,
+            buttons: 0,
+            modifiers: 0,
+            keys: HashSet::new(),
+        })
     }
 
     fn send_mouse_report(&self, buttons: u8, dx: i8, dy: i8, wheel: i8) -> Result<()> {
         let report = [buttons & 0x07, dx as u8, dy as u8, wheel as u8];
-        let ret = unsafe { IOHIDUserDeviceHandleReport(self.mouse, report.as_ptr(), report.len() as c_long) };
-        if ret != 0 { return Err(eyre!("IOHID mouse report failed: {}", ret)); }
+        let ret = unsafe {
+            IOHIDUserDeviceHandleReport(self.mouse, report.as_ptr(), report.len() as c_long)
+        };
+        if ret != 0 {
+            return Err(eyre!("IOHID mouse report failed: {}", ret));
+        }
         Ok(())
     }
 
     fn send_keyboard_report(&self) -> Result<()> {
-        let mut report = [0u8; 8];
-        report[0] = self.modifiers;
-        for (i, key) in self.keys.iter().copied().take(6).enumerate() {
-            report[2 + i] = key;
+        let report = keyboard_report(self.modifiers, &self.keys);
+        let ret = unsafe {
+            IOHIDUserDeviceHandleReport(self.keyboard, report.as_ptr(), report.len() as c_long)
+        };
+        if ret != 0 {
+            return Err(eyre!("IOHID keyboard report failed: {}", ret));
         }
-        let ret = unsafe { IOHIDUserDeviceHandleReport(self.keyboard, report.as_ptr(), report.len() as c_long) };
-        if ret != 0 { return Err(eyre!("IOHID keyboard report failed: {}", ret)); }
         Ok(())
+    }
+
+    fn release_all_inputs(&mut self) {
+        if self.buttons != 0 {
+            if let Err(e) = self.send_mouse_report(0, 0, 0, 0) {
+                warn!(
+                    "Failed to release IOHID mouse buttons during shutdown: {}",
+                    e
+                );
+            }
+            self.buttons = 0;
+        }
+        if self.modifiers != 0 || !self.keys.is_empty() {
+            self.modifiers = 0;
+            self.keys.clear();
+            if let Err(e) = self.send_keyboard_report() {
+                warn!(
+                    "Failed to release IOHID keyboard state during shutdown: {}",
+                    e
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn keyboard_report(modifiers: u8, keys: &HashSet<u8>) -> [u8; 8] {
+    let mut report = [0u8; 8];
+    report[0] = modifiers;
+    let mut keys = keys.iter().copied().collect::<Vec<_>>();
+    keys.sort_unstable();
+    for (i, key) in keys.into_iter().take(MAX_HID_BOOT_KEYS).enumerate() {
+        report[2 + i] = key;
+    }
+    report
+}
+
+fn update_keyboard_keys(keys: &mut HashSet<u8>, usage: u8, pressed: bool) -> bool {
+    if pressed {
+        if keys.contains(&usage) || keys.len() < MAX_HID_BOOT_KEYS {
+            keys.insert(usage);
+            true
+        } else {
+            false
+        }
+    } else {
+        keys.remove(&usage);
+        true
     }
 }
 
@@ -155,20 +233,44 @@ impl InputInjector for MacOSHidInjector {
         match event {
             Message::MouseMove { x, y } => self.move_mouse(*x, *y),
             Message::MouseButton { button, pressed } => {
-                let mask = match button { 0 => 0x01, 1 => 0x02, 2 => 0x04, _ => return Ok(()) };
-                if *pressed { self.buttons |= mask; } else { self.buttons &= !mask; }
+                let mask = match button {
+                    0 => 0x01,
+                    1 => 0x02,
+                    2 => 0x04,
+                    _ => return Ok(()),
+                };
+                if *pressed {
+                    self.buttons |= mask;
+                } else {
+                    self.buttons &= !mask;
+                }
                 self.send_mouse_report(self.buttons, 0, 0, 0)
             }
-            Message::KeyEvent { keycode, pressed, .. } => {
+            Message::KeyEvent {
+                keycode, pressed, ..
+            } => {
                 if let Some(bit) = evdev_to_hid_modifier(*keycode) {
-                    if *pressed { self.modifiers |= bit; } else { self.modifiers &= !bit; }
+                    if *pressed {
+                        self.modifiers |= bit;
+                    } else {
+                        self.modifiers &= !bit;
+                    }
                     return self.send_keyboard_report();
                 }
                 let Some(usage) = evdev_to_hid_usage(*keycode) else {
-                    warn!("IOHID injector falling back for unsupported keycode {}", keycode);
+                    warn!(
+                        "IOHID injector falling back for unsupported keycode {}",
+                        keycode
+                    );
                     return self.fallback.inject(event);
                 };
-                if *pressed { self.keys.insert(usage); } else { self.keys.remove(&usage); }
+                if !update_keyboard_keys(&mut self.keys, usage, *pressed) {
+                    warn!(
+                        "IOHID injector ignoring key press beyond {}-key boot keyboard limit",
+                        MAX_HID_BOOT_KEYS
+                    );
+                    return Ok(());
+                }
                 self.send_keyboard_report()
             }
             // Scroll/media keys stay on the proven Quartz path for now.
@@ -177,20 +279,19 @@ impl InputInjector for MacOSHidInjector {
     }
 
     fn move_mouse(&mut self, x: i32, y: i32) -> Result<()> {
-        let sw = CGDisplayPixelsWide(MAIN_DISPLAY) as i32;
-        let sh = CGDisplayPixelsHigh(MAIN_DISPLAY) as i32;
+        let (sw, sh) = main_display_size_i32()?;
         let target_x = x.clamp(0, sw - 1);
         let target_y = y.clamp(0, sh - 1);
-        let mut dx = target_x - self.cursor_x;
-        let mut dy = target_y - self.cursor_y;
+        let mut dx = hid_relative_delta(target_x, self.cursor_x);
+        let mut dy = hid_relative_delta(target_y, self.cursor_y);
         while dx != 0 || dy != 0 {
             let step_x = dx.clamp(-127, 127) as i8;
             let step_y = dy.clamp(-127, 127) as i8;
             self.send_mouse_report(self.buttons, step_x, step_y, 0)?;
-            self.cursor_x += step_x as i32;
-            self.cursor_y += step_y as i32;
-            dx = target_x - self.cursor_x;
-            dy = target_y - self.cursor_y;
+            self.cursor_x = self.cursor_x.saturating_add(i32::from(step_x));
+            self.cursor_y = self.cursor_y.saturating_add(i32::from(step_y));
+            dx = hid_relative_delta(target_x, self.cursor_x);
+            dy = hid_relative_delta(target_y, self.cursor_y);
         }
         Ok(())
     }
@@ -201,7 +302,30 @@ impl InputInjector for MacOSHidInjector {
 }
 
 #[cfg(target_os = "macos")]
-fn create_hid_device(name: &str, usage_page: i32, usage: i32, descriptor: &[u8]) -> Result<IOHIDUserDeviceRef> {
+fn main_display_size_i32() -> Result<(i32, i32)> {
+    let sw = CGDisplayPixelsWide(MAIN_DISPLAY);
+    let sh = CGDisplayPixelsHigh(MAIN_DISPLAY);
+    let sw = i32::try_from(sw).unwrap_or(0);
+    let sh = i32::try_from(sh).unwrap_or(0);
+    if sw <= 0 || sh <= 0 {
+        return Err(eyre!("Invalid macOS screen size: {}x{}", sw, sh));
+    }
+    Ok((sw, sh))
+}
+
+#[cfg(target_os = "macos")]
+fn hid_relative_delta(target: i32, current: i32) -> i32 {
+    let delta = i64::from(target) - i64::from(current);
+    delta.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+#[cfg(target_os = "macos")]
+fn create_hid_device(
+    name: &str,
+    usage_page: i32,
+    usage: i32,
+    descriptor: &[u8],
+) -> Result<IOHIDUserDeviceRef> {
     unsafe {
         info!(
             "Creating IOHIDUserDevice: name='{}' usage_page={} usage={} descriptor_len={}",
@@ -217,14 +341,30 @@ fn create_hid_device(name: &str, usage_page: i32, usage: i32, descriptor: &[u8])
             &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
             &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
         );
-        if dict.is_null() { return Err(eyre!("CFDictionaryCreateMutable failed for {}", name)); }
+        if dict.is_null() {
+            return Err(eyre!("CFDictionaryCreateMutable failed for {}", name));
+        }
 
         set_string(dict, name, "Transport", "Virtual")?;
         set_string(dict, name, "Manufacturer", "Nexdesk")?;
         set_string(dict, name, "Product", name)?;
-        set_string(dict, name, "SerialNumber", if usage == 2 { "nexdesk-mouse" } else { "nexdesk-keyboard" })?;
+        set_string(
+            dict,
+            name,
+            "SerialNumber",
+            if usage == 2 {
+                "nexdesk-mouse"
+            } else {
+                "nexdesk-keyboard"
+            },
+        )?;
         set_i32(dict, name, "VendorID", 0x1209)?;
-        set_i32(dict, name, "ProductID", if usage == 2 { 0x4242 } else { 0x4243 })?;
+        set_i32(
+            dict,
+            name,
+            "ProductID",
+            if usage == 2 { 0x4242 } else { 0x4243 },
+        )?;
         set_i32(dict, name, "VersionNumber", 1)?;
         set_i32(dict, name, "PrimaryUsagePage", usage_page)?;
         set_i32(dict, name, "PrimaryUsage", usage)?;
@@ -248,7 +388,12 @@ fn create_hid_device(name: &str, usage_page: i32, usage: i32, descriptor: &[u8])
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn set_string(dict: CFMutableDictionaryRef, device_name: &str, key: &str, value: &str) -> Result<()> {
+unsafe fn set_string(
+    dict: CFMutableDictionaryRef,
+    device_name: &str,
+    key: &str,
+    value: &str,
+) -> Result<()> {
     let k = cf_string(key)?;
     let v = cf_string(value)?;
     info!("IOHID property for {}: {}='{}'", device_name, key, value);
@@ -259,12 +404,25 @@ unsafe fn set_string(dict: CFMutableDictionaryRef, device_name: &str, key: &str,
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn set_i32(dict: CFMutableDictionaryRef, device_name: &str, key: &str, value: i32) -> Result<()> {
+unsafe fn set_i32(
+    dict: CFMutableDictionaryRef,
+    device_name: &str,
+    key: &str,
+    value: i32,
+) -> Result<()> {
     let k = cf_string(key)?;
-    let n = CFNumberCreate(ptr::null(), K_CF_NUMBER_SINT32_TYPE, &value as *const _ as *const c_void);
+    let n = CFNumberCreate(
+        ptr::null(),
+        K_CF_NUMBER_SINT32_TYPE,
+        &value as *const _ as *const c_void,
+    );
     if n.is_null() {
         CFRelease(k as CFTypeRef);
-        return Err(eyre!("CFNumberCreate failed for {} property {}", device_name, key));
+        return Err(eyre!(
+            "CFNumberCreate failed for {} property {}",
+            device_name,
+            key
+        ));
     }
     info!("IOHID property for {}: {}={}", device_name, key, value);
     CFDictionarySetValue(dict, k as *const c_void, n as *const c_void);
@@ -274,14 +432,28 @@ unsafe fn set_i32(dict: CFMutableDictionaryRef, device_name: &str, key: &str, va
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn set_data(dict: CFMutableDictionaryRef, device_name: &str, key: &str, value: &[u8]) -> Result<()> {
+unsafe fn set_data(
+    dict: CFMutableDictionaryRef,
+    device_name: &str,
+    key: &str,
+    value: &[u8],
+) -> Result<()> {
     let k = cf_string(key)?;
     let d = CFDataCreate(ptr::null(), value.as_ptr(), value.len() as c_long);
     if d.is_null() {
         CFRelease(k as CFTypeRef);
-        return Err(eyre!("CFDataCreate failed for {} property {}", device_name, key));
+        return Err(eyre!(
+            "CFDataCreate failed for {} property {}",
+            device_name,
+            key
+        ));
     }
-    info!("IOHID property for {}: {}=<{} bytes>", device_name, key, value.len());
+    info!(
+        "IOHID property for {}: {}=<{} bytes>",
+        device_name,
+        key,
+        value.len()
+    );
     CFDictionarySetValue(dict, k as *const c_void, d as *const c_void);
     CFRelease(k as CFTypeRef);
     CFRelease(d as CFTypeRef);
@@ -326,29 +498,125 @@ fn evdev_to_hid_modifier(evdev: u32) -> Option<u8> {
 fn evdev_to_hid_usage(evdev: u32) -> Option<u8> {
     match evdev {
         // Letters
-        30 => Some(0x04), 48 => Some(0x05), 46 => Some(0x06), 32 => Some(0x07),
-        18 => Some(0x08), 33 => Some(0x09), 34 => Some(0x0A), 35 => Some(0x0B),
-        23 => Some(0x0C), 36 => Some(0x0D), 37 => Some(0x0E), 38 => Some(0x0F),
-        50 => Some(0x10), 49 => Some(0x11), 24 => Some(0x12), 25 => Some(0x13),
-        16 => Some(0x14), 19 => Some(0x15), 31 => Some(0x16), 20 => Some(0x17),
-        22 => Some(0x18), 47 => Some(0x19), 17 => Some(0x1A), 45 => Some(0x1B),
-        21 => Some(0x1C), 44 => Some(0x1D),
+        30 => Some(0x04),
+        48 => Some(0x05),
+        46 => Some(0x06),
+        32 => Some(0x07),
+        18 => Some(0x08),
+        33 => Some(0x09),
+        34 => Some(0x0A),
+        35 => Some(0x0B),
+        23 => Some(0x0C),
+        36 => Some(0x0D),
+        37 => Some(0x0E),
+        38 => Some(0x0F),
+        50 => Some(0x10),
+        49 => Some(0x11),
+        24 => Some(0x12),
+        25 => Some(0x13),
+        16 => Some(0x14),
+        19 => Some(0x15),
+        31 => Some(0x16),
+        20 => Some(0x17),
+        22 => Some(0x18),
+        47 => Some(0x19),
+        17 => Some(0x1A),
+        45 => Some(0x1B),
+        21 => Some(0x1C),
+        44 => Some(0x1D),
         // Number row
-        2 => Some(0x1E), 3 => Some(0x1F), 4 => Some(0x20), 5 => Some(0x21), 6 => Some(0x22),
-        7 => Some(0x23), 8 => Some(0x24), 9 => Some(0x25), 10 => Some(0x26), 11 => Some(0x27),
+        2 => Some(0x1E),
+        3 => Some(0x1F),
+        4 => Some(0x20),
+        5 => Some(0x21),
+        6 => Some(0x22),
+        7 => Some(0x23),
+        8 => Some(0x24),
+        9 => Some(0x25),
+        10 => Some(0x26),
+        11 => Some(0x27),
         // Control / punctuation
-        28 => Some(0x28), 1 => Some(0x29), 14 => Some(0x2A), 15 => Some(0x2B), 57 => Some(0x2C),
-        12 => Some(0x2D), 13 => Some(0x2E), 26 => Some(0x2F), 27 => Some(0x30), 43 => Some(0x31),
-        39 => Some(0x33), 40 => Some(0x34), 41 => Some(0x35), 51 => Some(0x36), 52 => Some(0x37), 53 => Some(0x38),
+        28 => Some(0x28),
+        1 => Some(0x29),
+        14 => Some(0x2A),
+        15 => Some(0x2B),
+        57 => Some(0x2C),
+        12 => Some(0x2D),
+        13 => Some(0x2E),
+        26 => Some(0x2F),
+        27 => Some(0x30),
+        43 => Some(0x31),
+        39 => Some(0x33),
+        40 => Some(0x34),
+        41 => Some(0x35),
+        51 => Some(0x36),
+        52 => Some(0x37),
+        53 => Some(0x38),
         58 => Some(0x39),
         // Function keys
-        59 => Some(0x3A), 60 => Some(0x3B), 61 => Some(0x3C), 62 => Some(0x3D), 63 => Some(0x3E),
-        64 => Some(0x3F), 65 => Some(0x40), 66 => Some(0x41), 67 => Some(0x42), 68 => Some(0x43),
-        87 => Some(0x44), 88 => Some(0x45),
+        59 => Some(0x3A),
+        60 => Some(0x3B),
+        61 => Some(0x3C),
+        62 => Some(0x3D),
+        63 => Some(0x3E),
+        64 => Some(0x3F),
+        65 => Some(0x40),
+        66 => Some(0x41),
+        67 => Some(0x42),
+        68 => Some(0x43),
+        87 => Some(0x44),
+        88 => Some(0x45),
         // Navigation
-        110 => Some(0x49), 102 => Some(0x4A), 104 => Some(0x4B), 111 => Some(0x4C),
-        107 => Some(0x4D), 109 => Some(0x4E), 106 => Some(0x4F), 105 => Some(0x50),
-        108 => Some(0x51), 103 => Some(0x52),
+        110 => Some(0x49),
+        102 => Some(0x4A),
+        104 => Some(0x4B),
+        111 => Some(0x4C),
+        107 => Some(0x4D),
+        109 => Some(0x4E),
+        106 => Some(0x4F),
+        105 => Some(0x50),
+        108 => Some(0x51),
+        103 => Some(0x52),
         _ => None,
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_report_is_empty_after_state_clear() {
+        let keys = HashSet::new();
+        assert_eq!(keyboard_report(0, &keys), [0; 8]);
+    }
+
+    #[test]
+    fn keyboard_report_has_deterministic_key_slots() {
+        let keys = HashSet::from([0x09, 0x04, 0x08, 0x05, 0x07, 0x06, 0x0a]);
+        assert_eq!(
+            keyboard_report(0x03, &keys),
+            [0x03, 0, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]
+        );
+    }
+
+    #[test]
+    fn keyboard_state_ignores_presses_beyond_boot_keyboard_limit() {
+        let mut keys = HashSet::new();
+        for usage in 1..=MAX_HID_BOOT_KEYS as u8 {
+            assert!(update_keyboard_keys(&mut keys, usage, true));
+        }
+        assert!(!update_keyboard_keys(&mut keys, 99, true));
+        assert!(!keys.contains(&99));
+        assert!(update_keyboard_keys(&mut keys, 1, false));
+        assert!(!keys.contains(&1));
+        assert!(!keys.contains(&99));
+    }
+
+    #[test]
+    fn hid_relative_delta_saturates_extreme_cursor_state() {
+        assert_eq!(hid_relative_delta(10, 3), 7);
+        assert_eq!(hid_relative_delta(i32::MAX, i32::MIN), i32::MAX);
+        assert_eq!(hid_relative_delta(i32::MIN, i32::MAX), i32::MIN);
     }
 }

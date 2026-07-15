@@ -5,16 +5,23 @@ const EDGE_MARGIN: i32 = 2;
 
 /// Detect if the cursor is at a screen edge.
 pub fn detect_edge(x: i32, y: i32, screen_width: u32, screen_height: u32) -> Option<Direction> {
-    let w = screen_width as i32;
-    let h = screen_height as i32;
+    if screen_width == 0 || screen_height == 0 {
+        return None;
+    }
 
-    if x <= EDGE_MARGIN {
+    let x = i64::from(x);
+    let y = i64::from(y);
+    let w = i64::from(screen_width);
+    let h = i64::from(screen_height);
+    let edge_margin = i64::from(EDGE_MARGIN);
+
+    if x <= edge_margin {
         Some(Direction::Left)
-    } else if x >= w - EDGE_MARGIN - 1 {
+    } else if x >= w - edge_margin - 1 {
         Some(Direction::Right)
-    } else if y <= EDGE_MARGIN {
+    } else if y <= edge_margin {
         Some(Direction::Up)
-    } else if y >= h - EDGE_MARGIN - 1 {
+    } else if y >= h - edge_margin - 1 {
         Some(Direction::Down)
     } else {
         None
@@ -114,5 +121,17 @@ mod tests {
             detect_edge(W as i32 - 1, H as i32 - 1, W, H),
             Some(Direction::Right)
         );
+    }
+
+    #[test]
+    fn zero_sized_screen_returns_none() {
+        assert_eq!(detect_edge(0, 0, 0, H), None);
+        assert_eq!(detect_edge(0, 0, W, 0), None);
+    }
+
+    #[test]
+    fn large_screen_dimensions_do_not_wrap() {
+        assert_eq!(detect_edge(10, 10, u32::MAX, u32::MAX), None);
+        assert_eq!(detect_edge(i32::MAX, 10, u32::MAX, u32::MAX), None);
     }
 }

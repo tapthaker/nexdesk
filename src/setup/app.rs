@@ -17,6 +17,37 @@ use crate::net::discovery::{BrowseHandle, DiscoveredPeer};
 
 use super::{certificates, network, permissions, role, screens, service, welcome};
 
+const MAX_MANUAL_ADDR_BYTES: usize = 512;
+
+fn push_manual_addr_char(value: &mut String, ch: char) -> bool {
+    if ch.is_control() || value.len().saturating_add(ch.len_utf8()) > MAX_MANUAL_ADDR_BYTES {
+        return false;
+    }
+    value.push(ch);
+    true
+}
+
+fn normalize_manual_addr(value: &str) -> Option<String> {
+    if value.len() > MAX_MANUAL_ADDR_BYTES || value.chars().any(char::is_control) {
+        return None;
+    }
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn service_client_addr_arg(addr: &str) -> Result<String> {
+    normalize_manual_addr(addr).ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "Invalid configured server address {:?}. Run `nexdesk setup` and choose a server address again.",
+            crate::status::terminal_safe(addr, crate::status::MAX_STATUS_DISPLAY_BYTES)
+        )
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     Welcome,
@@ -138,6 +169,30 @@ pub struct SetupState {
     _browse_handle: Option<BrowseHandle>,
 }
 
+struct TerminalCleanup {
+    active: bool,
+}
+
+impl TerminalCleanup {
+    fn armed() -> Self {
+        Self { active: true }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for TerminalCleanup {
+    fn drop(&mut self) {
+        if self.active {
+            disable_raw_mode().ok();
+            let mut stdout = io::stdout();
+            execute!(stdout, LeaveAlternateScreen).ok();
+        }
+    }
+}
+
 impl SetupState {
     fn new() -> Result<Self> {
         let config = NexdeskConfig::load()?;
@@ -170,13 +225,8 @@ pub async fn run() -> Result<()> {
     let _tty_guard = {
         let stdin_fd = io::stdin().as_raw_fd();
         let flags = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
-        let need_reopen = if !io::stdin().is_terminal() {
-            true
-        } else if flags >= 0 && (flags & libc::O_ACCMODE == libc::O_RDONLY) {
-            true
-        } else {
-            false
-        };
+        let need_reopen = !io::stdin().is_terminal()
+            || (flags >= 0 && (flags & libc::O_ACCMODE == libc::O_RDONLY));
         if need_reopen {
             // Try to get the actual PTY device path via ttyname on stdin,
             // stdout, or stderr. On macOS, kqueue returns EINVAL for /dev/tty
@@ -211,6 +261,7 @@ pub async fn run() -> Result<()> {
     };
 
     enable_raw_mode()?;
+    let mut terminal_cleanup = TerminalCleanup::armed();
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
@@ -363,7 +414,7 @@ pub async fn run() -> Result<()> {
                     }
                     KeyCode::Char(c) => {
                         if state.step == Step::Network && !state.use_discovery {
-                            state.manual_addr.push(c);
+                            push_manual_addr_char(&mut state.manual_addr, c);
                         }
                     }
                     KeyCode::Backspace => {
@@ -387,6 +438,7 @@ pub async fn run() -> Result<()> {
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal_cleanup.disarm();
 
     Ok(())
 }
@@ -411,6 +463,27 @@ async fn apply_step_with_terminal(
     }
 
     result
+}
+
+fn service_args_for_config(config: &NexdeskConfig) -> Result<Vec<String>> {
+    match config.role.as_deref() {
+        Some("server") => Ok(vec![
+            "serve".to_string(),
+            "--port".to_string(),
+            if config.port == 0 { 4242 } else { config.port }.to_string(),
+        ]),
+        Some("client") => Ok(match &config.server_addr {
+            Some(addr) => vec!["connect".to_string(), service_client_addr_arg(addr)?],
+            None => vec!["connect".to_string()],
+        }),
+        Some(role) => Err(color_eyre::eyre::eyre!(
+            "Invalid configured role {:?}. Run `nexdesk setup` and choose server or client.",
+            crate::status::terminal_safe(role, crate::status::MAX_STATUS_DISPLAY_BYTES)
+        )),
+        None => Err(color_eyre::eyre::eyre!(
+            "No role configured. Run `nexdesk setup` and choose server or client."
+        )),
+    }
 }
 
 async fn apply_step(state: &mut SetupState) -> Result<()> {
@@ -446,8 +519,8 @@ async fn apply_step(state: &mut SetupState) -> Result<()> {
                 if let Some(peer) = state.discovered_peers.get(state.peer_selection) {
                     state.config.server_addr = Some(peer.addr.to_string());
                 }
-            } else if !state.manual_addr.is_empty() {
-                state.config.server_addr = Some(state.manual_addr.clone());
+            } else {
+                state.config.server_addr = normalize_manual_addr(&state.manual_addr);
             }
         }
         Step::Screens => {
@@ -465,24 +538,16 @@ async fn apply_step(state: &mut SetupState) -> Result<()> {
             state.fingerprint = Some(crate::net::tls::fingerprint(&cert));
         }
         Step::Service => {
-            let args: Vec<&str> = match state.config.role.as_deref() {
-                Some("server") => vec!["serve"],
-                _ => match &state.config.server_addr {
-                    Some(addr) => vec!["connect", addr],
-                    None => vec!["connect"],
-                },
-            };
+            let arg_values: Vec<String> = service_args_for_config(&state.config)?;
+            let args: Vec<&str> = arg_values.iter().map(String::as_str).collect();
+            state.config.save()?;
             if state.config.role.as_deref() != Some("server") {
                 if let Some(addr) = state.config.server_addr.as_deref() {
                     crate::net::quic::pair(addr).await?;
                 }
             }
-            if let Err(e) = crate::daemon::install_service(&args) {
-                tracing::warn!("Failed to install service: {}", e);
-            } else {
-                state.service_installed = true;
-            }
-            state.config.save()?;
+            crate::daemon::install_service(&args)?;
+            state.service_installed = true;
         }
         _ => {}
     }
@@ -507,4 +572,70 @@ fn render_done(frame: &mut Frame, area: Rect) {
     let paragraph =
         Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(" Done "));
     frame.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_address_input_is_bounded_and_control_free() {
+        let mut value = String::new();
+        assert!(push_manual_addr_char(&mut value, 'a'));
+        assert!(!push_manual_addr_char(&mut value, '\n'));
+        assert_eq!(value, "a");
+
+        value = "x".repeat(MAX_MANUAL_ADDR_BYTES);
+        assert!(!push_manual_addr_char(&mut value, 'y'));
+        assert_eq!(value.len(), MAX_MANUAL_ADDR_BYTES);
+    }
+
+    #[test]
+    fn manual_address_is_trimmed_before_config_persistence() {
+        assert_eq!(
+            normalize_manual_addr("  example.local:4242  ").as_deref(),
+            Some("example.local:4242")
+        );
+        assert_eq!(normalize_manual_addr("   "), None);
+        assert_eq!(normalize_manual_addr("host:4242\n"), None);
+        assert_eq!(
+            normalize_manual_addr(&"x".repeat(MAX_MANUAL_ADDR_BYTES + 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn service_arguments_require_an_explicit_valid_role() {
+        let mut config = NexdeskConfig {
+            role: Some("server".into()),
+            port: 5555,
+            ..Default::default()
+        };
+        assert_eq!(
+            service_args_for_config(&config).unwrap(),
+            vec!["serve", "--port", "5555"]
+        );
+        config.port = 0;
+        assert_eq!(
+            service_args_for_config(&config).unwrap(),
+            vec!["serve", "--port", "4242"]
+        );
+
+        config.role = Some("client".into());
+        config.server_addr = Some("127.0.0.1:4242".into());
+        assert_eq!(
+            service_args_for_config(&config).unwrap(),
+            vec!["connect", "127.0.0.1:4242"]
+        );
+
+        config.server_addr = Some("host:4242\n".into());
+        assert!(service_args_for_config(&config).is_err());
+
+        config.role = None;
+        assert!(service_args_for_config(&config).is_err());
+        config.role = Some("invalid\x1b[31m".into());
+        let err = service_args_for_config(&config).unwrap_err().to_string();
+        assert!(err.contains("Invalid configured role"));
+        assert!(!err.contains('\u{1b}'));
+    }
 }

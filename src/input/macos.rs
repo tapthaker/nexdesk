@@ -12,6 +12,8 @@ use objc2_core_graphics::{
 };
 
 #[cfg(target_os = "macos")]
+use std::collections::HashSet;
+#[cfg(target_os = "macos")]
 use std::os::raw::{c_int, c_uint};
 
 #[cfg(target_os = "macos")]
@@ -28,6 +30,8 @@ use crate::net::protocol::Message;
 
 #[cfg(target_os = "macos")]
 const MAIN_DISPLAY: CGDirectDisplayID = 0;
+#[cfg(target_os = "macos")]
+const MAX_SCROLL_PIXELS_PER_MESSAGE: i32 = 4096;
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -53,21 +57,14 @@ enum PostMode {
 
 /// macOS input capturer using CoreGraphics.
 #[cfg(target_os = "macos")]
-pub struct MacOSCapturer {
-    screen_width: u32,
-    screen_height: u32,
-}
+pub struct MacOSCapturer;
 
 #[cfg(target_os = "macos")]
 impl MacOSCapturer {
     pub fn new() -> Result<Self> {
-        let screen_width = CGDisplayPixelsWide(MAIN_DISPLAY) as u32;
-        let screen_height = CGDisplayPixelsHigh(MAIN_DISPLAY) as u32;
+        let (screen_width, screen_height) = main_display_size_u32()?;
         debug!("macOS capturer: screen {}x{}", screen_width, screen_height);
-        Ok(Self {
-            screen_width,
-            screen_height,
-        })
+        Ok(Self)
     }
 }
 
@@ -83,10 +80,7 @@ impl InputCapture for MacOSCapturer {
     }
 
     fn screen_size(&self) -> Result<(u32, u32)> {
-        Ok((
-            CGDisplayPixelsWide(MAIN_DISPLAY) as u32,
-            CGDisplayPixelsHigh(MAIN_DISPLAY) as u32,
-        ))
+        main_display_size_u32()
     }
 
     fn mouse_buttons(&self) -> Result<u8> {
@@ -151,11 +145,57 @@ fn evdev_to_media_key(evdev: u32) -> Option<i32> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn main_display_size_u32() -> Result<(u32, u32)> {
+    let width = CGDisplayPixelsWide(MAIN_DISPLAY);
+    let height = CGDisplayPixelsHigh(MAIN_DISPLAY);
+    let width = u32::try_from(width).unwrap_or(0);
+    let height = u32::try_from(height).unwrap_or(0);
+    if width == 0 || height == 0 {
+        return Err(color_eyre::eyre::eyre!(
+            "Invalid macOS screen size: {}x{}",
+            width,
+            height
+        ));
+    }
+    Ok((width, height))
+}
+
+#[cfg(target_os = "macos")]
+fn main_display_size_i32() -> Result<(i32, i32)> {
+    let (width, height) = main_display_size_u32()?;
+    let width = i32::try_from(width).map_err(|_| {
+        color_eyre::eyre::eyre!("Invalid macOS screen width: {} exceeds i32", width)
+    })?;
+    let height = i32::try_from(height).map_err(|_| {
+        color_eyre::eyre::eyre!("Invalid macOS screen height: {} exceeds i32", height)
+    })?;
+    Ok((width, height))
+}
+
+#[cfg(target_os = "macos")]
+fn consume_scroll_pixels(remainder: &mut f64, delta: f64) -> i32 {
+    if !delta.is_finite() {
+        return 0;
+    }
+    let total = *remainder + delta;
+    let pixels = total.trunc().clamp(
+        -(MAX_SCROLL_PIXELS_PER_MESSAGE as f64),
+        MAX_SCROLL_PIXELS_PER_MESSAGE as f64,
+    ) as i32;
+    *remainder = if pixels.unsigned_abs() == MAX_SCROLL_PIXELS_PER_MESSAGE as u32 {
+        0.0
+    } else {
+        total - pixels as f64
+    };
+    pixels
+}
+
 /// macOS input injector using CoreGraphics.
 #[cfg(target_os = "macos")]
 pub struct MacOSInjector {
-    screen_width: u32,
-    screen_height: u32,
+    /// Currently pressed modifier keycodes used to derive synthesized flags.
+    modifier_keys_down: HashSet<u32>,
     /// Tracked modifier flags for synthesized key events
     modifier_flags: CGEventFlags,
     /// Bitmask of currently pressed mouse buttons (bit 0=left, 1=right, 2=middle)
@@ -170,13 +210,16 @@ pub struct MacOSInjector {
     tap_location: CGEventTapLocation,
     /// Posting API used for ordinary mouse/keyboard/scroll events.
     post_mode: PostMode,
+    /// Fractional scroll pixels retained until they accumulate to an integer.
+    scroll_x_remainder: f64,
+    /// Fractional scroll pixels retained until they accumulate to an integer.
+    scroll_y_remainder: f64,
 }
 
 #[cfg(target_os = "macos")]
 impl MacOSInjector {
     pub fn new() -> Result<Self> {
-        let screen_width = CGDisplayPixelsWide(MAIN_DISPLAY) as u32;
-        let screen_height = CGDisplayPixelsHigh(MAIN_DISPLAY) as u32;
+        let (screen_width, screen_height) = main_display_size_u32()?;
         let source_state = match std::env::var("NEXDESK_MACOS_EVENT_SOURCE")
             .unwrap_or_else(|_| "hid".into())
             .to_ascii_lowercase()
@@ -205,16 +248,11 @@ impl MacOSInjector {
         };
         info!(
             "macOS injector: screen {}x{}, source_state={}, tap_location={}, post_mode={:?}",
-            screen_width,
-            screen_height,
-            source_state.0,
-            tap_location.0,
-            post_mode
+            screen_width, screen_height, source_state.0, tap_location.0, post_mode
         );
 
         Ok(Self {
-            screen_width,
-            screen_height,
+            modifier_keys_down: HashSet::new(),
             modifier_flags: CGEventFlags::empty(),
             buttons_down: 0,
             last_click: None,
@@ -222,6 +260,8 @@ impl MacOSInjector {
             source_state,
             tap_location,
             post_mode,
+            scroll_x_remainder: 0.0,
+            scroll_y_remainder: 0.0,
         })
     }
 
@@ -235,16 +275,27 @@ impl MacOSInjector {
         }
     }
 
+    fn flags_for_modifier_keys(keys: &HashSet<u32>) -> CGEventFlags {
+        let mut flags = CGEventFlags::empty();
+        for &keycode in keys {
+            if let Some(flag) = Self::modifier_flag(keycode) {
+                flags |= flag;
+            }
+        }
+        flags
+    }
+
     /// Update tracked modifier flags based on an evdev keycode press/release.
     fn update_modifier_flags(&mut self, keycode: u32, pressed: bool) {
-        let Some(flag) = Self::modifier_flag(keycode) else {
+        if Self::modifier_flag(keycode).is_none() {
             return;
-        };
-        if pressed {
-            self.modifier_flags |= flag;
-        } else {
-            self.modifier_flags -= flag;
         }
+        if pressed {
+            self.modifier_keys_down.insert(keycode);
+        } else {
+            self.modifier_keys_down.remove(&keycode);
+        }
+        self.modifier_flags = Self::flags_for_modifier_keys(&self.modifier_keys_down);
     }
 
     fn event_source(&self) -> Result<CFRetained<CGEventSource>> {
@@ -330,9 +381,9 @@ impl MacOSInjector {
         }
     }
 
-    fn post_legacy_scroll(&self, dx: f64, dy: f64) {
-        let wheel1 = -(dy as i32);
-        let wheel2 = -(dx as i32);
+    fn post_legacy_scroll(&self, dx: i32, dy: i32) {
+        let wheel1 = -dy;
+        let wheel2 = -dx;
         let ret = unsafe { CGPostScrollWheelEvent(2, wheel1, wheel2) };
         if ret != 0 {
             debug!("CGPostScrollWheelEvent returned {}", ret);
@@ -405,21 +456,23 @@ impl InputInjector for MacOSInjector {
             Message::MouseScroll { dx, dy, phase } => {
                 use crate::net::protocol::ScrollPhase;
 
+                let dy_pixels = consume_scroll_pixels(&mut self.scroll_y_remainder, *dy);
+                let dx_pixels = consume_scroll_pixels(&mut self.scroll_x_remainder, *dx);
                 let source = self.event_source()?;
 
                 if self.post_mode == PostMode::LegacyQuartz {
-                    self.post_legacy_scroll(*dx, *dy);
+                    self.post_legacy_scroll(dx_pixels, dy_pixels);
                     return Ok(());
                 }
 
                 // Vertical scroll: pixel-based events without the continuous
                 // flag. This works in all apps including Firefox.
-                if *dy != 0.0 {
+                if dy_pixels != 0 {
                     let event = CGEvent::new_scroll_wheel_event2(
                         Some(&source),
                         CGScrollEventUnit::Pixel,
                         1,
-                        -*dy as i32,
+                        -dy_pixels,
                         0,
                         0,
                     )
@@ -429,13 +482,13 @@ impl InputInjector for MacOSInjector {
 
                 // Horizontal scroll: continuous trackpad events with phases.
                 // This is what triggers swipe-to-navigate in browsers/Finder.
-                if *dx != 0.0 || (*phase == ScrollPhase::Ended && *dy == 0.0) {
+                if dx_pixels != 0 || (*phase == ScrollPhase::Ended && dy_pixels == 0) {
                     let event = CGEvent::new_scroll_wheel_event2(
                         Some(&source),
                         CGScrollEventUnit::Pixel,
                         2,
                         0,
-                        -*dx as i32,
+                        -dx_pixels,
                         0,
                     )
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create scroll event"))?;
@@ -447,7 +500,7 @@ impl InputInjector for MacOSInjector {
                     CGEvent::set_integer_value_field(
                         Some(&event),
                         CGEventField::ScrollWheelEventPointDeltaAxis2,
-                        -*dx as i64,
+                        -i64::from(dx_pixels),
                     );
                     let cg_phase: i64 = match phase {
                         ScrollPhase::Began => 1,
@@ -514,8 +567,7 @@ impl InputInjector for MacOSInjector {
     }
 
     fn move_mouse(&mut self, x: i32, y: i32) -> Result<()> {
-        let sw = CGDisplayPixelsWide(MAIN_DISPLAY) as i32;
-        let sh = CGDisplayPixelsHigh(MAIN_DISPLAY) as i32;
+        let (sw, sh) = main_display_size_i32()?;
         let x = x.clamp(0, sw - 1) as f64;
         let y = y.clamp(0, sh - 1) as f64;
         // macOS requires drag event types when a button is held, otherwise
@@ -544,9 +596,60 @@ impl InputInjector for MacOSInjector {
     }
 
     fn screen_size(&self) -> Result<(u32, u32)> {
-        Ok((
-            CGDisplayPixelsWide(MAIN_DISPLAY) as u32,
-            CGDisplayPixelsHigh(MAIN_DISPLAY) as u32,
-        ))
+        main_display_size_u32()
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modifier_flags_preserve_same_logical_modifier_until_all_keys_released() {
+        let mut keys = HashSet::new();
+        keys.insert(EVDEV_KEY_LEFTSHIFT);
+        keys.insert(EVDEV_KEY_RIGHTSHIFT);
+        assert!(MacOSInjector::flags_for_modifier_keys(&keys).contains(CGEventFlags::MaskShift));
+
+        keys.remove(&EVDEV_KEY_LEFTSHIFT);
+        assert!(MacOSInjector::flags_for_modifier_keys(&keys).contains(CGEventFlags::MaskShift));
+
+        keys.remove(&EVDEV_KEY_RIGHTSHIFT);
+        assert!(!MacOSInjector::flags_for_modifier_keys(&keys).contains(CGEventFlags::MaskShift));
+    }
+
+    #[test]
+    fn scroll_pixel_consumption_preserves_fractional_deltas() {
+        let mut remainder = 0.0;
+        assert_eq!(consume_scroll_pixels(&mut remainder, 0.4), 0);
+        assert_eq!(consume_scroll_pixels(&mut remainder, 0.4), 0);
+        assert_eq!(consume_scroll_pixels(&mut remainder, 0.4), 1);
+        assert!((remainder - 0.2).abs() < 1e-12);
+        assert_eq!(consume_scroll_pixels(&mut remainder, -0.7), 0);
+        assert!((remainder + 0.5).abs() < 1e-12);
+        assert_eq!(consume_scroll_pixels(&mut remainder, -0.7), -1);
+        assert!((remainder + 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn scroll_pixel_consumption_ignores_non_finite_deltas() {
+        let mut remainder = 0.25;
+        assert_eq!(consume_scroll_pixels(&mut remainder, f64::INFINITY), 0);
+        assert_eq!(remainder, 0.25);
+    }
+
+    #[test]
+    fn scroll_pixel_consumption_caps_extreme_protocol_deltas() {
+        let mut remainder = 0.25;
+        assert_eq!(consume_scroll_pixels(&mut remainder, 10_000.0), 4096);
+        assert_eq!(remainder, 0.0);
+        assert_eq!(consume_scroll_pixels(&mut remainder, -10_000.0), -4096);
+        assert_eq!(remainder, 0.0);
+    }
+
+    #[test]
+    fn display_size_conversion_rejects_zero_and_too_large_values() {
+        assert!(i32::try_from(1u32).is_ok());
+        assert!(i32::try_from(u32::MAX).is_err());
     }
 }
