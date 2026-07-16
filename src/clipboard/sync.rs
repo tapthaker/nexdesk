@@ -143,7 +143,7 @@ fn read_text_from_command(
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", test))]
 fn write_text_to_command(mut command: std::process::Command, text: &str, name: &str) -> Result<()> {
     use std::io::{Read, Write};
     use std::process::Stdio;
@@ -212,6 +212,45 @@ fn write_text_to_command(mut command: std::process::Command, text: &str, name: &
     }
 }
 
+#[cfg(target_os = "linux")]
+fn write_text_to_daemonizing_command(
+    mut command: std::process::Command,
+    text: &str,
+    name: &str,
+) -> Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // wl-copy and xclip may fork a long-lived clipboard owner. Do not pipe
+    // stderr: the owner inherits that pipe, so waiting for EOF would block the
+    // clipboard receive task indefinitely and eventually stall QUIC traffic.
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| eyre!("{}: {}", name, e))?;
+
+    let write_result = match child.stdin.take() {
+        Some(mut stdin) => stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| eyre!("{} write: {}", name, e)),
+        None => Err(eyre!("{} stdin unavailable", name)),
+    };
+    if let Err(err) = write_result {
+        child.kill().ok();
+        child.wait().ok();
+        return Err(err);
+    }
+
+    let status = child.wait().map_err(|e| eyre!("{} wait: {}", name, e))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(eyre!("{} exited with {}", name, status))
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn read_clipboard() -> Result<String> {
     read_text_from_command(
@@ -248,17 +287,17 @@ fn read_clipboard() -> Result<String> {
 fn write_clipboard(text: &str) -> Result<()> {
     use std::process::Command;
 
-    // Try wl-copy first (Wayland), fall back to xclip (X11). Both commands
-    // consume stdin until EOF, so take/drop the pipe before waiting; otherwise
-    // failures can hang the clipboard sync task or be reported as success.
+    // Try wl-copy first (Wayland), fall back to xclip (X11). Both may fork a
+    // long-lived clipboard owner, so they must not inherit a stderr pipe that
+    // this process waits to reach EOF.
     let wl_copy = Command::new("wl-copy");
-    if write_text_to_command(wl_copy, text, "wl-copy").is_ok() {
+    if write_text_to_daemonizing_command(wl_copy, text, "wl-copy").is_ok() {
         return Ok(());
     }
 
     let mut xclip = Command::new("xclip");
     xclip.args(["-selection", "clipboard"]);
-    write_text_to_command(xclip, text, "xclip")
+    write_text_to_daemonizing_command(xclip, text, "xclip")
 }
 
 #[cfg(test)]
