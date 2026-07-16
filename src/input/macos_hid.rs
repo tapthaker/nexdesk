@@ -299,6 +299,10 @@ impl InputInjector for MacOSHidInjector {
     fn screen_size(&self) -> Result<(u32, u32)> {
         self.fallback.screen_size()
     }
+
+    fn set_cursor_visible(&mut self, visible: bool) -> Result<()> {
+        self.fallback.set_cursor_visible(visible)
+    }
 }
 
 #[cfg(target_os = "macos")]

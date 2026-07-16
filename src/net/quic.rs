@@ -1508,6 +1508,9 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 }
                             }
                             ClientOutput::Activate => {
+                                if let Err(e) = injector.set_cursor_visible(true) {
+                                    warn!("Failed to show cursor on remote activation: {}", e);
+                                }
                                 info!("Server sharing mouse");
                                 activation_started = Some(Instant::now());
                                 activation_input_messages = 0;
@@ -1548,6 +1551,9 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 // this transition has become inactive.
                                 release_injected_inputs(&mut *injector, &mut injected_keys, &mut injected_buttons);
                                 release_defensive_keyups(&mut *injector);
+                                if let Err(e) = injector.set_cursor_visible(false) {
+                                    warn!("Failed to hide cursor after switching back: {}", e);
+                                }
                                 info!("Edge on client: {:?} — requesting switch back", direction);
                                 let switch_msg = Message::SwitchScreen { direction };
                                 send_message(&mut control_send, &switch_msg).await.ok();
@@ -1696,6 +1702,9 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     // before key-up/button-up events were processed (for example during display sleep).
     release_injected_inputs(&mut *injector, &mut injected_keys, &mut injected_buttons);
     release_defensive_keyups(&mut *injector);
+    if let Err(e) = injector.set_cursor_visible(true) {
+        warn!("Failed to restore cursor after disconnect: {}", e);
+    }
 
     // Signal clipboard tasks to shut down
     shutdown_tx.send(true).ok();

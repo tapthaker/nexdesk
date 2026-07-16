@@ -37,6 +37,8 @@ const MAX_SCROLL_PIXELS_PER_MESSAGE: i32 = 4096;
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGWarpMouseCursorPosition(new_cursor_position: CGPoint) -> i32;
+    fn CGDisplayHideCursor(display: CGDirectDisplayID) -> i32;
+    fn CGDisplayShowCursor(display: CGDirectDisplayID) -> i32;
     fn CGPostMouseEvent(
         mouse_cursor_position: CGPoint,
         update_mouse_cursor_position: c_int,
@@ -214,6 +216,8 @@ pub struct MacOSInjector {
     scroll_x_remainder: f64,
     /// Fractional scroll pixels retained until they accumulate to an integer.
     scroll_y_remainder: f64,
+    /// Tracks CoreGraphics' balanced cursor hide/show calls.
+    cursor_hidden: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -262,6 +266,7 @@ impl MacOSInjector {
             post_mode,
             scroll_x_remainder: 0.0,
             scroll_y_remainder: 0.0,
+            cursor_hidden: false,
         })
     }
 
@@ -394,6 +399,16 @@ impl MacOSInjector {
         let ret = unsafe { CGPostKeyboardEvent(0, mac_keycode, if pressed { 1 } else { 0 }) };
         if ret != 0 {
             debug!("CGPostKeyboardEvent returned {}", ret);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacOSInjector {
+    fn drop(&mut self) {
+        if self.cursor_hidden {
+            unsafe { CGDisplayShowCursor(MAIN_DISPLAY) };
+            self.cursor_hidden = false;
         }
     }
 }
@@ -597,6 +612,28 @@ impl InputInjector for MacOSInjector {
 
     fn screen_size(&self) -> Result<(u32, u32)> {
         main_display_size_u32()
+    }
+
+    fn set_cursor_visible(&mut self, visible: bool) -> Result<()> {
+        if visible != self.cursor_hidden {
+            return Ok(());
+        }
+        let status = unsafe {
+            if visible {
+                CGDisplayShowCursor(MAIN_DISPLAY)
+            } else {
+                CGDisplayHideCursor(MAIN_DISPLAY)
+            }
+        };
+        if status != 0 {
+            return Err(color_eyre::eyre::eyre!(
+                "Failed to {} macOS cursor: status {}",
+                if visible { "show" } else { "hide" },
+                status
+            ));
+        }
+        self.cursor_hidden = !visible;
+        Ok(())
     }
 }
 

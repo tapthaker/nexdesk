@@ -12,6 +12,11 @@ pub trait InputInjector: Send {
 
     /// Get the screen dimensions.
     fn screen_size(&self) -> Result<(u32, u32)>;
+
+    /// Show or hide the local pointer while control is on another screen.
+    fn set_cursor_visible(&mut self, _visible: bool) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Create a platform-appropriate input injector.
