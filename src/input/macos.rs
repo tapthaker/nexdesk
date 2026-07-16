@@ -198,6 +198,8 @@ fn consume_scroll_pixels(remainder: &mut f64, delta: f64) -> i32 {
 pub struct MacOSInjector {
     /// Currently pressed modifier keycodes used to derive synthesized flags.
     modifier_keys_down: HashSet<u32>,
+    /// Non-modifier keys currently held, used to mark repeated key-downs.
+    keys_down: HashSet<u32>,
     /// Tracked modifier flags for synthesized key events
     modifier_flags: CGEventFlags,
     /// Bitmask of currently pressed mouse buttons (bit 0=left, 1=right, 2=middle)
@@ -257,6 +259,7 @@ impl MacOSInjector {
 
         Ok(Self {
             modifier_keys_down: HashSet::new(),
+            keys_down: HashSet::new(),
             modifier_flags: CGEventFlags::empty(),
             buttons_down: 0,
             last_click: None,
@@ -571,9 +574,20 @@ impl InputInjector for MacOSInjector {
                     return Ok(());
                 }
 
+                let is_repeat = if *pressed {
+                    !self.keys_down.insert(*keycode)
+                } else {
+                    self.keys_down.remove(keycode);
+                    false
+                };
                 let event = CGEvent::new_keyboard_event(Some(&source), mac_keycode, *pressed)
                     .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create key event"))?;
                 CGEvent::set_flags(Some(&event), self.modifier_flags);
+                if is_repeat {
+                    // kCGKeyboardEventAutorepeat. Apps still receive an ordinary
+                    // key-down, while frameworks can identify it as a repeat.
+                    CGEvent::set_integer_value_field(Some(&event), CGEventField(8), 1);
+                }
                 self.post_event(&event);
             }
             _ => {}

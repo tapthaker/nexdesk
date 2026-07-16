@@ -39,10 +39,10 @@ fn clamp_with_inset(value: i32, len: i32) -> i32 {
     }
 }
 
-// Do not synthesize keyboard repeat in nexdesk. The client OS will repeat
-// naturally after a forwarded key-down. Synthesizing repeat here is dangerous:
-// if the Linux capturer misses a key-up during a switch-back/grab transition,
-// the stale pressed key becomes an endless stream of key-downs on the client.
+// Do not synthesize keyboard repeat in the transition state. Capture backends
+// forward source-generated repeat events, preserving the configured delay/rate.
+// A timer here would risk endless repeats if a key-up were missed during a
+// switch-back or grab transition.
 
 // Evdev keycodes for the safety escape combo (Ctrl+Alt+Escape)
 const KEY_ESC: u32 = 1;
@@ -212,7 +212,7 @@ impl ServerTransition {
     }
 
     fn push_key_events(&mut self, key_events: Vec<Message>, messages: &mut Vec<Message>) {
-        // No synthetic repeats. Forward only real press/release transitions.
+        // Forward real press, release, and source-generated repeat key-downs.
         messages.extend(key_events);
     }
 
@@ -378,7 +378,7 @@ impl ServerTransition {
                 self.last_buttons = buttons;
             }
 
-            // Keyboard events: forward originals and synthesize repeats.
+            // Forward keyboard events, including source-generated repeats.
             self.push_key_events(key_events, &mut messages);
 
             ServerOutput::Forward { messages }
@@ -1372,7 +1372,7 @@ mod tests {
         st.poll(1919, 500, 1920, 1080, 0, key);
 
         // Holding the key without new physical events must not generate more
-        // key-down messages. The client OS handles natural key repeat.
+        // key-down messages. Source-generated repeats are forwarded separately.
         for _ in 0..500 {
             let out = st.poll(1919, 500, 1920, 1080, 0, vec![]);
             if let ServerOutput::Forward { messages } = out {

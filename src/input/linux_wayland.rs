@@ -161,20 +161,86 @@ fn protocol_keycode(code: u32) -> Option<u32> {
     (code <= MAX_KEYCODE).then_some(code)
 }
 
-fn update_protocol_key_state(pressed_keys: &mut HashSet<u32>, code: u32, pressed: bool) {
+fn record_key_event(
+    pressed_keys: &mut HashSet<u32>,
+    pending: &mut Vec<Message>,
+    code: u32,
+    value: i32,
+) {
     let Some(keycode) = protocol_keycode(code) else {
         return;
     };
-    if pressed {
-        pressed_keys.insert(keycode);
-    } else {
-        pressed_keys.remove(&keycode);
+
+    match value {
+        0 => {
+            pressed_keys.remove(&keycode);
+            pending.push(Message::KeyEvent {
+                keycode,
+                pressed: false,
+                modifiers: 0,
+            });
+        }
+        1 => {
+            pressed_keys.insert(keycode);
+            pending.push(Message::KeyEvent {
+                keycode,
+                pressed: true,
+                modifiers: 0,
+            });
+        }
+        // Linux emits EV_KEY value 2 using the source machine's configured
+        // repeat delay/rate. Forward it as another key-down; synthetic macOS
+        // events do not start native key repeat from the initial key-down.
+        2 if pressed_keys.contains(&keycode) => pending.push(Message::KeyEvent {
+            keycode,
+            pressed: true,
+            modifiers: 0,
+        }),
+        _ => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evdev_key_repeats_preserve_order_and_held_state() {
+        let mut pressed = HashSet::new();
+        let mut events = Vec::new();
+
+        record_key_event(&mut pressed, &mut events, 30, 1);
+        record_key_event(&mut pressed, &mut events, 30, 2);
+        record_key_event(&mut pressed, &mut events, 30, 0);
+        record_key_event(&mut pressed, &mut events, 30, 2);
+
+        assert!(!pressed.contains(&30));
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[0],
+            Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[1],
+            Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[2],
+            Message::KeyEvent {
+                keycode: 30,
+                pressed: false,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn cursor_add_saturates() {
@@ -302,6 +368,7 @@ pub struct WaylandCapturer {
     screen_width: u32,
     screen_height: u32,
     pressed_keys: HashSet<u32>,
+    pending_key_events: Vec<Message>,
     buttons: u8,
     /// Accumulated scroll deltas (pixels) since last poll
     scroll_acc_x: f64,
@@ -363,6 +430,7 @@ impl WaylandCapturer {
             screen_width,
             screen_height,
             pressed_keys: HashSet::new(),
+            pending_key_events: Vec::new(),
             buttons: 0,
             scroll_acc_x: 0.0,
             scroll_acc_y: 0.0,
@@ -562,10 +630,11 @@ impl WaylandCapturer {
                                             // Keyboard key tracking. Keep only protocol-supported
                                             // keycodes in long-lived state so device-specific or
                                             // pointer-only evdev codes cannot accumulate forever.
-                                            update_protocol_key_state(
+                                            record_key_event(
                                                 &mut self.pressed_keys,
+                                                &mut self.pending_key_events,
                                                 code,
-                                                pressed,
+                                                event.value(),
                                             );
                                         }
                                     }
@@ -597,8 +666,12 @@ impl WaylandCapturer {
                             got_any = true;
                             if let InputEventKind::Key(key) = event.kind() {
                                 let code = key.code() as u32;
-                                let pressed = event.value() != 0;
-                                update_protocol_key_state(&mut self.pressed_keys, code, pressed);
+                                record_key_event(
+                                    &mut self.pressed_keys,
+                                    &mut self.pending_key_events,
+                                    code,
+                                    event.value(),
+                                );
                             }
                         }
                         if !got_any {
@@ -709,38 +782,9 @@ impl InputCapture for WaylandCapturer {
     }
 
     fn poll_key_events(&mut self) -> Result<Vec<Message>> {
-        // Drain all pending events first — this updates cursor position, buttons, keys, and scroll
-        let old_keys: HashSet<u32> = self.pressed_keys.clone();
+        // Preserve the kernel event order, including EV_KEY value 2 repeats.
         self.drain_events();
-
-        // Compute key state changes
-        let mut events = Vec::new();
-        for &code in &self.pressed_keys {
-            if !old_keys.contains(&code) {
-                let Some(keycode) = protocol_keycode(code) else {
-                    debug!("Ignoring unsupported evdev keycode: {}", code);
-                    continue;
-                };
-                events.push(Message::KeyEvent {
-                    keycode,
-                    pressed: true,
-                    modifiers: 0,
-                });
-            }
-        }
-        for &code in &old_keys {
-            if !self.pressed_keys.contains(&code) {
-                let Some(keycode) = protocol_keycode(code) else {
-                    debug!("Ignoring unsupported evdev keycode release: {}", code);
-                    continue;
-                };
-                events.push(Message::KeyEvent {
-                    keycode,
-                    pressed: false,
-                    modifiers: 0,
-                });
-            }
-        }
+        let mut events = std::mem::take(&mut self.pending_key_events);
 
         // Emit accumulated scroll events (discrete mouse wheel — no phase)
         let sx = self.scroll_acc_x;
