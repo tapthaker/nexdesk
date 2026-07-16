@@ -542,6 +542,11 @@ async fn handle_server_connection(
     let input_send = Arc::new(Mutex::new(input_send));
     debug!("Input stream opened and marker sent");
 
+    // Keep framed reads in a dedicated task. recv_message() uses read_exact(),
+    // which must not be cancelled by the 2ms input polling branch below after
+    // it has consumed part of a frame.
+    let mut control_messages = spawn_message_reader(control_recv);
+
     // Shutdown signal for background tasks tied to this server connection.
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
@@ -988,8 +993,8 @@ async fn handle_server_connection(
                 }
             }
             // Branch: Control stream messages
-            msg = recv_message(&mut control_recv) => {
-                match msg {
+            msg = control_messages.recv() => {
+                match msg.unwrap_or(Ok(None)) {
                     Ok(Some(Message::Heartbeat { timestamp })) => {
                         let ack = Message::HeartbeatAck { timestamp };
                         send_message(&mut control_send, &ack).await?;
@@ -1312,6 +1317,7 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     }
 
     let mut transition = ClientTransition::new(my_w, my_h);
+    let mut control_messages = spawn_message_reader(control_recv);
 
     // Shutdown signal for background tasks
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
@@ -1447,6 +1453,7 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     // Read and discard the stream-ready marker
     let _marker = recv_message_uni(&mut input_recv).await?;
     debug!("Input stream accepted");
+    let mut input_messages = spawn_message_reader(input_recv);
 
     let mut last_screen_w = my_w;
     let mut last_screen_h = my_h;
@@ -1464,8 +1471,8 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
 
     loop {
         tokio::select! {
-            msg = recv_message_uni(&mut input_recv) => {
-                match msg {
+            msg = input_messages.recv() => {
+                match msg.unwrap_or(Ok(None)) {
                     Ok(Some(message)) => {
                         if activation_started.is_some() {
                             activation_input_messages += 1;
@@ -1570,8 +1577,8 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                     }
                 }
             }
-            msg = recv_message(&mut control_recv) => {
-                match msg {
+            msg = control_messages.recv() => {
+                match msg.unwrap_or(Ok(None)) {
                     Ok(Some(Message::Heartbeat { timestamp })) => {
                         let ack = Message::HeartbeatAck { timestamp };
                         if let Err(e) = send_message(&mut control_send, &ack).await {
@@ -2110,6 +2117,27 @@ async fn recv_message(recv: &mut RecvStream) -> Result<Option<Message>> {
 
 async fn recv_message_uni(recv: &mut quinn::RecvStream) -> Result<Option<Message>> {
     recv_message(recv).await
+}
+
+/// Read framed messages without exposing `read_exact` to cancellation from a
+/// surrounding `tokio::select!`. Cancelling a partially completed framed read
+/// consumes stream bytes and causes subsequent reads to lose frame alignment.
+fn spawn_message_reader(
+    mut recv: RecvStream,
+) -> tokio::sync::mpsc::Receiver<Result<Option<Message>>> {
+    // Keep the channel bounded so an abusive peer cannot queue messages without
+    // applying QUIC stream backpressure.
+    let (send, receive) = tokio::sync::mpsc::channel(32);
+    tokio::spawn(async move {
+        loop {
+            let result = recv_message(&mut recv).await;
+            let finished = !matches!(result, Ok(Some(_)));
+            if send.send(result).await.is_err() || finished {
+                break;
+            }
+        }
+    });
+    receive
 }
 
 #[cfg(test)]
