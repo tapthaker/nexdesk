@@ -282,55 +282,42 @@ pub async fn check_latest_version() -> Result<String> {
     Ok(tag.to_string())
 }
 
-/// Periodically checks for new releases and self-updates. Exits the process
-/// on successful update so the service manager (LaunchAgent/systemd) restarts
-/// with the new binary.
+/// Periodically checks for new releases and self-updates. The first check runs
+/// immediately so a restarted or manually installed stale daemon does not wait
+/// 30 minutes. A successful update exits so the service manager restarts the
+/// new binary.
 pub async fn update_check_loop() {
     use crate::net::protocol::BUILD_VERSION;
     use std::time::Duration;
 
-    // Skip update checks for dev builds
     if !is_release_version(BUILD_VERSION) {
         info!("Dev build ({}), skipping update checks", BUILD_VERSION);
         return;
     }
 
-    let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
-    interval.tick().await; // skip the immediate first tick
-
     loop {
-        interval.tick().await;
-
-        let latest = match check_latest_version().await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("Update check failed: {}", e);
-                continue;
+        match check_latest_version().await {
+            Ok(latest) if latest == BUILD_VERSION => {
+                info!("Up to date ({})", BUILD_VERSION);
             }
-        };
-
-        if latest == BUILD_VERSION {
-            info!("Up to date ({})", BUILD_VERSION);
-            continue;
+            Ok(latest) if is_release_version(&latest) && is_newer(&latest, BUILD_VERSION) => {
+                info!(
+                    "New version available: {} (current: {})",
+                    latest, BUILD_VERSION
+                );
+                match self_update(&latest).await {
+                    Ok(()) => {
+                        info!("Updated to {}. Exiting for restart...", latest);
+                        std::process::exit(0);
+                    }
+                    Err(e) => warn!("Self-update to {} failed: {}", latest, e),
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!("Update check failed: {}", e),
         }
 
-        if !is_release_version(&latest) || !is_newer(&latest, BUILD_VERSION) {
-            continue;
-        }
-
-        info!(
-            "New version available: {} (current: {})",
-            latest, BUILD_VERSION
-        );
-        match self_update(&latest).await {
-            Ok(()) => {
-                info!("Updated to {}. Exiting for restart...", latest);
-                std::process::exit(0);
-            }
-            Err(e) => {
-                warn!("Self-update to {} failed: {}", latest, e);
-            }
-        }
+        tokio::time::sleep(Duration::from_secs(30 * 60)).await;
     }
 }
 

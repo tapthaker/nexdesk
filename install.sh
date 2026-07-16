@@ -113,6 +113,25 @@ mv -f "$TMPFILE" "$BINARY"
 trap - EXIT HUP INT TERM
 printf '%sDownloaded%s %s-> %s%s\n' "$GREEN" "$NC" "$DIM" "$BINARY" "$NC"
 
+# If an existing background service is running, restart it so it does not keep
+# executing the unlinked pre-update binary. Initial installations are skipped.
+case "$OS" in
+  linux)
+    if command -v systemctl >/dev/null 2>&1 && \
+       systemctl --user is-active --quiet nexdesk.service 2>/dev/null; then
+      systemctl --user restart nexdesk.service
+      printf '%sRestarted%s nexdesk user service\n' "$GREEN" "$NC"
+    fi
+    ;;
+  darwin)
+    SERVICE="gui/$(id -u)/com.nexdesk.agent"
+    if launchctl print "$SERVICE" >/dev/null 2>&1; then
+      launchctl kickstart -k "$SERVICE"
+      printf '%sRestarted%s nexdesk LaunchAgent\n' "$GREEN" "$NC"
+    fi
+    ;;
+esac
+
 # ============================================
 # PATH Configuration
 # ============================================

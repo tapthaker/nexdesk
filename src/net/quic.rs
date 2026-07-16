@@ -28,11 +28,11 @@ const CLIENT_LATENCY_RESTART_STRIKES: u8 = 3;
 const MAX_CONCURRENT_FILE_TRANSFERS: usize = 2;
 const MAX_CONNECT_ADDR_BYTES: usize = 512;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 static WAKE_DISPLAY_IN_FLIGHT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn mark_wake_display_in_flight(flag: &std::sync::atomic::AtomicBool) -> bool {
     !flag.swap(true, std::sync::atomic::Ordering::AcqRel)
 }
@@ -93,7 +93,7 @@ fn track_injected_input(
 }
 
 fn request_wake_display() {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use std::sync::atomic::Ordering;
 
@@ -329,6 +329,7 @@ fn validate_listen_port(port: u16) -> Result<()> {
 /// Run a QUIC server that captures local mouse and sends events to clients.
 pub async fn serve(port: u16, trigger_edge: Option<crate::net::protocol::Direction>) -> Result<()> {
     validate_listen_port(port)?;
+    let _idle_sleep_inhibitor = crate::input::wake::inhibit_idle_system_sleep();
     let server_config = tls::server_config()?;
     let (endpoint, addr) = make_server_endpoint(server_config, port)?;
 
@@ -1122,6 +1123,7 @@ fn explicit_connect_addr_arg(addr: Option<&str>) -> Result<Option<String>> {
 /// Automatically reconnects with exponential backoff on disconnection.
 pub async fn connect(addr: Option<&str>) -> Result<()> {
     let explicit_addr = explicit_connect_addr_arg(addr)?;
+    let _idle_sleep_inhibitor = crate::input::wake::inhibit_idle_system_sleep();
 
     loop {
         let target_addr = match explicit_addr.as_deref() {
