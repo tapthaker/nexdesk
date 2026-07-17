@@ -90,6 +90,8 @@ pub enum Message {
     SwitchScreen {
         direction: Direction,
     },
+    /// The server reclaimed local control (for example because it locked).
+    ReleaseScreen,
 
     // Phase 4a: Keyboard
     KeyEvent {
@@ -140,7 +142,7 @@ pub enum Message {
 }
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Build version string burned in at compile time (e.g. "v0.1.2" or "v0.1.2-3-gabcdef").
 pub const BUILD_VERSION: &str = env!("NEXDESK_VERSION");
@@ -226,6 +228,7 @@ pub fn message_summary(msg: &Message) -> String {
         Message::MouseButton { .. } => "MouseButton".to_string(),
         Message::MouseScroll { .. } => "MouseScroll".to_string(),
         Message::SwitchScreen { .. } => "SwitchScreen".to_string(),
+        Message::ReleaseScreen => "ReleaseScreen".to_string(),
         Message::KeyEvent { .. } => "KeyEvent".to_string(),
         Message::ScreenResize { .. } => "ScreenResize".to_string(),
         Message::ClipboardUpdate {

@@ -411,6 +411,16 @@ impl ServerTransition {
         self.edge_cooldown = SERVER_EDGE_COOLDOWN;
         self.release_pressed_keys()
     }
+
+    /// Reclaim control on the server and explicitly reset the client's active
+    /// screen state. Used when local safety takes priority over remote input.
+    pub fn reset_to_local(&mut self) -> Vec<Message> {
+        self.active = false;
+        self.edge_cooldown = SERVER_EDGE_COOLDOWN;
+        let mut messages = vec![Message::ReleaseScreen];
+        messages.extend(self.release_pressed_keys());
+        messages
+    }
 }
 
 // --- Client Transition ---
@@ -428,6 +438,7 @@ fn opposite(dir: Direction) -> Direction {
 pub enum ClientOutput {
     Ignore,
     Activate,
+    Deactivate,
     InjectMove {
         x: i32,
         y: i32,
@@ -485,6 +496,13 @@ impl ClientTransition {
                 self.edge_dwell = 0;
                 self.switch_back_edge = Some(opposite(direction));
                 ClientOutput::Activate
+            }
+            Message::ReleaseScreen => {
+                self.active = false;
+                self.first_move = false;
+                self.edge_dwell = 0;
+                self.switch_back_edge = None;
+                ClientOutput::Deactivate
             }
             Message::MouseMove { x, y } if self.active => {
                 if self.first_move {
@@ -1032,6 +1050,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn server_reset_to_local_deactivates_and_notifies_client() {
+        let mut st = ServerTransition::new(
+            Some(Direction::Right),
+            ScreenLayout {
+                width: 1920,
+                height: 1080,
+            },
+        );
+        activate_server(&mut st);
+        st.update_key(KEY_LEFTCTRL, true);
+
+        let messages = st.reset_to_local();
+
+        assert!(!st.is_active());
+        assert!(matches!(messages.first(), Some(Message::ReleaseScreen)));
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            Message::KeyEvent {
+                keycode: KEY_LEFTCTRL,
+                pressed: false,
+                ..
+            }
+        )));
+    }
+
     // ===== Client Tests =====
 
     #[test]
@@ -1048,6 +1092,20 @@ mod tests {
             direction: Direction::Right,
         });
         assert!(matches!(out, ClientOutput::Activate));
+    }
+
+    #[test]
+    fn client_release_screen_deactivates_remote_control() {
+        let mut ct = ClientTransition::new(1920, 1080);
+        ct.handle(Message::SwitchScreen {
+            direction: Direction::Right,
+        });
+
+        let out = ct.handle(Message::ReleaseScreen);
+
+        assert!(matches!(out, ClientOutput::Deactivate));
+        assert!(!ct.active);
+        assert_eq!(ct.switch_back_edge, None);
     }
 
     #[test]

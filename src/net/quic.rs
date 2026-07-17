@@ -1045,14 +1045,13 @@ async fn handle_server_connection(
             }
             _ = local_lock_check.tick(), if transition.is_active() => {
                 if crate::input::session::is_session_locked() {
-                    warn!("Local session locked while sharing — releasing remote control so Linux can be unlocked locally");
-                    let messages = transition.deactivate_for_shortcut();
-                    if !messages.is_empty() {
-                        let mut sender = input_send.lock().await;
-                        for msg in messages {
-                            send_message_uni(&mut sender, &msg).await.ok();
-                        }
-                    }
+                    warn!("Linux session locked while sharing — switching control back to the server");
+                    let messages = transition.reset_to_local();
+
+                    // Local recovery must happen before any network await. If the
+                    // sleeping/locked peer has stopped reading QUIC, notifying it
+                    // can block, but the Linux keyboard must already be available
+                    // for password entry.
                     if use_layer_shell {
                         #[cfg(target_os = "linux")]
                         if let Some(ref tx) = capture_tx {
@@ -1063,6 +1062,12 @@ async fn handle_server_connection(
                         layer_shell_keyboard_grabbed = false;
                     } else {
                         lock_recover(&capturer, "input capturer").set_grab(false).ok();
+                    }
+                    request_wake_display();
+
+                    let mut sender = input_send.lock().await;
+                    for msg in messages {
+                        send_message_uni(&mut sender, &msg).await.ok();
                     }
                 }
             }
@@ -1519,6 +1524,15 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 activation_inject_moves = 0;
                                 activation_first_inject_logged = false;
                                 request_wake_display();
+                            }
+                            ClientOutput::Deactivate => {
+                                release_injected_inputs(&mut *injector, &mut injected_keys, &mut injected_buttons);
+                                release_defensive_keyups(&mut *injector);
+                                if let Err(e) = injector.set_cursor_visible(false) {
+                                    warn!("Failed to hide cursor after server reclaimed control: {}", e);
+                                }
+                                activation_started = None;
+                                info!("Server reclaimed control");
                             }
                             ClientOutput::InjectMove { x, y } => {
                                 activation_inject_moves += 1;

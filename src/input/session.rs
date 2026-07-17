@@ -3,7 +3,41 @@
 //! locks while the pointer is on a macOS client).
 
 #[cfg(target_os = "linux")]
-const MAX_LOGINCTL_OUTPUT_BYTES: usize = crate::status::MAX_COMMAND_OUTPUT_DISPLAY_BYTES;
+const MAX_SESSION_QUERY_OUTPUT_BYTES: usize = crate::status::MAX_COMMAND_OUTPUT_DISPLAY_BYTES;
+
+#[cfg(target_os = "linux")]
+const SCREEN_SAVER_LOCK_CALLS: &[(&str, &str, &str)] = &[
+    (
+        "org.freedesktop.ScreenSaver",
+        "/org/freedesktop/ScreenSaver",
+        "org.freedesktop.ScreenSaver.GetActive",
+    ),
+    (
+        "org.freedesktop.ScreenSaver",
+        "/ScreenSaver",
+        "org.freedesktop.ScreenSaver.GetActive",
+    ),
+    (
+        "org.gnome.ScreenSaver",
+        "/org/gnome/ScreenSaver",
+        "org.gnome.ScreenSaver.GetActive",
+    ),
+    (
+        "org.cinnamon.ScreenSaver",
+        "/org/cinnamon/ScreenSaver",
+        "org.cinnamon.ScreenSaver.GetActive",
+    ),
+    (
+        "org.mate.ScreenSaver",
+        "/org/mate/ScreenSaver",
+        "org.mate.ScreenSaver.GetActive",
+    ),
+    (
+        "org.xfce.ScreenSaver",
+        "/org/xfce/ScreenSaver",
+        "org.xfce.ScreenSaver.GetActive",
+    ),
+];
 
 #[cfg(any(target_os = "linux", test))]
 fn command_stdout_limited(
@@ -98,12 +132,14 @@ fn linux_session_locked() -> bool {
     let uid = unsafe { libc::geteuid() }.to_string();
     let mut command = std::process::Command::new("loginctl");
     command.args(["list-sessions", "--no-legend"]);
-    let Some(stdout) =
-        command_stdout_limited(command, "loginctl list-sessions", MAX_LOGINCTL_OUTPUT_BYTES)
-    else {
-        return false;
+    let Some(stdout) = command_stdout_limited(
+        command,
+        "loginctl list-sessions",
+        MAX_SESSION_QUERY_OUTPUT_BYTES,
+    ) else {
+        return screen_saver_locked();
     };
-    stdout.lines().any(|line| {
+    let logind_locked = stdout.lines().any(|line| {
         let mut parts = line.split_whitespace();
         let Some(session_id) = parts.next() else {
             return false;
@@ -112,7 +148,9 @@ fn linux_session_locked() -> bool {
             return false;
         };
         session_uid == uid && session_locked_hint(session_id).unwrap_or(false)
-    })
+    });
+
+    logind_locked || screen_saver_locked()
 }
 
 #[cfg(target_os = "linux")]
@@ -122,10 +160,54 @@ fn session_locked_hint(session_id: &str) -> Option<bool> {
     }
     let mut command = std::process::Command::new("loginctl");
     command.args(["show-session", session_id, "-p", "LockedHint", "--value"]);
-    let stdout =
-        command_stdout_limited(command, "loginctl show-session", MAX_LOGINCTL_OUTPUT_BYTES)?;
+    let stdout = command_stdout_limited(
+        command,
+        "loginctl show-session",
+        MAX_SESSION_QUERY_OUTPUT_BYTES,
+    )?;
 
     Some(stdout.trim() == "yes")
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_dbus_boolean(output: &str) -> Option<bool> {
+    let mut values = output
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .filter_map(|word| match word {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        });
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+#[cfg(target_os = "linux")]
+fn screen_saver_locked() -> bool {
+    // Some desktop environments do not keep logind's LockedHint in sync. Query
+    // their screen-saver service as a fallback. Each D-Bus reply is bounded and
+    // has a short timeout so lock recovery cannot stall the input loop.
+    SCREEN_SAVER_LOCK_CALLS
+        .iter()
+        .any(|(destination, path, method)| {
+            let destination = format!("--dest={destination}");
+            let mut command = std::process::Command::new("dbus-send");
+            command.args([
+                "--session",
+                "--print-reply=literal",
+                "--reply-timeout=200",
+                &destination,
+                path,
+                method,
+            ]);
+            command_stdout_limited(
+                command,
+                "screen-saver GetActive",
+                MAX_SESSION_QUERY_OUTPUT_BYTES,
+            )
+            .and_then(|output| parse_dbus_boolean(&output))
+            .unwrap_or(false)
+        })
 }
 
 #[cfg(test)]
@@ -141,6 +223,15 @@ mod tests {
         assert!(!valid_loginctl_session_id("two words"));
         assert!(!valid_loginctl_session_id("bad\nvalue"));
         assert!(!valid_loginctl_session_id(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn dbus_boolean_parser_accepts_supported_reply_formats() {
+        assert_eq!(parse_dbus_boolean("   boolean true\n"), Some(true));
+        assert_eq!(parse_dbus_boolean("(false,)"), Some(false));
+        assert_eq!(parse_dbus_boolean("method return true"), Some(true));
+        assert_eq!(parse_dbus_boolean("true false"), None);
+        assert_eq!(parse_dbus_boolean("not-a-boolean"), None);
     }
 
     #[cfg(unix)]

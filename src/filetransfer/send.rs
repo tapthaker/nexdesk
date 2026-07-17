@@ -116,6 +116,7 @@ fn offer_response_summary(msg: &Message) -> String {
         Message::MouseButton { .. } => "MouseButton".to_string(),
         Message::MouseScroll { .. } => "MouseScroll".to_string(),
         Message::SwitchScreen { .. } => "SwitchScreen".to_string(),
+        Message::ReleaseScreen => "ReleaseScreen".to_string(),
         Message::KeyEvent { .. } => "KeyEvent".to_string(),
         Message::ScreenResize { .. } => "ScreenResize".to_string(),
         Message::WakeDisplay => "WakeDisplay".to_string(),
