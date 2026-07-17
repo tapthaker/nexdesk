@@ -28,6 +28,20 @@ const CLIENT_LATENCY_RESTART_STRIKES: u8 = 3;
 const MAX_CONCURRENT_FILE_TRANSFERS: usize = 2;
 const MAX_CONNECT_ADDR_BYTES: usize = 512;
 
+// Only modifiers are safe to release defensively. Synthesizing an orphaned
+// key-up for an ordinary key such as Space can trigger application behavior
+// (for example, pausing a focused YouTube player) during a screen transition.
+const DEFENSIVE_MODIFIER_KEYS: &[u32] = &[
+    29,  // KEY_LEFTCTRL
+    42,  // KEY_LEFTSHIFT
+    54,  // KEY_RIGHTSHIFT
+    56,  // KEY_LEFTALT
+    97,  // KEY_RIGHTCTRL
+    100, // KEY_RIGHTALT
+    125, // KEY_LEFTMETA
+    126, // KEY_RIGHTMETA
+];
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 static WAKE_DISPLAY_IN_FLIGHT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -139,16 +153,25 @@ fn lock_recover<'a, T>(
     }
 }
 
+fn cleanup_keycodes(injected_keys: &HashSet<u32>) -> Vec<u32> {
+    let mut keys: Vec<u32> = injected_keys
+        .iter()
+        .copied()
+        .chain(DEFENSIVE_MODIFIER_KEYS.iter().copied())
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
 fn release_injected_inputs(
     injector: &mut dyn InputInjector,
     injected_keys: &mut HashSet<u32>,
     injected_buttons: &mut HashSet<u8>,
 ) {
-    if injected_keys.is_empty() && injected_buttons.is_empty() {
-        return;
+    if !injected_keys.is_empty() || !injected_buttons.is_empty() {
+        request_wake_display();
     }
-
-    request_wake_display();
 
     let mut buttons: Vec<u8> = injected_buttons.iter().copied().collect();
     buttons.sort_unstable();
@@ -164,30 +187,10 @@ fn release_injected_inputs(
         }
     }
 
-    // Always include modifiers in cleanup. These are the keys users notice as
-    // "sticky" most often, and relying only on tracked key-downs is brittle if
-    // the disconnect/switch-back races with the last key event.
-    const MODIFIER_KEYS: &[u32] = &[
-        29,  // KEY_LEFTCTRL
-        42,  // KEY_LEFTSHIFT
-        54,  // KEY_RIGHTSHIFT
-        56,  // KEY_LEFTALT
-        58,  // KEY_CAPSLOCK
-        97,  // KEY_RIGHTCTRL
-        100, // KEY_RIGHTALT
-        125, // KEY_LEFTMETA
-        126, // KEY_RIGHTMETA
-    ];
-
-    let mut keys: Vec<u32> = injected_keys
-        .iter()
-        .copied()
-        .chain(MODIFIER_KEYS.iter().copied())
-        .collect();
-    keys.sort_unstable();
-    keys.dedup();
-
-    for keycode in keys {
+    // Include modifiers defensively because a missed modifier release is very
+    // disruptive. Ordinary keys are released only when their key-down was
+    // tracked; orphaned ordinary key-ups are observable by some applications.
+    for keycode in cleanup_keycodes(injected_keys) {
         let msg = Message::KeyEvent {
             keycode,
             pressed: false,
@@ -197,26 +200,6 @@ fn release_injected_inputs(
             warn!("Failed to release injected key {}: {}", keycode, e);
         }
         injected_keys.remove(&keycode);
-    }
-}
-
-fn release_defensive_keyups(injector: &mut dyn InputInjector) {
-    // Last-resort cleanup for cases where our bookkeeping missed a key-down
-    // (e.g. a disconnect/restart race). Key-up events for keys that are not
-    // down are harmless, and this prevents OS-level auto-repeat from getting
-    // stuck on the client.
-    for keycode in 0u32..256 {
-        if crate::input::keymap::evdev_to_macos(keycode).is_none() {
-            continue;
-        }
-        let msg = Message::KeyEvent {
-            keycode,
-            pressed: false,
-            modifiers: 0,
-        };
-        if let Err(e) = injector.inject(&msg) {
-            debug!("Defensive key release failed for {}: {}", keycode, e);
-        }
     }
 }
 
@@ -875,8 +858,11 @@ async fn handle_server_connection(
                                 layer_shell_keyboard_grabbed = true;
                             }
                             Err(e) => {
-                                warn!("Failed to grab keyboard devices for layer-shell capture: {}", e);
+                                warn!("Failed to grab keyboard devices for layer-shell capture: {}; falling back to layer-shell keyboard focus", e);
                                 layer_shell_keyboard_grabbed = false;
+                                if let Some(ref tx) = capture_tx {
+                                    tx.send(LayerShellCommand::CaptureKeyboard).ok();
+                                }
                             }
                         }
                         let mut sender = input_send.lock().await;
@@ -1527,7 +1513,6 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                             }
                             ClientOutput::Deactivate => {
                                 release_injected_inputs(&mut *injector, &mut injected_keys, &mut injected_buttons);
-                                release_defensive_keyups(&mut *injector);
                                 if let Err(e) = injector.set_cursor_visible(false) {
                                     warn!("Failed to hide cursor after server reclaimed control: {}", e);
                                 }
@@ -1566,7 +1551,6 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 // server also sends cleanup releases, but those can arrive after
                                 // this transition has become inactive.
                                 release_injected_inputs(&mut *injector, &mut injected_keys, &mut injected_buttons);
-                                release_defensive_keyups(&mut *injector);
                                 if let Err(e) = injector.set_cursor_visible(false) {
                                     warn!("Failed to hide cursor after switching back: {}", e);
                                 }
@@ -1717,7 +1701,6 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     // Release any synthetic input that may still be down if the stream ended
     // before key-up/button-up events were processed (for example during display sleep).
     release_injected_inputs(&mut *injector, &mut injected_keys, &mut injected_buttons);
-    release_defensive_keyups(&mut *injector);
     if let Err(e) = injector.set_cursor_visible(true) {
         warn!("Failed to restore cursor after disconnect: {}", e);
     }
@@ -2179,6 +2162,26 @@ mod tests {
     #[test]
     fn file_transfer_concurrency_limit_is_small() {
         assert_eq!(MAX_CONCURRENT_FILE_TRANSFERS, 2);
+    }
+
+    #[test]
+    fn transition_cleanup_does_not_release_untracked_ordinary_keys() {
+        let keys = cleanup_keycodes(&HashSet::new());
+
+        assert!(!keys.contains(&57), "orphaned Space key-up can pause media");
+        assert!(!keys.contains(&164), "orphaned play/pause key-up is unsafe");
+        assert_eq!(keys, DEFENSIVE_MODIFIER_KEYS);
+    }
+
+    #[test]
+    fn transition_cleanup_releases_tracked_ordinary_keys() {
+        let keys = cleanup_keycodes(&HashSet::from([57, 164]));
+
+        assert!(keys.contains(&57));
+        assert!(keys.contains(&164));
+        for modifier in DEFENSIVE_MODIFIER_KEYS {
+            assert!(keys.contains(modifier));
+        }
     }
 
     #[test]

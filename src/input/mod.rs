@@ -49,6 +49,7 @@ pub mod wayland_layer_shell {
 
     #[derive(Debug)]
     pub enum LayerShellCommand {
+        CaptureKeyboard,
         Release,
         Shutdown,
     }

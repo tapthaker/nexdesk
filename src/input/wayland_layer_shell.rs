@@ -69,6 +69,8 @@ pub enum LayerShellEvent {
 /// Commands from the server loop to the Wayland capture task.
 #[derive(Debug)]
 pub enum LayerShellCommand {
+    /// Fall back to wl_keyboard capture when the evdev keyboard grab failed.
+    CaptureKeyboard,
     Release,
     Shutdown,
 }
@@ -307,6 +309,7 @@ struct GrabState {
     shortcuts_inhibitor:
         Option<zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1>,
     surface: wl_surface::WlSurface,
+    keyboard_interactive: bool,
 }
 
 /// Key repeat state for a single held key.
@@ -413,16 +416,10 @@ impl WaylandState {
         // Hide cursor
         pointer.set_cursor(self.pointer_serial, None, 0, 0);
 
-        // Enable keyboard interactivity on the corresponding layer surface
-        for edge in &self.edge_surfaces {
-            if edge.surface == *surface {
-                edge.layer_surface.set_keyboard_interactivity(
-                    zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive,
-                );
-                edge.surface.commit();
-                break;
-            }
-        }
+        // Keep keyboard focus on the user's current window. The server normally
+        // captures the keyboard directly through evdev; giving this 1px overlay
+        // exclusive keyboard focus can make terminals emit focus/resize updates.
+        // Keyboard interactivity is enabled later only if the evdev grab fails.
 
         // Lock pointer
         let locked_pointer = pc.lock_pointer(
@@ -454,10 +451,32 @@ impl WaylandState {
             relative_pointer,
             shortcuts_inhibitor,
             surface: surface.clone(),
+            keyboard_interactive: false,
         });
         self.grabbed = true;
 
         debug!("Layer-shell: pointer grabbed");
+    }
+
+    fn capture_keyboard(&mut self) {
+        let Some(grab) = self.grab.as_mut() else {
+            return;
+        };
+        if grab.keyboard_interactive {
+            return;
+        }
+
+        for edge in &self.edge_surfaces {
+            if edge.surface == grab.surface {
+                edge.layer_surface.set_keyboard_interactivity(
+                    zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive,
+                );
+                edge.surface.commit();
+                grab.keyboard_interactive = true;
+                debug!("Layer-shell: using exclusive keyboard-focus fallback");
+                break;
+            }
+        }
     }
 
     fn release_grab(&mut self) {
@@ -468,14 +487,17 @@ impl WaylandState {
                 inhibitor.destroy();
             }
 
-            // Disable keyboard interactivity
-            for edge in &self.edge_surfaces {
-                if edge.surface == grab.surface {
-                    edge.layer_surface.set_keyboard_interactivity(
-                        zwlr_layer_surface_v1::KeyboardInteractivity::None,
-                    );
-                    edge.surface.commit();
-                    break;
+            // Do not commit the layer surface on the normal evdev path. Avoiding
+            // needless layer reconfiguration keeps terminal geometry stable.
+            if grab.keyboard_interactive {
+                for edge in &self.edge_surfaces {
+                    if edge.surface == grab.surface {
+                        edge.layer_surface.set_keyboard_interactivity(
+                            zwlr_layer_surface_v1::KeyboardInteractivity::None,
+                        );
+                        edge.surface.commit();
+                        break;
+                    }
                 }
             }
         }
@@ -1003,6 +1025,10 @@ async fn run_event_loop(
             }
             cmd = command_rx.recv() => {
                 match cmd {
+                    Some(LayerShellCommand::CaptureKeyboard) => {
+                        state.capture_keyboard();
+                        conn.flush().ok();
+                    }
                     Some(LayerShellCommand::Release) => {
                         state.release_grab();
                         conn.flush().ok();
