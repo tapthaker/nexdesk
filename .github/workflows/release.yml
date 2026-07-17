@@ -11,7 +11,7 @@ jobs:
   build-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: |
@@ -23,7 +23,7 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: nexdesk-linux-x86_64
           path: target/release/nexdesk
@@ -32,7 +32,7 @@ jobs:
     runs-on: macos-latest
     environment: CI
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup code signing
         id: signing
@@ -89,12 +89,12 @@ jobs:
             --issuer "${{ secrets.APPLE_NOTARY_ISSUER_ID }}" \
             --wait
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: nexdesk-macos-aarch64
           path: nexdesk-macos-aarch64
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: nexdesk-macos-x86_64
           path: nexdesk-macos-x86_64
@@ -103,7 +103,7 @@ jobs:
     needs: [build-linux, build-macos]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -114,7 +114,7 @@ jobs:
           mv artifacts/nexdesk-macos-x86_64/nexdesk-macos-x86_64 nexdesk-macos-x86_64
           chmod +x nexdesk-*
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: |
