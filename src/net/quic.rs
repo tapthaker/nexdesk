@@ -140,6 +140,31 @@ fn inject_with_timing(
     result
 }
 
+async fn refresh_client_screen_snapshot(
+    injector: &mut dyn InputInjector,
+    transition: &mut ClientTransition,
+    last_screen_w: &mut u32,
+    last_screen_h: &mut u32,
+    control_send: &mut SendStream,
+    context: &str,
+) -> Result<()> {
+    let (w, h) = injector.refresh_screen_size()?;
+    let screen = nonzero_screen_layout(w, h)
+        .ok_or_else(|| eyre!("Invalid refreshed client screen size: {}x{}", w, h))?;
+    transition.update_screen_size(w, h);
+
+    if (w, h) != (*last_screen_w, *last_screen_h) {
+        info!(
+            "Screen size refreshed {}: {}x{} -> {}x{}",
+            context, *last_screen_w, *last_screen_h, w, h
+        );
+        *last_screen_w = w;
+        *last_screen_h = h;
+        send_message(control_send, &Message::ScreenResize { screen }).await?;
+    }
+    Ok(())
+}
+
 fn lock_recover<'a, T>(
     mutex: &'a std::sync::Mutex<T>,
     context: &str,
@@ -1182,7 +1207,7 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
 
     // Create input injector early so we can send screen size in handshake
     let mut injector = crate::input::inject::create_injector()?;
-    let (my_w, my_h) = injector.screen_size()?;
+    let (my_w, my_h) = injector.refresh_screen_size()?;
     let my_screen = nonzero_screen_layout(my_w, my_h).ok_or_else(|| {
         eyre!(
             "Invalid local client screen size during handshake: {}x{}",
@@ -1470,6 +1495,15 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                         if activation_started.is_some() {
                             activation_input_messages += 1;
                         }
+                        if matches!(message, Message::MouseMove { .. })
+                            && transition.needs_cursor_sync()
+                        {
+                            // Reconcile against the real pointer while retaining
+                            // the geometry snapshot taken at activation.
+                            if let Ok(Some((x, y))) = injector.cursor_position() {
+                                transition.sync_cursor_position(x, y);
+                            }
+                        }
                         let original_message = message.clone();
                         match transition.handle(message) {
                             ClientOutput::Ignore => {
@@ -1501,6 +1535,20 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 }
                             }
                             ClientOutput::Activate => {
+                                // Snapshot fresh geometry at every handoff and use
+                                // that same snapshot for movement and edge checks.
+                                if let Err(e) = refresh_client_screen_snapshot(
+                                    &mut *injector,
+                                    &mut transition,
+                                    &mut last_screen_w,
+                                    &mut last_screen_h,
+                                    &mut control_send,
+                                    "on remote activation",
+                                )
+                                .await
+                                {
+                                    warn!("Failed to refresh screen size on activation: {}", e);
+                                }
                                 if let Err(e) = injector.set_cursor_visible(true) {
                                     warn!("Failed to show cursor on remote activation: {}", e);
                                 }
@@ -1512,6 +1560,18 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 request_wake_display();
                             }
                             ClientOutput::Deactivate => {
+                                if let Err(e) = refresh_client_screen_snapshot(
+                                    &mut *injector,
+                                    &mut transition,
+                                    &mut last_screen_w,
+                                    &mut last_screen_h,
+                                    &mut control_send,
+                                    "on deactivation",
+                                )
+                                .await
+                                {
+                                    warn!("Failed to refresh screen size on deactivation: {}", e);
+                                }
                                 release_injected_inputs(&mut *injector, &mut injected_keys, &mut injected_buttons);
                                 if let Err(e) = injector.set_cursor_visible(false) {
                                     warn!("Failed to hide cursor after server reclaimed control: {}", e);
@@ -1546,6 +1606,18 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 if let Some((x, y)) = inject {
                                     let msg = Message::MouseMove { x, y };
                                     inject_with_timing(&mut *injector, &msg, "switch back").ok();
+                                }
+                                if let Err(e) = refresh_client_screen_snapshot(
+                                    &mut *injector,
+                                    &mut transition,
+                                    &mut last_screen_w,
+                                    &mut last_screen_h,
+                                    &mut control_send,
+                                    "on switch back",
+                                )
+                                .await
+                                {
+                                    warn!("Failed to refresh screen size on switch back: {}", e);
                                 }
                                 // Release any remote-held keys immediately on switch-back. The
                                 // server also sends cleanup releases, but those can arrive after
@@ -1677,22 +1749,22 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                 }
             }
             _ = screen_check.tick() => {
-                if let Ok((w, h)) = injector.screen_size() {
-                    if w != last_screen_w || h != last_screen_h {
-                        let Some(screen) = nonzero_screen_layout(w, h) else {
-                            warn!("Ignoring invalid local screen resize: {}x{}", w, h);
-                            continue;
-                        };
-                        info!("Screen size changed: {}x{} -> {}x{}", last_screen_w, last_screen_h, w, h);
-                        last_screen_w = w;
-                        last_screen_h = h;
-                        transition.update_screen_size(w, h);
-                        let resize_msg = Message::ScreenResize { screen };
-                        if let Err(e) = send_message(&mut control_send, &resize_msg).await {
-                            warn!("Failed to send screen resize: {}", e);
-                            break;
-                        }
-                    }
+                // Keep active movement and edge detection on one immutable
+                // geometry snapshot. Inactive polling prepares the next handoff.
+                if transition.is_active() {
+                    continue;
+                }
+                if let Err(e) = refresh_client_screen_snapshot(
+                    &mut *injector,
+                    &mut transition,
+                    &mut last_screen_w,
+                    &mut last_screen_h,
+                    &mut control_send,
+                    "while inactive",
+                )
+                .await
+                {
+                    warn!("Failed to refresh inactive screen size: {}", e);
                 }
             }
         }

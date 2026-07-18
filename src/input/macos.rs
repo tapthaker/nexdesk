@@ -6,15 +6,18 @@ use objc2_core_foundation::{CFRetained, CGPoint};
 
 #[cfg(target_os = "macos")]
 use objc2_core_graphics::{
-    CGDirectDisplayID, CGDisplayPixelsHigh, CGDisplayPixelsWide, CGEvent, CGEventField,
-    CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventType,
+    CGDirectDisplayID, CGDisplayBounds, CGDisplayChangeSummaryFlags,
+    CGDisplayRegisterReconfigurationCallback, CGEvent, CGEventField, CGEventFlags, CGEventSource,
+    CGEventSourceStateID, CGEventTapLocation, CGEventType, CGGetActiveDisplayList, CGMainDisplayID,
     CGMouseButton, CGScrollEventUnit,
 };
 
 #[cfg(target_os = "macos")]
 use std::collections::HashSet;
 #[cfg(target_os = "macos")]
-use std::os::raw::{c_int, c_uint};
+use std::os::raw::{c_int, c_uint, c_void};
+#[cfg(target_os = "macos")]
+use std::sync::{LazyLock, Mutex};
 
 #[cfg(target_os = "macos")]
 use tracing::{debug, info};
@@ -29,9 +32,22 @@ use crate::input::keymap;
 use crate::net::protocol::Message;
 
 #[cfg(target_os = "macos")]
-const MAIN_DISPLAY: CGDirectDisplayID = 0;
+const MAX_ACTIVE_DISPLAYS: usize = 32;
 #[cfg(target_os = "macos")]
 const MAX_SCROLL_PIXELS_PER_MESSAGE: i32 = 4096;
+
+#[cfg(target_os = "macos")]
+static DESKTOP_BOUNDS_CACHE: LazyLock<Mutex<Option<DesktopBounds>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+#[cfg(target_os = "macos")]
+static DISPLAY_CALLBACK_STATUS: LazyLock<i32> = LazyLock::new(|| unsafe {
+    CGDisplayRegisterReconfigurationCallback(
+        Some(display_reconfiguration_callback),
+        std::ptr::null_mut(),
+    )
+    .0
+});
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -64,8 +80,8 @@ pub struct MacOSCapturer;
 #[cfg(target_os = "macos")]
 impl MacOSCapturer {
     pub fn new() -> Result<Self> {
-        let (screen_width, screen_height) = main_display_size_u32()?;
-        debug!("macOS capturer: screen {}x{}", screen_width, screen_height);
+        let (screen_width, screen_height) = desktop_size_u32()?;
+        debug!("macOS capturer: desktop {}x{}", screen_width, screen_height);
         Ok(Self)
     }
 }
@@ -73,16 +89,11 @@ impl MacOSCapturer {
 #[cfg(target_os = "macos")]
 impl InputCapture for MacOSCapturer {
     fn mouse_position(&self) -> Result<(i32, i32)> {
-        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-            .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
-        let event = CGEvent::new(Some(&source))
-            .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEvent"))?;
-        let loc = CGEvent::location(Some(&event));
-        Ok((loc.x as i32, loc.y as i32))
+        normalized_cursor_position(desktop_bounds()?)
     }
 
     fn screen_size(&self) -> Result<(u32, u32)> {
-        main_display_size_u32()
+        desktop_size_u32()
     }
 
     fn mouse_buttons(&self) -> Result<u8> {
@@ -148,31 +159,155 @@ fn evdev_to_media_key(evdev: u32) -> Option<i32> {
 }
 
 #[cfg(target_os = "macos")]
-fn main_display_size_u32() -> Result<(u32, u32)> {
-    let width = CGDisplayPixelsWide(MAIN_DISPLAY);
-    let height = CGDisplayPixelsHigh(MAIN_DISPLAY);
-    let width = u32::try_from(width).unwrap_or(0);
-    let height = u32::try_from(height).unwrap_or(0);
-    if width == 0 || height == 0 {
-        return Err(color_eyre::eyre::eyre!(
-            "Invalid macOS screen size: {}x{}",
-            width,
-            height
-        ));
-    }
-    Ok((width, height))
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DesktopBounds {
+    pub min_x: i32,
+    pub min_y: i32,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[cfg(target_os = "macos")]
-fn main_display_size_i32() -> Result<(i32, i32)> {
-    let (width, height) = main_display_size_u32()?;
-    let width = i32::try_from(width).map_err(|_| {
-        color_eyre::eyre::eyre!("Invalid macOS screen width: {} exceeds i32", width)
-    })?;
-    let height = i32::try_from(height).map_err(|_| {
-        color_eyre::eyre::eyre!("Invalid macOS screen height: {} exceeds i32", height)
-    })?;
-    Ok((width, height))
+fn desktop_bounds_from_rects(rects: &[(f64, f64, f64, f64)]) -> Option<DesktopBounds> {
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+
+    for &(x, y, width, height) in rects {
+        if !x.is_finite()
+            || !y.is_finite()
+            || !width.is_finite()
+            || !height.is_finite()
+            || width <= 0.0
+            || height <= 0.0
+        {
+            continue;
+        }
+        min_x = min_x.min(x.floor());
+        min_y = min_y.min(y.floor());
+        max_x = max_x.max((x + width).ceil());
+        max_y = max_y.max((y + height).ceil());
+    }
+
+    if !min_x.is_finite() || !min_y.is_finite() || !max_x.is_finite() || !max_y.is_finite() {
+        return None;
+    }
+    let min_x = i32::try_from(min_x as i64).ok()?;
+    let min_y = i32::try_from(min_y as i64).ok()?;
+    let width = u32::try_from((max_x as i64).checked_sub(i64::from(min_x))?).ok()?;
+    let height = u32::try_from((max_y as i64).checked_sub(i64::from(min_y))?).ok()?;
+    if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
+        return None;
+    }
+    Some(DesktopBounds {
+        min_x,
+        min_y,
+        width,
+        height,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn query_desktop_bounds() -> Result<DesktopBounds> {
+    let mut displays = [0 as CGDirectDisplayID; MAX_ACTIVE_DISPLAYS];
+    let mut count = 0u32;
+    let status =
+        unsafe { CGGetActiveDisplayList(displays.len() as u32, displays.as_mut_ptr(), &mut count) };
+    if status.0 != 0 || count == 0 {
+        return Err(color_eyre::eyre::eyre!(
+            "Failed to query active macOS displays: status {}, count {}",
+            status.0,
+            count
+        ));
+    }
+
+    let rects: Vec<_> = displays[..count.min(displays.len() as u32) as usize]
+        .iter()
+        .map(|display| {
+            let bounds = CGDisplayBounds(*display);
+            (
+                bounds.origin.x,
+                bounds.origin.y,
+                bounds.size.width,
+                bounds.size.height,
+            )
+        })
+        .collect();
+    desktop_bounds_from_rects(&rects)
+        .ok_or_else(|| color_eyre::eyre::eyre!("Active macOS displays have invalid desktop bounds"))
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C-unwind" fn display_reconfiguration_callback(
+    _display: CGDirectDisplayID,
+    _flags: CGDisplayChangeSummaryFlags,
+    _user_info: *mut c_void,
+) {
+    let mut cache = DESKTOP_BOUNDS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *cache = None;
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn desktop_bounds() -> Result<DesktopBounds> {
+    // CoreGraphics invalidates the cached union whenever display topology or
+    // mode changes. If callback registration fails, query on every call rather
+    // than risk using stale geometry.
+    if *DISPLAY_CALLBACK_STATUS != 0 {
+        return query_desktop_bounds();
+    }
+
+    let mut cache = DESKTOP_BOUNDS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(bounds) = *cache {
+        return Ok(bounds);
+    }
+
+    let bounds = query_desktop_bounds()?;
+    *cache = Some(bounds);
+    Ok(bounds)
+}
+
+#[cfg(target_os = "macos")]
+fn refresh_desktop_bounds() -> Result<DesktopBounds> {
+    let bounds = query_desktop_bounds()?;
+    let mut cache = DESKTOP_BOUNDS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *cache = Some(bounds);
+    Ok(bounds)
+}
+
+#[cfg(target_os = "macos")]
+fn desktop_size_u32() -> Result<(u32, u32)> {
+    let bounds = desktop_bounds()?;
+    Ok((bounds.width, bounds.height))
+}
+
+#[cfg(target_os = "macos")]
+fn normalized_desktop_point(bounds: DesktopBounds, x: i32, y: i32) -> CGPoint {
+    let x = x.clamp(0, bounds.width as i32 - 1);
+    let y = y.clamp(0, bounds.height as i32 - 1);
+    CGPoint {
+        x: f64::from(bounds.min_x.saturating_add(x)),
+        y: f64::from(bounds.min_y.saturating_add(y)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn normalized_cursor_position(bounds: DesktopBounds) -> Result<(i32, i32)> {
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
+    let event = CGEvent::new(Some(&source))
+        .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEvent"))?;
+    let loc = CGEvent::location(Some(&event));
+    Ok((
+        (loc.x as i32).saturating_sub(bounds.min_x),
+        (loc.y as i32).saturating_sub(bounds.min_y),
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -218,6 +353,8 @@ pub struct MacOSInjector {
     scroll_x_remainder: f64,
     /// Fractional scroll pixels retained until they accumulate to an integer.
     scroll_y_remainder: f64,
+    /// Desktop geometry snapshot shared by movement and edge reconciliation.
+    desktop_bounds: DesktopBounds,
     /// Tracks CoreGraphics' balanced cursor hide/show calls.
     cursor_hidden: bool,
 }
@@ -225,7 +362,8 @@ pub struct MacOSInjector {
 #[cfg(target_os = "macos")]
 impl MacOSInjector {
     pub fn new() -> Result<Self> {
-        let (screen_width, screen_height) = main_display_size_u32()?;
+        let desktop_bounds = refresh_desktop_bounds()?;
+        let (screen_width, screen_height) = (desktop_bounds.width, desktop_bounds.height);
         let source_state = match std::env::var("NEXDESK_MACOS_EVENT_SOURCE")
             .unwrap_or_else(|_| "hid".into())
             .to_ascii_lowercase()
@@ -269,8 +407,13 @@ impl MacOSInjector {
             post_mode,
             scroll_x_remainder: 0.0,
             scroll_y_remainder: 0.0,
+            desktop_bounds,
             cursor_hidden: false,
         })
+    }
+
+    pub(crate) fn desktop_bounds_snapshot(&self) -> DesktopBounds {
+        self.desktop_bounds
     }
 
     fn modifier_flag(keycode: u32) -> Option<CGEventFlags> {
@@ -410,7 +553,7 @@ impl MacOSInjector {
 impl Drop for MacOSInjector {
     fn drop(&mut self) {
         if self.cursor_hidden {
-            unsafe { CGDisplayShowCursor(MAIN_DISPLAY) };
+            unsafe { CGDisplayShowCursor(CGMainDisplayID()) };
             self.cursor_hidden = false;
         }
     }
@@ -596,9 +739,9 @@ impl InputInjector for MacOSInjector {
     }
 
     fn move_mouse(&mut self, x: i32, y: i32) -> Result<()> {
-        let (sw, sh) = main_display_size_i32()?;
-        let x = x.clamp(0, sw - 1) as f64;
-        let y = y.clamp(0, sh - 1) as f64;
+        let point = normalized_desktop_point(self.desktop_bounds, x, y);
+        let x = point.x;
+        let y = point.y;
         // macOS requires drag event types when a button is held, otherwise
         // the move is not recognized as part of a drag operation.
         let (event_type, button) = if self.buttons_down & 1 != 0 {
@@ -625,7 +768,16 @@ impl InputInjector for MacOSInjector {
     }
 
     fn screen_size(&self) -> Result<(u32, u32)> {
-        main_display_size_u32()
+        Ok((self.desktop_bounds.width, self.desktop_bounds.height))
+    }
+
+    fn refresh_screen_size(&mut self) -> Result<(u32, u32)> {
+        self.desktop_bounds = refresh_desktop_bounds()?;
+        self.screen_size()
+    }
+
+    fn cursor_position(&self) -> Result<Option<(i32, i32)>> {
+        normalized_cursor_position(self.desktop_bounds).map(Some)
     }
 
     fn set_cursor_visible(&mut self, visible: bool) -> Result<()> {
@@ -634,9 +786,9 @@ impl InputInjector for MacOSInjector {
         }
         let status = unsafe {
             if visible {
-                CGDisplayShowCursor(MAIN_DISPLAY)
+                CGDisplayShowCursor(CGMainDisplayID())
             } else {
-                CGDisplayHideCursor(MAIN_DISPLAY)
+                CGDisplayHideCursor(CGMainDisplayID())
             }
         };
         if status != 0 {
@@ -699,8 +851,48 @@ mod tests {
     }
 
     #[test]
-    fn display_size_conversion_rejects_zero_and_too_large_values() {
-        assert!(i32::try_from(1u32).is_ok());
-        assert!(i32::try_from(u32::MAX).is_err());
+    fn desktop_bounds_include_all_side_by_side_displays() {
+        let bounds =
+            desktop_bounds_from_rects(&[(0.0, 0.0, 1470.0, 956.0), (1470.0, 0.0, 2560.0, 1440.0)])
+                .unwrap();
+
+        assert_eq!(
+            bounds,
+            DesktopBounds {
+                min_x: 0,
+                min_y: 0,
+                width: 4030,
+                height: 1440,
+            }
+        );
+    }
+
+    #[test]
+    fn desktop_bounds_normalize_negative_display_origins() {
+        let bounds = desktop_bounds_from_rects(&[
+            (-2560.0, -200.0, 2560.0, 1440.0),
+            (0.0, 0.0, 1470.0, 956.0),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            bounds,
+            DesktopBounds {
+                min_x: -2560,
+                min_y: -200,
+                width: 4030,
+                height: 1440,
+            }
+        );
+    }
+
+    #[test]
+    fn desktop_bounds_reject_empty_or_invalid_displays() {
+        assert_eq!(desktop_bounds_from_rects(&[]), None);
+        assert_eq!(desktop_bounds_from_rects(&[(0.0, 0.0, 0.0, 10.0)]), None);
+        assert_eq!(
+            desktop_bounds_from_rects(&[(f64::NAN, 0.0, 10.0, 10.0)]),
+            None
+        );
     }
 }

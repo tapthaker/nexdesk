@@ -9,6 +9,7 @@ const EDGE_DWELL_THRESHOLD: u32 = 50;
 const SERVER_EDGE_COOLDOWN: u32 = 125;
 const INSET: i32 = 20;
 const CLIENT_EDGE_DWELL: u32 = 8;
+const CLIENT_CURSOR_SYNC_MARGIN: i32 = 64;
 
 fn lower_inset(len: i32) -> i32 {
     if len <= 0 {
@@ -477,6 +478,10 @@ impl ClientTransition {
         }
     }
 
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
     pub fn update_screen_size(&mut self, w: u32, h: u32) {
         if w == 0 || h == 0 {
             return;
@@ -485,6 +490,40 @@ impl ClientTransition {
         self.screen_h = h;
         self.cursor_x = self.cursor_x.clamp(0, w as i32 - 1);
         self.cursor_y = self.cursor_y.clamp(0, h as i32 - 1);
+    }
+
+    pub fn needs_cursor_sync(&self) -> bool {
+        if !self.active {
+            return false;
+        }
+        match self.switch_back_edge {
+            Some(Direction::Left) => self.cursor_x <= CLIENT_CURSOR_SYNC_MARGIN,
+            Some(Direction::Right) => {
+                self.cursor_x >= self.screen_w as i32 - 1 - CLIENT_CURSOR_SYNC_MARGIN
+            }
+            Some(Direction::Up) => self.cursor_y <= CLIENT_CURSOR_SYNC_MARGIN,
+            Some(Direction::Down) => {
+                self.cursor_y >= self.screen_h as i32 - 1 - CLIENT_CURSOR_SYNC_MARGIN
+            }
+            None => false,
+        }
+    }
+
+    /// Reconcile the modeled cursor with the position accepted by the client
+    /// OS. This matters for non-rectangular multi-display layouts, where an OS
+    /// may constrain a requested point out of a gap between displays.
+    pub fn sync_cursor_position(&mut self, x: i32, y: i32) {
+        if !self.active || self.screen_w == 0 || self.screen_h == 0 {
+            return;
+        }
+        self.cursor_x = x.clamp(0, self.screen_w as i32 - 1);
+        self.cursor_y = y.clamp(0, self.screen_h as i32 - 1);
+
+        let actual_edge =
+            edge::detect_edge(self.cursor_x, self.cursor_y, self.screen_w, self.screen_h);
+        if actual_edge != self.switch_back_edge {
+            self.edge_dwell = 0;
+        }
     }
 
     pub fn handle(&mut self, message: Message) -> ClientOutput {
@@ -1164,6 +1203,52 @@ mod tests {
         } else {
             panic!("Expected InjectMove");
         }
+    }
+
+    #[test]
+    fn client_cursor_sync_prevents_false_edge_in_display_gap() {
+        let mut ct = ClientTransition::new(4030, 1440);
+        ct.handle(Message::SwitchScreen {
+            direction: Direction::Right,
+        });
+        ct.handle(Message::MouseMove { x: 1470, y: 1200 });
+        ct.edge_cooldown = 0;
+
+        // The modeled pointer can move into the rectangular union below a
+        // shorter left display, while macOS constrains the real pointer to the
+        // adjacent display at x=1470. Reconciliation must prevent false dwell
+        // at the virtual desktop's x=0 edge.
+        for _ in 0..CLIENT_EDGE_DWELL * 4 {
+            if ct.needs_cursor_sync() {
+                ct.sync_cursor_position(1470, 1200);
+            }
+            let out = ct.handle(Message::MouseMove { x: -500, y: 0 });
+            assert!(matches!(out, ClientOutput::InjectMove { .. }));
+        }
+        assert!(ct.active);
+    }
+
+    #[test]
+    fn client_cursor_sync_preserves_dwell_at_real_return_edge() {
+        let mut ct = ClientTransition::new(4030, 1440);
+        ct.handle(Message::SwitchScreen {
+            direction: Direction::Right,
+        });
+        ct.handle(Message::MouseMove { x: 0, y: 500 });
+        ct.edge_cooldown = 0;
+
+        let mut switched = false;
+        for _ in 0..CLIENT_EDGE_DWELL + 1 {
+            ct.sync_cursor_position(0, 500);
+            if matches!(
+                ct.handle(Message::MouseMove { x: -1, y: 0 }),
+                ClientOutput::SwitchBack { .. }
+            ) {
+                switched = true;
+                break;
+            }
+        }
+        assert!(switched);
     }
 
     #[test]

@@ -10,8 +10,20 @@ pub trait InputInjector: Send {
     /// Move the mouse to an absolute position.
     fn move_mouse(&mut self, x: i32, y: i32) -> Result<()>;
 
-    /// Get the screen dimensions.
+    /// Get the currently stored screen dimensions.
     fn screen_size(&self) -> Result<(u32, u32)>;
+
+    /// Refresh screen geometry and return the new dimensions. Backends whose
+    /// geometry is inherently live may use the default implementation.
+    fn refresh_screen_size(&mut self) -> Result<(u32, u32)> {
+        self.screen_size()
+    }
+
+    /// Get the pointer position in the same normalized desktop coordinates as
+    /// `move_mouse`. Backends that cannot query it may return `None`.
+    fn cursor_position(&self) -> Result<Option<(i32, i32)>> {
+        Ok(None)
+    }
 
     /// Show or hide the local pointer while control is on another screen.
     fn set_cursor_visible(&mut self, _visible: bool) -> Result<()> {

@@ -12,10 +12,7 @@ use color_eyre::eyre::{eyre, Result};
 #[cfg(target_os = "macos")]
 use objc2_core_foundation::CGPoint;
 #[cfg(target_os = "macos")]
-use objc2_core_graphics::{
-    CGDirectDisplayID, CGDisplayPixelsHigh, CGDisplayPixelsWide, CGEvent, CGEventSource,
-    CGEventSourceStateID,
-};
+use objc2_core_graphics::{CGEvent, CGEventSource, CGEventSourceStateID};
 #[cfg(target_os = "macos")]
 use tracing::{info, warn};
 
@@ -26,8 +23,6 @@ use crate::input::macos::MacOSInjector;
 #[cfg(target_os = "macos")]
 use crate::net::protocol::Message;
 
-#[cfg(target_os = "macos")]
-const MAIN_DISPLAY: CGDirectDisplayID = 0;
 const MAX_HID_BOOT_KEYS: usize = 6;
 
 #[cfg(target_os = "macos")]
@@ -279,9 +274,13 @@ impl InputInjector for MacOSHidInjector {
     }
 
     fn move_mouse(&mut self, x: i32, y: i32) -> Result<()> {
-        let (sw, sh) = main_display_size_i32()?;
-        let target_x = x.clamp(0, sw - 1);
-        let target_y = y.clamp(0, sh - 1);
+        let bounds = self.fallback.desktop_bounds_snapshot();
+        let target_x = bounds
+            .min_x
+            .saturating_add(x.clamp(0, bounds.width as i32 - 1));
+        let target_y = bounds
+            .min_y
+            .saturating_add(y.clamp(0, bounds.height as i32 - 1));
         let mut dx = hid_relative_delta(target_x, self.cursor_x);
         let mut dy = hid_relative_delta(target_y, self.cursor_y);
         while dx != 0 || dy != 0 {
@@ -300,21 +299,17 @@ impl InputInjector for MacOSHidInjector {
         self.fallback.screen_size()
     }
 
+    fn refresh_screen_size(&mut self) -> Result<(u32, u32)> {
+        self.fallback.refresh_screen_size()
+    }
+
+    fn cursor_position(&self) -> Result<Option<(i32, i32)>> {
+        self.fallback.cursor_position()
+    }
+
     fn set_cursor_visible(&mut self, visible: bool) -> Result<()> {
         self.fallback.set_cursor_visible(visible)
     }
-}
-
-#[cfg(target_os = "macos")]
-fn main_display_size_i32() -> Result<(i32, i32)> {
-    let sw = CGDisplayPixelsWide(MAIN_DISPLAY);
-    let sh = CGDisplayPixelsHigh(MAIN_DISPLAY);
-    let sw = i32::try_from(sw).unwrap_or(0);
-    let sh = i32::try_from(sh).unwrap_or(0);
-    if sw <= 0 || sh <= 0 {
-        return Err(eyre!("Invalid macOS screen size: {}x{}", sw, sh));
-    }
-    Ok((sw, sh))
 }
 
 #[cfg(target_os = "macos")]
