@@ -27,6 +27,8 @@ const CLIENT_LATENCY_RESTART_THRESHOLD: Duration = Duration::from_secs(3);
 const CLIENT_LATENCY_RESTART_STRIKES: u8 = 3;
 const MAX_CONCURRENT_FILE_TRANSFERS: usize = 2;
 const MAX_CONNECT_ADDR_BYTES: usize = 512;
+const SERVER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const ACTIVE_SESSION_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 
 // Only modifiers are safe to release defensively. Synthesizing an orphaned
 // key-up for an ordinary key such as Space can trigger application behavior
@@ -360,10 +362,8 @@ pub async fn serve(port: u16, trigger_edge: Option<crate::net::protocol::Directi
     // Periodically check for new releases and self-update
     tokio::spawn(crate::net::update::update_check_loop());
 
-    // Nexdesk currently has a single local input source and one remote-screen
-    // transition state. Allowing multiple connected clients to drive the same
-    // capturer/grab state causes conflicting SwitchScreen/Input streams and can
-    // leave one peer with stuck synthetic input when another peer switches back.
+    // Input sharing is single-session, but authentication and diagnostic
+    // connections must not consume this permit.
     let active_connection = Arc::new(Semaphore::new(1));
 
     while let Some(incoming) = endpoint.accept().await {
@@ -375,22 +375,16 @@ pub async fn serve(port: u16, trigger_edge: Option<crate::net::protocol::Directi
             }
         };
         let remote = connection.remote_address();
-        let Ok(connection_permit) = active_connection.clone().try_acquire_owned() else {
-            warn!(
-                "Rejecting connection from {}: another peer is already connected",
-                remote
-            );
-            connection.close(0u32.into(), b"another peer is already connected");
-            continue;
-        };
         info!("New connection from {}", remote);
 
         let edge = trigger_edge;
         let otp = otp.clone();
         let fp = server_fingerprint.clone();
+        let active_connection = active_connection.clone();
         tokio::spawn(async move {
-            let _connection_permit = connection_permit;
-            if let Err(e) = handle_server_connection(connection, edge, &otp, &fp).await {
+            if let Err(e) =
+                handle_server_connection(connection, edge, &otp, &fp, active_connection).await
+            {
                 error!("Connection from {} error: {}", remote, e);
             }
         });
@@ -399,11 +393,35 @@ pub async fn serve(port: u16, trigger_edge: Option<crate::net::protocol::Directi
     Ok(())
 }
 
+async fn handle_diagnostic_connection(
+    connection: quinn::Connection,
+    mut control_send: SendStream,
+    mut control_recv: RecvStream,
+) -> Result<()> {
+    loop {
+        match recv_message(&mut control_recv).await? {
+            Some(Message::Heartbeat { timestamp }) => {
+                send_message(&mut control_send, &Message::HeartbeatAck { timestamp }).await?;
+            }
+            Some(other) => {
+                debug!(
+                    "Ignoring non-diagnostic control message: {}",
+                    protocol::message_summary(&other)
+                );
+            }
+            None => break,
+        }
+    }
+    connection.close(0u32.into(), b"diagnostic complete");
+    Ok(())
+}
+
 async fn handle_server_connection(
     connection: quinn::Connection,
     trigger_edge: Option<crate::net::protocol::Direction>,
     server_otp: &str,
     server_fingerprint: &str,
+    active_connection: Arc<Semaphore>,
 ) -> Result<()> {
     let remote = connection.remote_address();
     let client_fingerprint = tls::peer_fingerprint(&connection);
@@ -433,8 +451,12 @@ async fn handle_server_connection(
     };
     send_message(&mut control_send, &hello).await?;
 
-    // Receive HelloAck with optional OTP
-    let (peer_screen, peer_build_version) = match recv_message(&mut control_recv).await? {
+    // Receive HelloAck with optional OTP. A peer that opens QUIC but never
+    // completes the application handshake must not hold resources forever.
+    let hello_ack = time::timeout(SERVER_HANDSHAKE_TIMEOUT, recv_message(&mut control_recv))
+        .await
+        .wrap_err("Timed out waiting for client handshake")??;
+    let (peer_screen, peer_build_version, input_capable) = match hello_ack {
         Some(Message::HelloAck {
             accepted: true,
             version,
@@ -513,12 +535,14 @@ async fn handle_server_connection(
                     BUILD_VERSION, peer_version
                 );
             }
+            let input_capable = screen.is_some();
             (
                 screen.unwrap_or(ScreenLayout {
                     width: 1920,
                     height: 1080,
                 }),
                 peer_version.to_string(),
+                input_capable,
             )
         }
         Some(Message::HelloAck {
@@ -533,6 +557,24 @@ async fn handle_server_connection(
             ));
         }
     };
+
+    // Pairing and ping connections intentionally omit a client screen. They
+    // can authenticate and use the control stream without competing for the
+    // single input-sharing session.
+    if !input_capable {
+        return handle_diagnostic_connection(connection, control_send, control_recv).await;
+    }
+
+    // Wait for a previous input session to unwind during reconnect rather than
+    // rejecting the new authenticated peer immediately. The bounded wait keeps
+    // stale sessions from blocking service indefinitely.
+    let _connection_permit = time::timeout(
+        ACTIVE_SESSION_WAIT_TIMEOUT,
+        active_connection.acquire_owned(),
+    )
+    .await
+    .wrap_err("Timed out waiting for the previous input session to close")?
+    .map_err(|_| eyre!("Input session gate closed"))?;
 
     // Open clipboard stream (bidirectional) — must be before uni stream
     // so client accept_bi() picks it up in order

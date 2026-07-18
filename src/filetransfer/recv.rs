@@ -449,16 +449,15 @@ mod tests {
         assert!(safe_file_name("/tmp/file.txt").is_err());
         assert!(safe_file_name("bad\0name.txt").is_err());
         assert!(safe_file_name("dir\\file.txt").is_err());
-        assert!(safe_file_name("CON").is_err());
-        assert!(safe_file_name("bad:name.txt").is_err());
-        assert!(safe_file_name("trailing.").is_err());
         assert!(safe_file_name(&"a".repeat(protocol::MAX_TRANSFER_FILE_NAME_BYTES + 1)).is_err());
         assert!(safe_file_name("").is_err());
     }
 
     #[test]
-    fn accepts_simple_file_names() {
-        assert_eq!(safe_file_name("file.txt").unwrap(), "file.txt");
+    fn accepts_valid_posix_file_names() {
+        for name in ["file.txt", "CON", "bad:name.txt", "trailing."] {
+            assert_eq!(safe_file_name(name).unwrap(), name);
+        }
     }
 
     #[cfg(unix)]

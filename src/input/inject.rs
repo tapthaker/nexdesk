@@ -2,6 +2,25 @@ use color_eyre::eyre::Result;
 
 use crate::net::protocol::Message;
 
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxInjectorBackend {
+    X11,
+    Wayland,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn choose_linux_injector(override_value: &str, has_display: bool) -> LinuxInjectorBackend {
+    match override_value.trim().to_ascii_lowercase().as_str() {
+        "x11" => LinuxInjectorBackend::X11,
+        "wayland" => LinuxInjectorBackend::Wayland,
+        // XTest through XWayland is currently the only implemented Linux
+        // injection path. A Wayland session normally still exports DISPLAY.
+        _ if has_display => LinuxInjectorBackend::X11,
+        _ => LinuxInjectorBackend::Wayland,
+    }
+}
+
 /// Trait for injecting input events into the local machine.
 pub trait InputInjector: Send {
     /// Inject a single input event.
@@ -35,27 +54,13 @@ pub trait InputInjector: Send {
 pub fn create_injector() -> Result<Box<dyn InputInjector>> {
     #[cfg(target_os = "linux")]
     {
-        let injector_override = std::env::var("NEXDESK_LINUX_INJECTOR")
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
-
-        if injector_override == "x11" {
-            return crate::input::linux_x11::X11Injector::new()
-                .map(|i| Box::new(i) as Box<dyn InputInjector>);
+        let injector_override = std::env::var("NEXDESK_LINUX_INJECTOR").unwrap_or_default();
+        match choose_linux_injector(&injector_override, std::env::var("DISPLAY").is_ok()) {
+            LinuxInjectorBackend::X11 => crate::input::linux_x11::X11Injector::new()
+                .map(|i| Box::new(i) as Box<dyn InputInjector>),
+            LinuxInjectorBackend::Wayland => crate::input::linux_wayland::WaylandInjector::new()
+                .map(|i| Box::new(i) as Box<dyn InputInjector>),
         }
-
-        if is_wayland {
-            return crate::input::linux_wayland::WaylandInjector::new()
-                .map(|i| Box::new(i) as Box<dyn InputInjector>);
-        }
-
-        if std::env::var("DISPLAY").is_ok() {
-            return crate::input::linux_x11::X11Injector::new()
-                .map(|i| Box::new(i) as Box<dyn InputInjector>);
-        }
-        crate::input::linux_wayland::WaylandInjector::new()
-            .map(|i| Box::new(i) as Box<dyn InputInjector>)
     }
 
     #[cfg(target_os = "macos")]
@@ -75,5 +80,27 @@ pub fn create_injector() -> Result<Box<dyn InputInjector>> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(color_eyre::eyre::eyre!("Unsupported platform"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_wayland_session_prefers_implemented_xwayland_injector() {
+        assert_eq!(choose_linux_injector("", true), LinuxInjectorBackend::X11);
+    }
+
+    #[test]
+    fn linux_injector_override_is_respected() {
+        assert_eq!(
+            choose_linux_injector("wayland", true),
+            LinuxInjectorBackend::Wayland
+        );
+        assert_eq!(
+            choose_linux_injector("x11", false),
+            LinuxInjectorBackend::X11
+        );
     }
 }

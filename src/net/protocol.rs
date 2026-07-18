@@ -141,7 +141,8 @@ pub enum Message {
     WakeDisplay,
 }
 
-/// Protocol version.
+/// Protocol version. Increment only for incompatible serialized-message schema
+/// changes, not for stricter validation or implementation-only behavior.
 pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Build version string burned in at compile time (e.g. "v0.1.2" or "v0.1.2-3-gabcdef").
@@ -333,43 +334,13 @@ fn validate_screen_layout(screen: &ScreenLayout, context: &str) -> color_eyre::e
 }
 
 pub fn is_portable_transfer_file_name(name: &str) -> bool {
-    if name.is_empty()
-        || name.len() > MAX_TRANSFER_FILE_NAME_BYTES
-        || name.contains('\0')
-        || name.contains('\\')
-        || name.ends_with([' ', '.'])
-        || name
-            .chars()
-            .any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') || c.is_control())
-    {
-        return false;
-    }
-    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
-    !matches!(
-        stem.as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-    )
+    // Nexdesk currently transfers between Linux and macOS. Preserve valid
+    // POSIX basenames instead of imposing Windows reserved-name rules. Path
+    // separators, NUL/control characters, and oversized names remain unsafe.
+    !name.is_empty()
+        && name.len() <= MAX_TRANSFER_FILE_NAME_BYTES
+        && !name.contains(['/', '\\', '\0'])
+        && !name.chars().any(char::is_control)
 }
 
 fn validate_file_name(name: &str) -> color_eyre::eyre::Result<()> {
@@ -920,8 +891,8 @@ mod tests {
                     }],
                     total_size: 3,
                 })
-                .is_err(),
-                "accepted non-portable file name {name:?}"
+                .is_ok(),
+                "rejected valid POSIX file name {name:?}"
             );
         }
         assert!(validate_message(&Message::FileTransferOffer {
