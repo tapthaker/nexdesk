@@ -23,12 +23,14 @@ const MOUSE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const USER_ACTIVITY_INTERVAL: Duration = Duration::from_secs(20);
 const LOCAL_LOCK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const CLIENT_LATENCY_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+const CLIENT_SCREEN_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const CLIENT_LATENCY_RESTART_THRESHOLD: Duration = Duration::from_secs(3);
 const CLIENT_LATENCY_RESTART_STRIKES: u8 = 3;
 const MAX_CONCURRENT_FILE_TRANSFERS: usize = 2;
 const MAX_CONNECT_ADDR_BYTES: usize = 512;
 const SERVER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const ACTIVE_SESSION_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
+const INPUT_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
 // Only modifiers are safe to release defensively. Synthesizing an orphaned
 // key-up for an ordinary key such as Space can trigger application behavior
@@ -154,6 +156,12 @@ async fn refresh_client_screen_snapshot(
     let screen = nonzero_screen_layout(w, h)
         .ok_or_else(|| eyre!("Invalid refreshed client screen size: {}x{}", w, h))?;
     transition.update_screen_size(w, h);
+    // A display reconfiguration can move the real pointer independently of
+    // Nexdesk's modeled cursor. Reconcile immediately so a closed laptop lid
+    // cannot leave edge detection operating on the removed display.
+    if let Ok(Some((x, y))) = injector.cursor_position() {
+        transition.sync_cursor_position(x, y);
+    }
 
     if (w, h) != (*last_screen_w, *last_screen_h) {
         info!(
@@ -794,8 +802,20 @@ async fn handle_server_connection(
                         info!("Edge detected — switching to remote");
                         lock_recover(&capturer, "input capturer").set_grab(grab).ok();
                         let mut sender = input_send.lock().await;
+                        let mut send_failed = None;
                         for msg in messages {
-                            send_message_uni(&mut sender, &msg).await.ok();
+                            if let Err(e) = send_message_uni(&mut sender, &msg).await {
+                                send_failed = Some(e);
+                                break;
+                            }
+                        }
+                        drop(sender);
+                        if let Some(e) = send_failed {
+                            warn!("Failed to activate remote screen: {}; releasing local input", e);
+                            transition.deactivate();
+                            lock_recover(&capturer, "input capturer").set_grab(false).ok();
+                            connection.close(0u32.into(), b"input stream stalled");
+                            continue;
                         }
                         // Check clipboard for files and transfer them
                         let ft_conn = connection.clone();
@@ -818,25 +838,28 @@ async fn handle_server_connection(
                                 warn!("Failed to send: {}", e);
                                 transition.deactivate();
                                 lock_recover(&capturer, "input capturer").set_grab(false).ok();
+                                connection.close(0u32.into(), b"input stream stalled");
                                 break;
                             }
                         }
                     }
                     ServerOutput::ShortcutRelease { messages } => {
                         info!("Shortcut switch back — releasing grab");
+                        // Local recovery must precede network I/O: a sleeping
+                        // Mac may stop reading while Linux still owns the grab.
+                        lock_recover(&capturer, "input capturer").set_grab(false).ok();
                         let mut sender = input_send.lock().await;
                         for msg in messages {
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
-                        lock_recover(&capturer, "input capturer").set_grab(false).ok();
                     }
                     ServerOutput::ForceRelease { messages } => {
                         warn!("Safety escape (Ctrl+Alt+Escape) — releasing grab");
+                        lock_recover(&capturer, "input capturer").set_grab(false).ok();
                         let mut sender = input_send.lock().await;
                         for msg in messages {
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
-                        lock_recover(&capturer, "input capturer").set_grab(false).ok();
                     }
                 }
             }
@@ -862,16 +885,16 @@ async fn handle_server_connection(
                     ServerOutput::Activate { .. } => {}
                     ServerOutput::ShortcutRelease { messages } => {
                         info!("Shortcut switch back — releasing layer-shell grab");
-                        let mut sender = input_send.lock().await;
-                        for msg in messages {
-                            send_message_uni(&mut sender, &msg).await.ok();
-                        }
                         if let Some(ref tx) = capture_tx {
                             use crate::input::wayland_layer_shell::LayerShellCommand;
                             tx.send(LayerShellCommand::Release).ok();
                         }
                         lock_recover(&capturer, "input capturer").set_keyboard_grab(false).ok();
                         layer_shell_keyboard_grabbed = false;
+                        let mut sender = input_send.lock().await;
+                        for msg in messages {
+                            send_message_uni(&mut sender, &msg).await.ok();
+                        }
                     }
                     ServerOutput::Forward { messages } => {
                         if !messages.is_empty() {
@@ -886,6 +909,7 @@ async fn handle_server_connection(
                                     }
                                     lock_recover(&capturer, "input capturer").set_keyboard_grab(false).ok();
                                     layer_shell_keyboard_grabbed = false;
+                                    connection.close(0u32.into(), b"input stream stalled");
                                     break;
                                 }
                             }
@@ -893,16 +917,16 @@ async fn handle_server_connection(
                     }
                     ServerOutput::ForceRelease { messages } => {
                         warn!("Safety escape (Ctrl+Alt+Escape) — releasing layer-shell grab");
-                        let mut sender = input_send.lock().await;
-                        for msg in messages {
-                            send_message_uni(&mut sender, &msg).await.ok();
-                        }
                         if let Some(ref tx) = capture_tx {
                             use crate::input::wayland_layer_shell::LayerShellCommand;
                             tx.send(LayerShellCommand::Release).ok();
                         }
                         lock_recover(&capturer, "input capturer").set_keyboard_grab(false).ok();
                         layer_shell_keyboard_grabbed = false;
+                        let mut sender = input_send.lock().await;
+                        for msg in messages {
+                            send_message_uni(&mut sender, &msg).await.ok();
+                        }
                     }
                 }
             }
@@ -933,8 +957,24 @@ async fn handle_server_connection(
                             }
                         }
                         let mut sender = input_send.lock().await;
+                        let mut send_failed = None;
                         for msg in messages {
-                            send_message_uni(&mut sender, &msg).await.ok();
+                            if let Err(e) = send_message_uni(&mut sender, &msg).await {
+                                send_failed = Some(e);
+                                break;
+                            }
+                        }
+                        drop(sender);
+                        if let Some(e) = send_failed {
+                            warn!("Failed to activate layer-shell remote screen: {}; releasing local input", e);
+                            transition.deactivate();
+                            if let Some(ref tx) = capture_tx {
+                                tx.send(LayerShellCommand::Release).ok();
+                            }
+                            lock_recover(&capturer, "input capturer").set_keyboard_grab(false).ok();
+                            layer_shell_keyboard_grabbed = false;
+                            connection.close(0u32.into(), b"input stream stalled");
+                            continue;
                         }
                         // Check clipboard for files and transfer them
                         let ft_conn = connection.clone();
@@ -965,6 +1005,7 @@ async fn handle_server_connection(
                                 }
                                 lock_recover(&capturer, "input capturer").set_keyboard_grab(false).ok();
                                 layer_shell_keyboard_grabbed = false;
+                                connection.close(0u32.into(), b"input stream stalled");
                             }
                         }
                     }
@@ -1015,25 +1056,25 @@ async fn handle_server_connection(
                             if transition.is_escape_combo() {
                                 warn!("Safety escape (Ctrl+Alt+Escape) — releasing layer-shell grab");
                                 let messages = transition.deactivate_for_shortcut();
+                                if let Some(ref tx) = capture_tx {
+                                    tx.send(LayerShellCommand::Release).ok();
+                                }
                                 let mut sender = input_send.lock().await;
                                 for msg in messages {
                                     send_message_uni(&mut sender, &msg).await.ok();
-                                }
-                                if let Some(ref tx) = capture_tx {
-                                    tx.send(LayerShellCommand::Release).ok();
                                 }
                             } else if transition.shortcut_direction().is_some() {
                                 info!("Shortcut switch back — releasing layer-shell grab");
                                 let messages = transition.deactivate_for_shortcut();
-                                let mut sender = input_send.lock().await;
-                                for msg in messages {
-                                    send_message_uni(&mut sender, &msg).await.ok();
-                                }
                                 if let Some(ref tx) = capture_tx {
                                     tx.send(LayerShellCommand::Release).ok();
                                 }
                                 lock_recover(&capturer, "input capturer").set_keyboard_grab(false).ok();
                                 layer_shell_keyboard_grabbed = false;
+                                let mut sender = input_send.lock().await;
+                                for msg in messages {
+                                    send_message_uni(&mut sender, &msg).await.ok();
+                                }
                             } else {
                                 let msg = Message::KeyEvent { keycode, pressed, modifiers: 0 };
                                 let mut sender = input_send.lock().await;
@@ -1057,12 +1098,10 @@ async fn handle_server_connection(
                         request_wake_display();
                         info!("Client requested switch back: {:?}", direction);
                         let messages = transition.on_switch_back();
-                        if !messages.is_empty() {
-                            let mut sender = input_send.lock().await;
-                            for msg in messages {
-                                send_message_uni(&mut sender, &msg).await.ok();
-                            }
-                        }
+
+                        // Restore Linux input ownership before waiting on the
+                        // stream back to the Mac. During lid/display changes
+                        // that stream can stall, but local input must recover.
                         if use_layer_shell {
                             #[cfg(target_os = "linux")]
                             if let Some(ref tx) = capture_tx {
@@ -1073,6 +1112,13 @@ async fn handle_server_connection(
                             layer_shell_keyboard_grabbed = false;
                         } else {
                             lock_recover(&capturer, "input capturer").set_grab(false).ok();
+                        }
+
+                        if !messages.is_empty() {
+                            let mut sender = input_send.lock().await;
+                            for msg in messages {
+                                send_message_uni(&mut sender, &msg).await.ok();
+                            }
                         }
                     }
                     Ok(Some(Message::ScreenResize { screen })) => {
@@ -1517,7 +1563,7 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
 
     let mut last_screen_w = my_w;
     let mut last_screen_h = my_h;
-    let mut screen_check = time::interval(Duration::from_secs(5));
+    let mut screen_check = time::interval(CLIENT_SCREEN_CHECK_INTERVAL);
     let mut latency_check = time::interval(CLIENT_LATENCY_CHECK_INTERVAL);
     let mut pending_latency_ping: Option<(u64, Instant)> = None;
     let mut latency_strikes: u8 = 0;
@@ -1602,6 +1648,14 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 request_wake_display();
                             }
                             ClientOutput::Deactivate => {
+                                // Synthetic input cleanup is more important than
+                                // geometry refresh and must never wait behind it.
+                                release_injected_inputs(&mut *injector, &mut injected_keys, &mut injected_buttons);
+                                if let Err(e) = injector.set_cursor_visible(false) {
+                                    warn!("Failed to hide cursor after server reclaimed control: {}", e);
+                                }
+                                activation_started = None;
+                                info!("Server reclaimed control");
                                 if let Err(e) = refresh_client_screen_snapshot(
                                     &mut *injector,
                                     &mut transition,
@@ -1614,12 +1668,6 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 {
                                     warn!("Failed to refresh screen size on deactivation: {}", e);
                                 }
-                                release_injected_inputs(&mut *injector, &mut injected_keys, &mut injected_buttons);
-                                if let Err(e) = injector.set_cursor_visible(false) {
-                                    warn!("Failed to hide cursor after server reclaimed control: {}", e);
-                                }
-                                activation_started = None;
-                                info!("Server reclaimed control");
                             }
                             ClientOutput::InjectMove { x, y } => {
                                 activation_inject_moves += 1;
@@ -1649,6 +1697,18 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                     let msg = Message::MouseMove { x, y };
                                     inject_with_timing(&mut *injector, &msg, "switch back").ok();
                                 }
+                                // Stop synthetic input and tell Linux to release
+                                // its devices before any display query. CoreGraphics
+                                // can be transiently unavailable during lid close.
+                                release_injected_inputs(&mut *injector, &mut injected_keys, &mut injected_buttons);
+                                if let Err(e) = injector.set_cursor_visible(false) {
+                                    warn!("Failed to hide cursor after switching back: {}", e);
+                                }
+                                info!("Edge on client: {:?} — requesting switch back", direction);
+                                let switch_msg = Message::SwitchScreen { direction };
+                                if let Err(e) = send_message(&mut control_send, &switch_msg).await {
+                                    warn!("Failed to request switch back: {}", e);
+                                }
                                 if let Err(e) = refresh_client_screen_snapshot(
                                     &mut *injector,
                                     &mut transition,
@@ -1661,16 +1721,6 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 {
                                     warn!("Failed to refresh screen size on switch back: {}", e);
                                 }
-                                // Release any remote-held keys immediately on switch-back. The
-                                // server also sends cleanup releases, but those can arrive after
-                                // this transition has become inactive.
-                                release_injected_inputs(&mut *injector, &mut injected_keys, &mut injected_buttons);
-                                if let Err(e) = injector.set_cursor_visible(false) {
-                                    warn!("Failed to hide cursor after switching back: {}", e);
-                                }
-                                info!("Edge on client: {:?} — requesting switch back", direction);
-                                let switch_msg = Message::SwitchScreen { direction };
-                                send_message(&mut control_send, &switch_msg).await.ok();
                                 // Check clipboard for files and transfer them
                                 let ft_conn = connection.clone();
                                 tokio::spawn(async move {
@@ -1791,18 +1841,21 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                 }
             }
             _ = screen_check.tick() => {
-                // Keep active movement and edge detection on one immutable
-                // geometry snapshot. Inactive polling prepares the next handoff.
-                if transition.is_active() {
-                    continue;
-                }
+                // Display topology can change while the remote screen is active
+                // (notably when a MacBook lid is closed). Refresh in both states
+                // so movement and the return edge recover without a reconnect.
+                let context = if transition.is_active() {
+                    "while active"
+                } else {
+                    "while inactive"
+                };
                 if let Err(e) = refresh_client_screen_snapshot(
                     &mut *injector,
                     &mut transition,
                     &mut last_screen_w,
                     &mut last_screen_h,
                     &mut control_send,
-                    "while inactive",
+                    context,
                 )
                 .await
                 {
@@ -2210,7 +2263,9 @@ async fn send_message(send: &mut SendStream, msg: &Message) -> Result<()> {
 
 async fn send_message_uni(send: &mut quinn::SendStream, msg: &Message) -> Result<()> {
     let bytes = protocol::encode(msg)?;
-    send.write_all(&bytes).await?;
+    time::timeout(INPUT_SEND_TIMEOUT, send.write_all(&bytes))
+        .await
+        .wrap_err("Timed out sending input to peer")??;
     Ok(())
 }
 

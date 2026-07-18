@@ -486,10 +486,20 @@ impl ClientTransition {
         if w == 0 || h == 0 {
             return;
         }
+        let changed = (w, h) != (self.screen_w, self.screen_h);
         self.screen_w = w;
         self.screen_h = h;
         self.cursor_x = self.cursor_x.clamp(0, w as i32 - 1);
         self.cursor_y = self.cursor_y.clamp(0, h as i32 - 1);
+        if changed {
+            // Topology changes can relocate the OS cursor onto an edge. Require
+            // fresh movement after the resize rather than switching back from
+            // dwell accumulated on a display that no longer exists.
+            self.edge_dwell = 0;
+            if self.active {
+                self.edge_cooldown = 50;
+            }
+        }
     }
 
     pub fn needs_cursor_sync(&self) -> bool {
@@ -1279,6 +1289,34 @@ mod tests {
         ct.update_screen_size(1920, 0);
         assert_eq!(ct.screen_w, 1920);
         assert_eq!(ct.screen_h, 1080);
+    }
+
+    #[test]
+    fn client_display_resize_resets_stale_edge_dwell() {
+        let mut ct = ClientTransition::new(1920, 1080);
+        ct.handle(Message::SwitchScreen {
+            direction: Direction::Right,
+        });
+        ct.handle(Message::MouseMove { x: 100, y: 500 });
+        for _ in 0..50 {
+            ct.handle(Message::MouseMove { x: 0, y: 0 });
+        }
+        ct.handle(Message::MouseMove { x: -100, y: 0 });
+        for _ in 1..CLIENT_EDGE_DWELL - 1 {
+            assert!(matches!(
+                ct.handle(Message::MouseMove { x: 0, y: 0 }),
+                ClientOutput::InjectMove { .. }
+            ));
+        }
+
+        // Closing a laptop lid can resize the desktop while the cursor model is
+        // sitting on the old return edge. It must not complete that old dwell.
+        ct.update_screen_size(1280, 720);
+        assert!(matches!(
+            ct.handle(Message::MouseMove { x: 0, y: 0 }),
+            ClientOutput::InjectMove { .. }
+        ));
+        assert!(ct.is_active());
     }
 
     #[test]
