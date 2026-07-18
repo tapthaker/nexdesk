@@ -303,6 +303,10 @@ impl InputInjector for MacOSHidInjector {
         self.fallback.refresh_screen_size()
     }
 
+    fn take_screen_geometry_changed(&mut self) -> bool {
+        self.fallback.take_screen_geometry_changed()
+    }
+
     fn cursor_position(&self) -> Result<Option<(i32, i32)>> {
         self.fallback.cursor_position()
     }

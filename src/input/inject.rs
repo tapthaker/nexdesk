@@ -38,6 +38,13 @@ pub trait InputInjector: Send {
         self.screen_size()
     }
 
+    /// Return and clear whether the last refresh observed a topology change
+    /// that may not be visible in the aggregate width and height (for example,
+    /// replacing one display with another at a different origin).
+    fn take_screen_geometry_changed(&mut self) -> bool {
+        false
+    }
+
     /// Get the pointer position in the same normalized desktop coordinates as
     /// `move_mouse`. Backends that cannot query it may return `None`.
     fn cursor_position(&self) -> Result<Option<(i32, i32)>> {

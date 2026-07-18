@@ -144,18 +144,25 @@ fn inject_with_timing(
     result
 }
 
-async fn refresh_client_screen_snapshot(
+struct ClientScreenRefresh {
+    resize: Option<ScreenLayout>,
+    topology_changed: bool,
+}
+
+fn refresh_client_screen_snapshot(
     injector: &mut dyn InputInjector,
     transition: &mut ClientTransition,
     last_screen_w: &mut u32,
     last_screen_h: &mut u32,
-    control_send: &mut SendStream,
     context: &str,
-) -> Result<()> {
+) -> Result<ClientScreenRefresh> {
     let (w, h) = injector.refresh_screen_size()?;
     let screen = nonzero_screen_layout(w, h)
         .ok_or_else(|| eyre!("Invalid refreshed client screen size: {}x{}", w, h))?;
+    let size_changed = (w, h) != (*last_screen_w, *last_screen_h);
+    let topology_changed = size_changed || injector.take_screen_geometry_changed();
     transition.update_screen_size(w, h);
+
     // A display reconfiguration can move the real pointer independently of
     // Nexdesk's modeled cursor. Reconcile immediately so a closed laptop lid
     // cannot leave edge detection operating on the removed display.
@@ -163,14 +170,39 @@ async fn refresh_client_screen_snapshot(
         transition.sync_cursor_position(x, y);
     }
 
-    if (w, h) != (*last_screen_w, *last_screen_h) {
+    let resize = size_changed.then_some(screen);
+    if size_changed {
         info!(
             "Screen size refreshed {}: {}x{} -> {}x{}",
             context, *last_screen_w, *last_screen_h, w, h
         );
         *last_screen_w = w;
         *last_screen_h = h;
-        send_message(control_send, &Message::ScreenResize { screen }).await?;
+    } else if topology_changed {
+        info!(
+            "Screen topology refreshed {} without a size change",
+            context
+        );
+    }
+
+    Ok(ClientScreenRefresh {
+        resize,
+        topology_changed,
+    })
+}
+
+async fn announce_client_screen_refresh(
+    control_send: &mut SendStream,
+    refresh: &ClientScreenRefresh,
+) -> Result<()> {
+    if let Some(ref screen) = refresh.resize {
+        send_message(
+            control_send,
+            &Message::ScreenResize {
+                screen: screen.clone(),
+            },
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1094,9 +1126,18 @@ async fn handle_server_connection(
                         let ack = Message::HeartbeatAck { timestamp };
                         send_message(&mut control_send, &ack).await?;
                     }
-                    Ok(Some(Message::SwitchScreen { direction })) => {
+                    Ok(Some(control @ Message::SwitchScreen { .. }))
+                    | Ok(Some(control @ Message::ReleaseScreen)) => {
                         request_wake_display();
-                        info!("Client requested switch back: {:?}", direction);
+                        match control {
+                            Message::SwitchScreen { direction } => {
+                                info!("Client requested switch back: {:?}", direction);
+                            }
+                            Message::ReleaseScreen => {
+                                warn!("Client requested fail-safe ownership reset");
+                            }
+                            _ => unreachable!(),
+                        }
                         let messages = transition.on_switch_back();
 
                         // Restore Linux input ownership before waiting on the
@@ -1124,7 +1165,36 @@ async fn handle_server_connection(
                     Ok(Some(Message::ScreenResize { screen })) => {
                         if validate_screen_layout(&screen, "peer resize").is_ok() {
                             info!("Peer screen updated: {}x{}", screen.width, screen.height);
+                            let reclaim_control = transition.is_active();
                             transition.update_peer_screen(screen);
+
+                            // Even if the client's explicit ReleaseScreen is
+                            // delayed, a topology resize invalidates the active
+                            // handoff. Reclaim Linux locally before notifying it.
+                            if reclaim_control {
+                                warn!("Peer display changed during handoff — reclaiming Linux input");
+                                let messages = transition.reset_to_local();
+                                if use_layer_shell {
+                                    #[cfg(target_os = "linux")]
+                                    if let Some(ref tx) = capture_tx {
+                                        use crate::input::wayland_layer_shell::LayerShellCommand;
+                                        tx.send(LayerShellCommand::Release).ok();
+                                    }
+                                    lock_recover(&capturer, "input capturer").set_keyboard_grab(false).ok();
+                                    layer_shell_keyboard_grabbed = false;
+                                } else {
+                                    lock_recover(&capturer, "input capturer").set_grab(false).ok();
+                                }
+
+                                let mut sender = input_send.lock().await;
+                                for msg in messages {
+                                    if let Err(e) = send_message_uni(&mut sender, &msg).await {
+                                        warn!("Failed to notify peer of topology recovery: {}", e);
+                                        connection.close(0u32.into(), b"topology recovery failed");
+                                        break;
+                                    }
+                                }
+                            }
                         } else {
                             warn!("Ignoring invalid peer screen resize: {}x{}", screen.width, screen.height);
                         }
@@ -1625,17 +1695,24 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                             ClientOutput::Activate => {
                                 // Snapshot fresh geometry at every handoff and use
                                 // that same snapshot for movement and edge checks.
-                                if let Err(e) = refresh_client_screen_snapshot(
+                                match refresh_client_screen_snapshot(
                                     &mut *injector,
                                     &mut transition,
                                     &mut last_screen_w,
                                     &mut last_screen_h,
-                                    &mut control_send,
                                     "on remote activation",
-                                )
-                                .await
-                                {
-                                    warn!("Failed to refresh screen size on activation: {}", e);
+                                ) {
+                                    Ok(refresh) => {
+                                        if let Err(e) = announce_client_screen_refresh(
+                                            &mut control_send,
+                                            &refresh,
+                                        )
+                                        .await
+                                        {
+                                            warn!("Failed to announce activation screen size: {}", e);
+                                        }
+                                    }
+                                    Err(e) => warn!("Failed to refresh screen size on activation: {}", e),
                                 }
                                 if let Err(e) = injector.set_cursor_visible(true) {
                                     warn!("Failed to show cursor on remote activation: {}", e);
@@ -1656,17 +1733,24 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 }
                                 activation_started = None;
                                 info!("Server reclaimed control");
-                                if let Err(e) = refresh_client_screen_snapshot(
+                                match refresh_client_screen_snapshot(
                                     &mut *injector,
                                     &mut transition,
                                     &mut last_screen_w,
                                     &mut last_screen_h,
-                                    &mut control_send,
                                     "on deactivation",
-                                )
-                                .await
-                                {
-                                    warn!("Failed to refresh screen size on deactivation: {}", e);
+                                ) {
+                                    Ok(refresh) => {
+                                        if let Err(e) = announce_client_screen_refresh(
+                                            &mut control_send,
+                                            &refresh,
+                                        )
+                                        .await
+                                        {
+                                            warn!("Failed to announce deactivation screen size: {}", e);
+                                        }
+                                    }
+                                    Err(e) => warn!("Failed to refresh screen size on deactivation: {}", e),
                                 }
                             }
                             ClientOutput::InjectMove { x, y } => {
@@ -1709,17 +1793,24 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 if let Err(e) = send_message(&mut control_send, &switch_msg).await {
                                     warn!("Failed to request switch back: {}", e);
                                 }
-                                if let Err(e) = refresh_client_screen_snapshot(
+                                match refresh_client_screen_snapshot(
                                     &mut *injector,
                                     &mut transition,
                                     &mut last_screen_w,
                                     &mut last_screen_h,
-                                    &mut control_send,
                                     "on switch back",
-                                )
-                                .await
-                                {
-                                    warn!("Failed to refresh screen size on switch back: {}", e);
+                                ) {
+                                    Ok(refresh) => {
+                                        if let Err(e) = announce_client_screen_refresh(
+                                            &mut control_send,
+                                            &refresh,
+                                        )
+                                        .await
+                                        {
+                                            warn!("Failed to announce switch-back screen size: {}", e);
+                                        }
+                                    }
+                                    Err(e) => warn!("Failed to refresh screen size on switch back: {}", e),
                                 }
                                 // Check clipboard for files and transfer them
                                 let ft_conn = connection.clone();
@@ -1841,25 +1932,60 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                 }
             }
             _ = screen_check.tick() => {
-                // Display topology can change while the remote screen is active
-                // (notably when a MacBook lid is closed). Refresh in both states
-                // so movement and the return edge recover without a reconnect.
-                let context = if transition.is_active() {
+                // Continuing a handoff across a topology mutation is unsafe:
+                // CoreGraphics may relocate the pointer while Linux still owns
+                // an evdev keyboard grab. Both peers independently reclaim
+                // local control, then the next handoff starts with fresh bounds.
+                let was_active = transition.is_active();
+                let context = if was_active {
                     "while active"
                 } else {
                     "while inactive"
                 };
-                if let Err(e) = refresh_client_screen_snapshot(
+                match refresh_client_screen_snapshot(
                     &mut *injector,
                     &mut transition,
                     &mut last_screen_w,
                     &mut last_screen_h,
-                    &mut control_send,
                     context,
-                )
-                .await
-                {
-                    warn!("Failed to refresh inactive screen size: {}", e);
+                ) {
+                    Ok(refresh) => {
+                        if was_active && refresh.topology_changed {
+                            warn!("Display topology changed during handoff — reclaiming local control");
+                            let _ = transition.handle(Message::ReleaseScreen);
+                            release_injected_inputs(
+                                &mut *injector,
+                                &mut injected_keys,
+                                &mut injected_buttons,
+                            );
+                            if let Err(e) = injector.set_cursor_visible(false) {
+                                warn!("Failed to hide cursor after topology recovery: {}", e);
+                            }
+                            activation_started = None;
+
+                            // ReleaseScreen is valid in both directions as a
+                            // fail-safe ownership reset. Send it before resize.
+                            if let Err(e) = send_message(
+                                &mut control_send,
+                                &Message::ReleaseScreen,
+                            )
+                            .await
+                            {
+                                warn!("Failed to request topology recovery: {}", e);
+                                break;
+                            }
+                        }
+                        if let Err(e) = announce_client_screen_refresh(
+                            &mut control_send,
+                            &refresh,
+                        )
+                        .await
+                        {
+                            warn!("Failed to announce refreshed screen size: {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => warn!("Failed to refresh {} screen size: {}", context, e),
                 }
             }
         }
@@ -2321,6 +2447,62 @@ fn spawn_message_reader(
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    struct GeometryInjector {
+        size: (u32, u32),
+        changed: bool,
+        cursor: (i32, i32),
+    }
+
+    impl InputInjector for GeometryInjector {
+        fn inject(&mut self, _event: &Message) -> Result<()> {
+            Ok(())
+        }
+
+        fn move_mouse(&mut self, _x: i32, _y: i32) -> Result<()> {
+            Ok(())
+        }
+
+        fn screen_size(&self) -> Result<(u32, u32)> {
+            Ok(self.size)
+        }
+
+        fn take_screen_geometry_changed(&mut self) -> bool {
+            std::mem::take(&mut self.changed)
+        }
+
+        fn cursor_position(&self) -> Result<Option<(i32, i32)>> {
+            Ok(Some(self.cursor))
+        }
+    }
+
+    #[test]
+    fn client_refresh_detects_same_size_topology_changes() {
+        let mut injector = GeometryInjector {
+            size: (1920, 1080),
+            changed: true,
+            cursor: (400, 300),
+        };
+        let mut transition = ClientTransition::new(1920, 1080);
+        transition.handle(Message::SwitchScreen {
+            direction: protocol::Direction::Right,
+        });
+        let mut width = 1920;
+        let mut height = 1080;
+
+        let refresh = refresh_client_screen_snapshot(
+            &mut injector,
+            &mut transition,
+            &mut width,
+            &mut height,
+            "during test",
+        )
+        .unwrap();
+
+        assert!(refresh.topology_changed);
+        assert!(refresh.resize.is_none());
+        assert!(!injector.changed);
+    }
 
     #[test]
     fn listen_port_rejects_zero() {

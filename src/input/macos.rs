@@ -355,6 +355,9 @@ pub struct MacOSInjector {
     scroll_y_remainder: f64,
     /// Desktop geometry snapshot shared by movement and edge reconciliation.
     desktop_bounds: DesktopBounds,
+    /// Set when refresh observes any bounds/topology change, including one
+    /// whose aggregate width and height happen to remain unchanged.
+    geometry_changed: bool,
     /// Tracks CoreGraphics' balanced cursor hide/show calls.
     cursor_hidden: bool,
 }
@@ -408,6 +411,7 @@ impl MacOSInjector {
             scroll_x_remainder: 0.0,
             scroll_y_remainder: 0.0,
             desktop_bounds,
+            geometry_changed: false,
             cursor_hidden: false,
         })
     }
@@ -772,8 +776,14 @@ impl InputInjector for MacOSInjector {
     }
 
     fn refresh_screen_size(&mut self) -> Result<(u32, u32)> {
-        self.desktop_bounds = refresh_desktop_bounds()?;
+        let refreshed = refresh_desktop_bounds()?;
+        self.geometry_changed |= refreshed != self.desktop_bounds;
+        self.desktop_bounds = refreshed;
         self.screen_size()
+    }
+
+    fn take_screen_geometry_changed(&mut self) -> bool {
+        std::mem::take(&mut self.geometry_changed)
     }
 
     fn cursor_position(&self) -> Result<Option<(i32, i32)>> {
