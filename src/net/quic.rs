@@ -146,7 +146,6 @@ fn inject_with_timing(
 
 struct ClientScreenRefresh {
     resize: Option<ScreenLayout>,
-    topology_changed: bool,
 }
 
 fn refresh_client_screen_snapshot(
@@ -185,10 +184,7 @@ fn refresh_client_screen_snapshot(
         );
     }
 
-    Ok(ClientScreenRefresh {
-        resize,
-        topology_changed,
-    })
+    Ok(ClientScreenRefresh { resize })
 }
 
 async fn announce_client_screen_refresh(
@@ -1185,36 +1181,10 @@ async fn handle_server_connection(
                     Ok(Some(Message::ScreenResize { screen })) => {
                         if validate_screen_layout(&screen, "peer resize").is_ok() {
                             info!("Peer screen updated: {}x{}", screen.width, screen.height);
-                            let reclaim_control = transition.is_active();
+                            // A resize updates future entry placement but does not
+                            // transfer ownership. The active client reconciles its
+                            // real cursor against the new geometry itself.
                             transition.update_peer_screen(screen);
-
-                            // Even if the client's explicit ReleaseScreen is
-                            // delayed, a topology resize invalidates the active
-                            // handoff. Reclaim Linux locally before notifying it.
-                            if reclaim_control {
-                                warn!("Peer display changed during handoff — reclaiming Linux input");
-                                let messages = transition.reset_to_local();
-                                if use_layer_shell {
-                                    #[cfg(target_os = "linux")]
-                                    if let Some(ref tx) = capture_tx {
-                                        use crate::input::wayland_layer_shell::LayerShellCommand;
-                                        tx.send(LayerShellCommand::Release).ok();
-                                    }
-                                    lock_recover(&capturer, "input capturer").set_keyboard_grab(false).ok();
-                                    layer_shell_keyboard_grabbed = false;
-                                } else {
-                                    lock_recover(&capturer, "input capturer").set_grab(false).ok();
-                                }
-
-                                let mut sender = input_send.lock().await;
-                                for msg in messages {
-                                    if let Err(e) = send_message_uni(&mut sender, &msg).await {
-                                        warn!("Failed to notify peer of topology recovery: {}", e);
-                                        connection.close(0u32.into(), b"topology recovery failed");
-                                        break;
-                                    }
-                                }
-                            }
                         } else {
                             warn!("Ignoring invalid peer screen resize: {}x{}", screen.width, screen.height);
                         }
@@ -1952,12 +1922,11 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                 }
             }
             _ = screen_check.tick() => {
-                // Continuing a handoff across a topology mutation is unsafe:
-                // CoreGraphics may relocate the pointer while Linux still owns
-                // an evdev keyboard grab. Both peers independently reclaim
-                // local control, then the next handoff starts with fresh bounds.
-                let was_active = transition.is_active();
-                let context = if was_active {
+                // Refresh geometry without changing ownership. CoreGraphics can
+                // relocate the pointer when a display disappears; the snapshot
+                // refresh reconciles the model to that real position and resets
+                // stale edge dwell before processing more relative movement.
+                let context = if transition.is_active() {
                     "while active"
                 } else {
                     "while inactive"
@@ -1970,35 +1939,6 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                     context,
                 ) {
                     Ok(refresh) => {
-                        if was_active && refresh.topology_changed {
-                            warn!(
-                                "Display topology changed during handoff — reclaiming local control (held keys={}, buttons={})",
-                                injected_keys.len(),
-                                injected_buttons.len()
-                            );
-                            let _ = transition.handle(Message::ReleaseScreen);
-                            release_injected_inputs(
-                                &mut *injector,
-                                &mut injected_keys,
-                                &mut injected_buttons,
-                            );
-                            if let Err(e) = injector.set_cursor_visible(false) {
-                                warn!("Failed to hide cursor after topology recovery: {}", e);
-                            }
-                            activation_started = None;
-
-                            // ReleaseScreen is valid in both directions as a
-                            // fail-safe ownership reset. Send it before resize.
-                            if let Err(e) = send_message(
-                                &mut control_send,
-                                &Message::ReleaseScreen,
-                            )
-                            .await
-                            {
-                                warn!("Failed to request topology recovery: {}", e);
-                                break;
-                            }
-                        }
                         if let Err(e) = announce_client_screen_refresh(
                             &mut control_send,
                             &refresh,
@@ -2501,7 +2441,7 @@ mod tests {
     }
 
     #[test]
-    fn client_refresh_detects_same_size_topology_changes() {
+    fn client_refresh_preserves_active_handoff_across_topology_changes() {
         let mut injector = GeometryInjector {
             size: (1920, 1080),
             changed: true,
@@ -2523,9 +2463,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(refresh.topology_changed);
         assert!(refresh.resize.is_none());
         assert!(!injector.changed);
+        assert!(transition.is_active());
     }
 
     #[test]
