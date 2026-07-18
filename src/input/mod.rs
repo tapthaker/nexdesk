@@ -22,6 +22,7 @@ pub mod wayland_layer_shell {
         EdgeEnter {
             direction: crate::net::protocol::Direction,
         },
+        EdgeLeave,
         MouseMove {
             dx: f64,
             dy: f64,

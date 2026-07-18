@@ -41,6 +41,8 @@ pub enum LayerShellEvent {
     EdgeEnter {
         direction: Direction,
     },
+    /// Pointer left an edge surface after local ownership was restored.
+    EdgeLeave,
     MouseMove {
         dx: f64,
         dy: f64,
@@ -665,8 +667,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                     });
                 }
             }
-            wl_pointer::Event::Leave { serial, .. } => {
+            wl_pointer::Event::Leave {
+                serial, surface, ..
+            } => {
                 state.pointer_serial = serial;
+                if state.is_edge_surface(&surface) && !state.grabbed {
+                    debug!("Layer-shell: pointer left edge surface");
+                    state.send_event(LayerShellEvent::EdgeLeave);
+                }
             }
             wl_pointer::Event::Button {
                 button,

@@ -88,6 +88,9 @@ pub struct ServerTransition {
     last_buttons: u8,
     edge_cooldown: u32,
     edge_dwell: u32,
+    /// After reclaiming local control, require evidence that the pointer left
+    /// the transfer edge before another handoff can begin.
+    edge_armed: bool,
     pressed_keys: HashSet<u32>,
 }
 
@@ -102,12 +105,24 @@ impl ServerTransition {
             last_buttons: 0,
             edge_cooldown: 0,
             edge_dwell: 0,
+            edge_armed: true,
             pressed_keys: HashSet::new(),
         }
     }
 
     pub fn is_active(&self) -> bool {
         self.active
+    }
+
+    pub fn edge_is_armed(&self) -> bool {
+        self.edge_armed
+    }
+
+    pub fn rearm_edge(&mut self) {
+        if !self.active {
+            self.edge_armed = true;
+            self.edge_dwell = 0;
+        }
     }
 
     fn update_pressed_keys(&mut self, key_events: &[Message]) {
@@ -225,12 +240,14 @@ impl ServerTransition {
         self.update_pressed_keys(&key_events);
         if self.is_escape_combo() {
             self.active = false;
+            self.edge_armed = false;
             return ServerOutput::ForceRelease {
                 messages: self.release_pressed_keys(),
             };
         }
         if self.shortcut_direction().is_some() {
             self.active = false;
+            self.edge_armed = false;
             self.edge_cooldown = SERVER_EDGE_COOLDOWN;
             return ServerOutput::ShortcutRelease {
                 messages: self.release_pressed_keys(),
@@ -256,6 +273,7 @@ impl ServerTransition {
         // Safety escape: Ctrl+Alt+Escape always force-releases
         if self.active && self.is_escape_combo() {
             self.active = false;
+            self.edge_armed = false;
             return ServerOutput::ForceRelease {
                 messages: self.release_pressed_keys(),
             };
@@ -265,6 +283,7 @@ impl ServerTransition {
             self.edge_dwell = 0;
             if self.active {
                 self.active = false;
+                self.edge_armed = false;
                 return ServerOutput::ForceRelease {
                     messages: self.release_pressed_keys(),
                 };
@@ -275,6 +294,7 @@ impl ServerTransition {
         if let Some(dir) = self.shortcut_direction() {
             if self.active {
                 self.active = false;
+                self.edge_armed = false;
                 self.edge_cooldown = SERVER_EDGE_COOLDOWN;
                 return ServerOutput::ShortcutRelease {
                     messages: self.release_pressed_keys(),
@@ -313,6 +333,14 @@ impl ServerTransition {
         if !self.active {
             let at_edge = edge::detect_edge(clamped_x, clamped_y, sw, sh)
                 .filter(|d| self.trigger_edge.is_none_or(|e| *d == e));
+
+            if !self.edge_armed {
+                if at_edge.is_some() {
+                    self.edge_dwell = 0;
+                    return ServerOutput::Idle;
+                }
+                self.rearm_edge();
+            }
 
             if self.edge_cooldown > 0 {
                 self.edge_cooldown -= 1;
@@ -397,18 +425,22 @@ impl ServerTransition {
     /// Any keys currently considered down on the remote side must be released
     /// before we stop forwarding input; otherwise the client OS can be left
     /// with a synthetic key-down that never gets its key-up.
+    #[cfg(test)]
     pub fn on_switch_back(&mut self) -> Vec<Message> {
         self.active = false;
+        self.edge_armed = false;
         self.edge_cooldown = SERVER_EDGE_COOLDOWN;
         self.release_pressed_keys()
     }
 
     pub fn deactivate(&mut self) {
         self.active = false;
+        self.edge_armed = false;
     }
 
     pub fn deactivate_for_shortcut(&mut self) -> Vec<Message> {
         self.active = false;
+        self.edge_armed = false;
         self.edge_cooldown = SERVER_EDGE_COOLDOWN;
         self.release_pressed_keys()
     }
@@ -417,6 +449,7 @@ impl ServerTransition {
     /// screen state. Used when local safety takes priority over remote input.
     pub fn reset_to_local(&mut self) -> Vec<Message> {
         self.active = false;
+        self.edge_armed = false;
         self.edge_cooldown = SERVER_EDGE_COOLDOWN;
         let mut messages = vec![Message::ReleaseScreen];
         messages.extend(self.release_pressed_keys());
@@ -892,12 +925,20 @@ mod tests {
         let releases = st.on_switch_back();
         assert!(releases.is_empty());
 
-        // During cooldown, dwell shouldn't accumulate
-        for _ in 0..SERVER_EDGE_COOLDOWN {
+        // Remaining at the edge must never re-arm, regardless of time.
+        for _ in 0..SERVER_EDGE_COOLDOWN * 2 {
             st.poll(1919, 500, 1920, 1080, 0, vec![]);
         }
-        // Cooldown just expired, dwell should be 0
-        // Need full dwell again
+        assert!(!st.edge_is_armed());
+
+        // Moving away explicitly rearms the edge, then the normal cooldown
+        // expires before a fresh dwell can activate it again.
+        st.poll(1000, 500, 1920, 1080, 0, vec![]);
+        assert!(st.edge_is_armed());
+        for _ in 1..SERVER_EDGE_COOLDOWN {
+            st.poll(1919, 500, 1920, 1080, 0, vec![]);
+        }
+        // Cooldown just expired, dwell should be 0. Need full dwell again.
         for i in 0..EDGE_DWELL_THRESHOLD - 1 {
             let out = st.poll(1919, 500, 1920, 1080, 0, vec![]);
             assert!(matches!(out, ServerOutput::Idle), "at dwell {}", i);

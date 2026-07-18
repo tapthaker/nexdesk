@@ -974,6 +974,16 @@ async fn handle_server_connection(
 
                 match event {
                     LayerShellEvent::EdgeEnter { direction } => {
+                        if !transition.edge_is_armed() {
+                            info!(
+                                "Ignoring layer-shell edge enter ({:?}) until pointer leaves the reclaim edge",
+                                direction
+                            );
+                            if let Some(ref tx) = capture_tx {
+                                tx.send(LayerShellCommand::Release).ok();
+                            }
+                            continue;
+                        }
                         let messages = transition.activate_instant(direction);
                         info!("Layer-shell edge enter ({:?}) — switching to remote", direction);
                         match lock_recover(&capturer, "input capturer").set_keyboard_grab(true) {
@@ -1021,6 +1031,13 @@ async fn handle_server_connection(
                                 }
                             }
                         });
+                    }
+                    LayerShellEvent::EdgeLeave => {
+                        let was_armed = transition.edge_is_armed();
+                        transition.rearm_edge();
+                        if !was_armed && transition.edge_is_armed() {
+                            info!("Layer-shell transfer edge rearmed after pointer left it");
+                        }
                     }
                     LayerShellEvent::MouseMove { dx, dy } => {
                         if transition.is_active() {
@@ -1138,7 +1155,9 @@ async fn handle_server_connection(
                             }
                             _ => unreachable!(),
                         }
-                        let messages = transition.on_switch_back();
+                        // Echo ReleaseScreen back to the client as an ownership
+                        // reset acknowledgement, followed by held-key releases.
+                        let messages = transition.reset_to_local();
 
                         // Restore Linux input ownership before waiting on the
                         // stream back to the Mac. During lid/display changes
@@ -1155,6 +1174,7 @@ async fn handle_server_connection(
                             lock_recover(&capturer, "input capturer").set_grab(false).ok();
                         }
 
+                        info!("Local input ownership restored; acknowledging client reset");
                         if !messages.is_empty() {
                             let mut sender = input_send.lock().await;
                             for msg in messages {
@@ -1951,7 +1971,11 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                 ) {
                     Ok(refresh) => {
                         if was_active && refresh.topology_changed {
-                            warn!("Display topology changed during handoff — reclaiming local control");
+                            warn!(
+                                "Display topology changed during handoff — reclaiming local control (held keys={}, buttons={})",
+                                injected_keys.len(),
+                                injected_buttons.len()
+                            );
                             let _ = transition.handle(Message::ReleaseScreen);
                             release_injected_inputs(
                                 &mut *injector,
