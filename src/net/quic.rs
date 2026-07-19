@@ -170,17 +170,28 @@ fn refresh_client_screen_snapshot(
     }
 
     let resize = size_changed.then_some(screen);
+    let (cursor_x, cursor_y, _, _, active, return_edge, dwell, cooldown) = transition.diagnostics();
     if size_changed {
         info!(
-            "Screen size refreshed {}: {}x{} -> {}x{}",
-            context, *last_screen_w, *last_screen_h, w, h
+            "Screen size refreshed {}: {}x{} -> {}x{}, active={}, cursor=({}, {}), return_edge={:?}, dwell={}, cooldown={}",
+            context,
+            *last_screen_w,
+            *last_screen_h,
+            w,
+            h,
+            active,
+            cursor_x,
+            cursor_y,
+            return_edge,
+            dwell,
+            cooldown
         );
         *last_screen_w = w;
         *last_screen_h = h;
     } else if topology_changed {
         info!(
-            "Screen topology refreshed {} without a size change",
-            context
+            "Screen topology refreshed {} without a size change: active={}, cursor=({}, {}), return_edge={:?}, dwell={}, cooldown={}",
+            context, active, cursor_x, cursor_y, return_edge, dwell, cooldown
         );
     }
 
@@ -897,7 +908,7 @@ async fn handle_server_connection(
             _ = layer_shell_key_poll_interval.tick(), if use_layer_shell && layer_shell_keyboard_grabbed && transition.is_active() => {
                 let key_events: Vec<Message> = {
                     let mut cap = lock_recover(&capturer, "input capturer");
-                    cap.poll_key_events()
+                    cap.poll_key_events_only()
                         .unwrap_or_default()
                         .into_iter()
                         .filter(|msg| matches!(msg, Message::KeyEvent { .. }))
@@ -1033,6 +1044,26 @@ async fn handle_server_connection(
                         transition.rearm_edge();
                         if !was_armed && transition.edge_is_armed() {
                             info!("Layer-shell transfer edge rearmed after pointer left it");
+                        }
+                    }
+                    LayerShellEvent::GrabLost => {
+                        warn!("Layer-shell pointer grab was lost — reclaiming Linux input");
+                        if transition.is_active() {
+                            let messages = transition.reset_to_local();
+                            // Recover local keyboard ownership before any network await.
+                            lock_recover(&capturer, "input capturer")
+                                .set_keyboard_grab(false)
+                                .ok();
+                            layer_shell_keyboard_grabbed = false;
+
+                            let mut sender = input_send.lock().await;
+                            for msg in messages {
+                                if let Err(e) = send_message_uni(&mut sender, &msg).await {
+                                    warn!("Failed to notify client after pointer grab loss: {}", e);
+                                    connection.close(0u32.into(), b"pointer grab lost");
+                                    break;
+                                }
+                            }
                         }
                     }
                     LayerShellEvent::MouseMove { dx, dy } => {
@@ -1634,6 +1665,7 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     let mut activation_input_messages: u64 = 0;
     let mut activation_inject_moves: u64 = 0;
     let mut activation_first_inject_logged = false;
+    let mut last_edge_diagnostic: Option<(protocol::Direction, Instant)> = None;
 
     loop {
         tokio::select! {
@@ -1707,7 +1739,16 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 if let Err(e) = injector.set_cursor_visible(true) {
                                     warn!("Failed to show cursor on remote activation: {}", e);
                                 }
-                                info!("Server sharing mouse");
+                                let direction = match &original_message {
+                                    Message::SwitchScreen { direction } => Some(*direction),
+                                    _ => None,
+                                };
+                                let (x, y, w, h, _, return_edge, dwell, cooldown) =
+                                    transition.diagnostics();
+                                info!(
+                                    "Server sharing mouse: entry={:?}, return_edge={:?}, cursor=({}, {}), screen={}x{}, dwell={}, cooldown={}",
+                                    direction, return_edge, x, y, w, h, dwell, cooldown
+                                );
                                 activation_started = Some(Instant::now());
                                 activation_input_messages = 0;
                                 activation_inject_moves = 0;
@@ -1745,6 +1786,26 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                             }
                             ClientOutput::InjectMove { x, y } => {
                                 activation_inject_moves += 1;
+                                let (_, _, w, h, _, return_edge, dwell, cooldown) =
+                                    transition.diagnostics();
+                                if let Some(edge) = crate::cursor::edge::detect_edge(x, y, w, h) {
+                                    let should_log = last_edge_diagnostic.is_none_or(
+                                        |(last_edge, at)| {
+                                            last_edge != edge
+                                                || at.elapsed() >= Duration::from_secs(1)
+                                        },
+                                    );
+                                    if should_log {
+                                        let actual = injector.cursor_position().ok().flatten();
+                                        info!(
+                                            "Client edge diagnostic: modeled=({}, {}), actual={:?}, screen={}x{}, edge={:?}, return_edge={:?}, dwell={}, cooldown={}",
+                                            x, y, actual, w, h, edge, return_edge, dwell, cooldown
+                                        );
+                                        last_edge_diagnostic = Some((edge, Instant::now()));
+                                    }
+                                } else {
+                                    last_edge_diagnostic = None;
+                                }
                                 if let Some(started) = activation_started {
                                     if !activation_first_inject_logged {
                                         activation_first_inject_logged = true;

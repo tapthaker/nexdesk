@@ -535,6 +535,19 @@ impl ClientTransition {
         }
     }
 
+    pub fn diagnostics(&self) -> (i32, i32, u32, u32, bool, Option<Direction>, u32, u32) {
+        (
+            self.cursor_x,
+            self.cursor_y,
+            self.screen_w,
+            self.screen_h,
+            self.active,
+            self.switch_back_edge,
+            self.edge_dwell,
+            self.edge_cooldown,
+        )
+    }
+
     pub fn needs_cursor_sync(&self) -> bool {
         if !self.active {
             return false;

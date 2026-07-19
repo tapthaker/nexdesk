@@ -43,6 +43,8 @@ pub enum LayerShellEvent {
     },
     /// Pointer left an edge surface after local ownership was restored.
     EdgeLeave,
+    /// The compositor broke the persistent pointer constraint unexpectedly.
+    GrabLost,
     MouseMove {
         dx: f64,
         dy: f64,
@@ -853,6 +855,38 @@ impl Dispatch<zxdg_output_v1::ZxdgOutputV1, wl_output::WlOutput> for WaylandStat
     }
 }
 
+impl Dispatch<zwp_locked_pointer_v1::ZwpLockedPointerV1, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        locked_pointer: &zwp_locked_pointer_v1::ZwpLockedPointerV1,
+        event: zwp_locked_pointer_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_locked_pointer_v1::Event::Locked => {
+                debug!("Layer-shell: pointer constraint confirmed locked");
+            }
+            zwp_locked_pointer_v1::Event::Unlocked => {
+                let is_current = state
+                    .grab
+                    .as_ref()
+                    .is_some_and(|grab| grab.locked_pointer == *locked_pointer);
+                if is_current {
+                    warn!("Layer-shell: compositor unexpectedly unlocked pointer constraint");
+                    // Clear local protocol state before the server handles the
+                    // notification so repeated Enter events cannot masquerade
+                    // as a valid active grab.
+                    state.release_grab();
+                    state.send_event(LayerShellEvent::GrabLost);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 // No-op dispatches for protocols that don't need event handling
 delegate_noop!(WaylandState: ignore wl_compositor::WlCompositor);
 delegate_noop!(WaylandState: ignore wl_surface::WlSurface);
@@ -865,7 +899,6 @@ delegate_noop!(WaylandState: ignore wl_seat::WlSeat);
 delegate_noop!(WaylandState: ignore wl_callback::WlCallback);
 delegate_noop!(WaylandState: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 delegate_noop!(WaylandState: ignore zwp_pointer_constraints_v1::ZwpPointerConstraintsV1);
-delegate_noop!(WaylandState: ignore zwp_locked_pointer_v1::ZwpLockedPointerV1);
 delegate_noop!(WaylandState: ignore zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1);
 delegate_noop!(WaylandState: ignore zxdg_output_manager_v1::ZxdgOutputManagerV1);
 delegate_noop!(WaylandState: ignore zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1);

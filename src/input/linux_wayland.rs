@@ -448,7 +448,31 @@ impl WaylandCapturer {
     /// Touchpad scroll sensitivity (fraction of screen per full-pad swipe).
     const TOUCHPAD_SCROLL_SPEED: f64 = 0.8;
 
-    /// Process all pending events from all devices.
+    fn drain_keyboard_events(&mut self) {
+        // One fetch drains the batch currently available. Do not loop until
+        // WouldBlock: a high-rate device can keep refilling its queue and
+        // monopolize the Tokio worker that owns the connection state machine.
+        for kdev in &mut self.keyboard_devices {
+            match kdev.fetch_events() {
+                Ok(events) => {
+                    for event in events {
+                        if let InputEventKind::Key(key) = event.kind() {
+                            record_key_event(
+                                &mut self.pressed_keys,
+                                &mut self.pending_key_events,
+                                key.code() as u32,
+                                event.value(),
+                            );
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Process the currently pending events from all devices.
     fn drain_events(&mut self) {
         let sw = self.screen_width as f64;
         let sh = self.screen_height as f64;
@@ -656,33 +680,7 @@ impl WaylandCapturer {
         // when sharing to a remote screen. The server loop clamps as needed
         // for local edge detection.
 
-        // Drain keyboard devices for key events
-        for kdev in &mut self.keyboard_devices {
-            loop {
-                match kdev.fetch_events() {
-                    Ok(events) => {
-                        let mut got_any = false;
-                        for event in events {
-                            got_any = true;
-                            if let InputEventKind::Key(key) = event.kind() {
-                                let code = key.code() as u32;
-                                record_key_event(
-                                    &mut self.pressed_keys,
-                                    &mut self.pending_key_events,
-                                    code,
-                                    event.value(),
-                                );
-                            }
-                        }
-                        if !got_any {
-                            break;
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
-                }
-            }
-        }
+        self.drain_keyboard_events();
     }
 }
 
@@ -800,6 +798,11 @@ impl InputCapture for WaylandCapturer {
         }
 
         Ok(events)
+    }
+
+    fn poll_key_events_only(&mut self) -> Result<Vec<Message>> {
+        self.drain_keyboard_events();
+        Ok(std::mem::take(&mut self.pending_key_events))
     }
 }
 

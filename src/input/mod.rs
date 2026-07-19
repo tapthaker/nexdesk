@@ -23,6 +23,7 @@ pub mod wayland_layer_shell {
             direction: crate::net::protocol::Direction,
         },
         EdgeLeave,
+        GrabLost,
         MouseMove {
             dx: f64,
             dy: f64,
