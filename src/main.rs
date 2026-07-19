@@ -1,18 +1,45 @@
-mod cli;
-mod clipboard;
-mod config;
-mod cursor;
-mod daemon;
-mod filetransfer;
-mod input;
-mod net;
-mod setup;
-mod status;
+use std::io::IsTerminal;
 
 use clap::Parser;
-use cli::{Cli, Command, DaemonCommand};
 use color_eyre::eyre::Result;
+use nexdesk::{
+    cli::{self, Cli, Command, DaemonCommand},
+    config, daemon, input, net, setup, status,
+};
 use tracing_subscriber::EnvFilter;
+
+fn direction_from_cli_edge(edge: cli::Edge) -> net::protocol::Direction {
+    match edge {
+        cli::Edge::Left => net::protocol::Direction::Left,
+        cli::Edge::Right => net::protocol::Direction::Right,
+        cli::Edge::Up => net::protocol::Direction::Up,
+        cli::Edge::Down => net::protocol::Direction::Down,
+    }
+}
+
+fn normalize_config_edge(edge: &str) -> String {
+    edge.trim().to_ascii_lowercase()
+}
+
+fn direction_from_config_edge(edge: &str) -> Option<net::protocol::Direction> {
+    match normalize_config_edge(edge).as_str() {
+        "left" => Some(net::protocol::Direction::Left),
+        "right" => Some(net::protocol::Direction::Right),
+        "top" | "up" => Some(net::protocol::Direction::Up),
+        "bottom" | "down" => Some(net::protocol::Direction::Down),
+        _ => None,
+    }
+}
+
+fn direction_from_config_edge_or_error(edge: &str) -> Result<net::protocol::Direction> {
+    direction_from_config_edge(edge).ok_or_else(|| {
+        let edge = status::terminal_safe(edge, status::MAX_STATUS_DISPLAY_BYTES);
+        color_eyre::eyre::eyre!(
+            "Invalid configured switch edge {:?}. Run `nexdesk daemon setup` or start with `nexdesk serve --edge <left|right|up|down>`.",
+            edge
+        )
+    })
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,15 +47,18 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Skip tracing for commands whose output is intended for direct terminal use.
-    if !matches!(&cli.command, Command::Setup | Command::Daemon { .. }) {
+    // Skip tracing init for setup/service commands — log output corrupts their user-facing output.
+    if !matches!(cli.command, Command::Daemon { .. } | Command::Log) {
         let filter = if cli.verbose {
             EnvFilter::new("nexdesk=debug")
         } else {
             EnvFilter::new("nexdesk=info")
         };
 
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(std::io::stderr().is_terminal())
+            .init();
     }
 
     match cli.command {
@@ -42,25 +72,18 @@ async fn main() -> Result<()> {
             net::quic::ping(&addr).await?;
         }
         Command::Serve { port, edge } => {
-            input::ensure_accessibility()?;
             let dir = if let Some(edge) = edge {
-                match edge {
-                    cli::Edge::Left => net::protocol::Direction::Left,
-                    cli::Edge::Right => net::protocol::Direction::Right,
-                    cli::Edge::Up => net::protocol::Direction::Up,
-                    cli::Edge::Down => net::protocol::Direction::Down,
-                }
+                direction_from_cli_edge(edge)
             } else {
                 let cfg = config::NexdeskConfig::load()?;
                 if let Some(ref edge_str) = cfg.switch_edge {
-                    match edge_str.as_str() {
-                        "left" => net::protocol::Direction::Left,
-                        "right" => net::protocol::Direction::Right,
-                        "top" | "up" => net::protocol::Direction::Up,
-                        "bottom" | "down" => net::protocol::Direction::Down,
-                        _ => net::protocol::Direction::Right,
-                    }
+                    direction_from_config_edge_or_error(edge_str)?
                 } else {
+                    if !std::io::stdin().is_terminal() {
+                        return Err(color_eyre::eyre::eyre!(
+                            "No switch edge configured and no interactive terminal is available. Run `nexdesk daemon setup` or start with `nexdesk serve --edge <left|right|up|down>`."
+                        ));
+                    }
                     let dir = setup::edge_picker::pick_edge()?;
                     let mut cfg = config::NexdeskConfig::load()?;
                     cfg.switch_edge = Some(
@@ -76,6 +99,7 @@ async fn main() -> Result<()> {
                     dir
                 }
             };
+            input::ensure_accessibility()?;
             net::quic::serve(port, Some(dir)).await?;
         }
         Command::Connect { addr } => {
@@ -88,15 +112,14 @@ async fn main() -> Result<()> {
         Command::Trust { fingerprint } => {
             net::tls::trust_fingerprint(&fingerprint)?;
         }
-        Command::Setup => {
-            setup::run_setup().await?;
-        }
-        Command::Daemon { action } => match action {
+        Command::Daemon { command } => match command {
+            DaemonCommand::Setup => setup::run_setup().await?,
+            DaemonCommand::Start => daemon::start_service()?,
+            DaemonCommand::Stop => daemon::stop_service()?,
             DaemonCommand::Status => daemon::print_status()?,
-            DaemonCommand::Start => daemon::start()?,
-            DaemonCommand::Stop => daemon::stop()?,
-            DaemonCommand::Logs => daemon::print_logs()?,
+            DaemonCommand::Log => daemon::print_log()?,
         },
+        Command::Log => daemon::print_log()?,
         Command::TestInput => {
             input::ensure_accessibility()?;
             use std::io::Write;
@@ -129,4 +152,59 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_configured_switch_edges() {
+        assert_eq!(
+            direction_from_config_edge("left"),
+            Some(net::protocol::Direction::Left)
+        );
+        assert_eq!(
+            direction_from_config_edge("right"),
+            Some(net::protocol::Direction::Right)
+        );
+        assert_eq!(
+            direction_from_config_edge("top"),
+            Some(net::protocol::Direction::Up)
+        );
+        assert_eq!(
+            direction_from_config_edge("up"),
+            Some(net::protocol::Direction::Up)
+        );
+        assert_eq!(
+            direction_from_config_edge("bottom"),
+            Some(net::protocol::Direction::Down)
+        );
+        assert_eq!(
+            direction_from_config_edge("down"),
+            Some(net::protocol::Direction::Down)
+        );
+        assert_eq!(
+            direction_from_config_edge("  RIGHT\n"),
+            Some(net::protocol::Direction::Right)
+        );
+        assert_eq!(direction_from_config_edge("invalid"), None);
+    }
+
+    #[test]
+    fn invalid_configured_switch_edge_is_an_error() {
+        let err = direction_from_config_edge_or_error("sideways").unwrap_err();
+        assert!(err.to_string().contains("Invalid configured switch edge"));
+        assert!(err.to_string().contains("nexdesk daemon setup"));
+    }
+
+    #[test]
+    fn invalid_configured_switch_edge_error_is_terminal_safe_and_bounded() {
+        let err = direction_from_config_edge_or_error(&format!("{}\x1b[31m", "x".repeat(2048)))
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("Invalid configured switch edge"));
+        assert!(!message.contains('\u{1b}'));
+        assert!(message.len() < 1300);
+    }
 }
