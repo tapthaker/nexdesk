@@ -57,6 +57,14 @@ A single test can be run with a fully qualified filter, for example:
 cargo test net::transition::tests::server_switch_back_releases_held_keys
 ```
 
+Generate an LCOV coverage report after installing [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov):
+
+```bash
+cargo llvm-cov --all-targets --lcov --output-path lcov.info
+```
+
+CI stores `lcov.info` as the `coverage-lcov` artifact. Coverage is initially informational and has no required percentage threshold.
+
 ## Current baseline
 
 At the start of the testability project on 2026-07-19:

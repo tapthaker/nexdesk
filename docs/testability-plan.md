@@ -82,7 +82,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T0.1.2** Add a test CI workflow that runs formatting and `cargo test --all-targets` on Linux with required native packages.
 - [x] **T0.1.3** Add a macOS test job so macOS-only adapters and tests compile and run.
 - [x] **T0.1.4** Add a non-blocking clippy job without `-D warnings`, then separately track the existing warning cleanup.
-- [ ] **T0.1.5** Add `cargo-llvm-cov` reporting and publish/store the coverage artifact without imposing an initial threshold.
+- [x] **T0.1.5** Add `cargo-llvm-cov` reporting and publish/store the coverage artifact without imposing an initial threshold.
 
 ### T0.2 — Expose a library without changing CLI behavior
 
@@ -330,4 +330,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `013906d` | T0.1.1 | Documented test commands, platform limits, and lint baseline. |
 | 2026-07-19 | `0855e7d` | T0.1.2 | Added Linux formatting and test CI. |
 | 2026-07-19 | `2943e1f` | T0.1.3 | Added macOS test CI for target-gated adapters. |
-| 2026-07-19 | this commit | T0.1.4 | Added advisory Linux clippy CI without a warning gate. |
+| 2026-07-19 | `5ece775` | T0.1.4 | Added advisory Linux clippy CI without a warning gate. |
+| 2026-07-19 | this commit | T0.1.5 | Added informational LCOV generation and artifact storage. |
