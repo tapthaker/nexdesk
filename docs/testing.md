@@ -1,6 +1,6 @@
 # Testing Nexdesk
 
-This document describes the repository's current verification commands and known platform limitations. The broader testability roadmap is tracked in [`testability-plan.md`](testability-plan.md).
+This document describes the repository's current verification commands and known platform limitations. The broader testability roadmap is tracked in [`testability-plan.md`](testability-plan.md), and test doubles follow the conventions in [`testing-fakes.md`](testing-fakes.md).
 
 ## Required toolchain
 
