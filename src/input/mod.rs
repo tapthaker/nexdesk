@@ -22,8 +22,6 @@ pub mod wayland_layer_shell {
         EdgeEnter {
             direction: crate::net::protocol::Direction,
         },
-        EdgeLeave,
-        GrabLost,
         MouseMove {
             dx: f64,
             dy: f64,
@@ -51,7 +49,6 @@ pub mod wayland_layer_shell {
 
     #[derive(Debug)]
     pub enum LayerShellCommand {
-        CaptureKeyboard,
         Release,
         Shutdown,
     }

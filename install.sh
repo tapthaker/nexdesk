@@ -63,74 +63,20 @@ BINARY="$INSTALL_DIR/nexdesk"
 mkdir -p "$INSTALL_DIR"
 
 # Download to temp file first, then atomic move (handles "Text file busy" when upgrading)
-MAX_DOWNLOAD_BYTES=$((100 * 1024 * 1024))
-TMPFILE=$(mktemp "$INSTALL_DIR/.nexdesk.tmp.XXXXXX")
-cleanup_tmp() {
-  [ -n "${TMPFILE:-}" ] && [ -f "$TMPFILE" ] && rm -f "$TMPFILE"
-}
-trap cleanup_tmp EXIT HUP INT TERM
-
-download_with_wget_limit() {
-  wget -q "$LATEST_URL" -O "$TMPFILE" &
-  wget_pid=$!
-  while kill -0 "$wget_pid" 2>/dev/null; do
-    if [ -f "$TMPFILE" ]; then
-      current_bytes=$(wc -c < "$TMPFILE" | tr -d ' ')
-      if [ "${current_bytes:-0}" -gt "$MAX_DOWNLOAD_BYTES" ]; then
-        kill "$wget_pid" 2>/dev/null || true
-        wait "$wget_pid" 2>/dev/null || true
-        printf '%sDownloaded binary is too large (%s bytes)%s\n' "$RED" "$current_bytes" "$NC"
-        return 1
-      fi
-    fi
-    sleep 1
-  done
-  wait "$wget_pid"
-}
-
+TMPFILE="$INSTALL_DIR/.nexdesk.tmp.$$"
 printf 'Downloading nexdesk-%s...\n' "$PLATFORM"
 if command -v curl > /dev/null 2>&1; then
-  curl -fsSL --max-filesize "$MAX_DOWNLOAD_BYTES" "$LATEST_URL" -o "$TMPFILE"
+  curl -fsSL "$LATEST_URL" -o "$TMPFILE"
 elif command -v wget > /dev/null 2>&1; then
-  download_with_wget_limit
+  wget -q "$LATEST_URL" -O "$TMPFILE"
 else
   printf '%scurl or wget required%s\n' "$RED" "$NC"
   exit 1
 fi
 
-if [ ! -s "$TMPFILE" ]; then
-  printf '%sDownloaded binary is empty%s\n' "$RED" "$NC"
-  exit 1
-fi
-DOWNLOAD_BYTES=$(wc -c < "$TMPFILE" | tr -d ' ')
-if [ "$DOWNLOAD_BYTES" -gt "$MAX_DOWNLOAD_BYTES" ]; then
-  printf '%sDownloaded binary is too large (%s bytes)%s\n' "$RED" "$DOWNLOAD_BYTES" "$NC"
-  exit 1
-fi
-
-chmod 755 "$TMPFILE"
+chmod +x "$TMPFILE"
 mv -f "$TMPFILE" "$BINARY"
-trap - EXIT HUP INT TERM
 printf '%sDownloaded%s %s-> %s%s\n' "$GREEN" "$NC" "$DIM" "$BINARY" "$NC"
-
-# If an existing background service is running, restart it so it does not keep
-# executing the unlinked pre-update binary. Initial installations are skipped.
-case "$OS" in
-  linux)
-    if command -v systemctl >/dev/null 2>&1 && \
-       systemctl --user is-active --quiet nexdesk.service 2>/dev/null; then
-      systemctl --user restart nexdesk.service
-      printf '%sRestarted%s nexdesk user service\n' "$GREEN" "$NC"
-    fi
-    ;;
-  darwin)
-    SERVICE="gui/$(id -u)/com.nexdesk.agent"
-    if launchctl print "$SERVICE" >/dev/null 2>&1; then
-      launchctl kickstart -k "$SERVICE"
-      printf '%sRestarted%s nexdesk LaunchAgent\n' "$GREEN" "$NC"
-    fi
-    ;;
-esac
 
 # ============================================
 # PATH Configuration
@@ -258,5 +204,5 @@ if [ "$NON_INTERACTIVE" != true ] && [ -c /dev/tty ]; then
   # Redirect stdin from /dev/tty so the TUI gets a real terminal.
   # The shell keeps /dev/tty open for the process lifetime, which is
   # important for macOS kqueue-based event polling in crossterm.
-  nexdesk daemon setup < /dev/tty
+  nexdesk setup < /dev/tty
 fi

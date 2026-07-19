@@ -9,41 +9,11 @@ const EDGE_DWELL_THRESHOLD: u32 = 50;
 const SERVER_EDGE_COOLDOWN: u32 = 125;
 const INSET: i32 = 20;
 const CLIENT_EDGE_DWELL: u32 = 8;
-const CLIENT_CURSOR_SYNC_MARGIN: i32 = 64;
 
-fn lower_inset(len: i32) -> i32 {
-    if len <= 0 {
-        0
-    } else {
-        INSET.clamp(0, len - 1)
-    }
-}
-
-fn upper_inset(len: i32) -> i32 {
-    if len <= 0 {
-        0
-    } else {
-        (len - 1 - INSET).clamp(0, len - 1)
-    }
-}
-
-fn clamp_with_inset(value: i32, len: i32) -> i32 {
-    if len <= 0 {
-        return 0;
-    }
-    let lo = lower_inset(len);
-    let hi = upper_inset(len);
-    if lo <= hi {
-        value.clamp(lo, hi)
-    } else {
-        value.clamp(0, len - 1)
-    }
-}
-
-// Do not synthesize keyboard repeat in the transition state. Capture backends
-// forward source-generated repeat events, preserving the configured delay/rate.
-// A timer here would risk endless repeats if a key-up were missed during a
-// switch-back or grab transition.
+// Do not synthesize keyboard repeat in nexdesk. The client OS will repeat
+// naturally after a forwarded key-down. Synthesizing repeat here is dangerous:
+// if the Linux capturer misses a key-up during a switch-back/grab transition,
+// the stale pressed key becomes an endless stream of key-downs on the client.
 
 // Evdev keycodes for the safety escape combo (Ctrl+Alt+Escape)
 const KEY_ESC: u32 = 1;
@@ -88,9 +58,6 @@ pub struct ServerTransition {
     last_buttons: u8,
     edge_cooldown: u32,
     edge_dwell: u32,
-    /// After reclaiming local control, require evidence that the pointer left
-    /// the transfer edge before another handoff can begin.
-    edge_armed: bool,
     pressed_keys: HashSet<u32>,
 }
 
@@ -105,24 +72,12 @@ impl ServerTransition {
             last_buttons: 0,
             edge_cooldown: 0,
             edge_dwell: 0,
-            edge_armed: true,
             pressed_keys: HashSet::new(),
         }
     }
 
     pub fn is_active(&self) -> bool {
         self.active
-    }
-
-    pub fn edge_is_armed(&self) -> bool {
-        self.edge_armed
-    }
-
-    pub fn rearm_edge(&mut self) {
-        if !self.active {
-            self.edge_armed = true;
-            self.edge_dwell = 0;
-        }
     }
 
     fn update_pressed_keys(&mut self, key_events: &[Message]) {
@@ -173,7 +128,7 @@ impl ServerTransition {
             return None;
         };
 
-        if self.trigger_edge.is_none_or(|edge| edge == direction) {
+        if self.trigger_edge.map_or(true, |edge| edge == direction) {
             Some(direction)
         } else {
             None
@@ -206,10 +161,10 @@ impl ServerTransition {
         let pw = self.peer_screen.width as i32;
         let ph = self.peer_screen.height as i32;
         let (rx, ry) = match direction {
-            Direction::Right => (lower_inset(pw), ph / 2),
-            Direction::Left => (upper_inset(pw), ph / 2),
-            Direction::Down => (pw / 2, lower_inset(ph)),
-            Direction::Up => (pw / 2, upper_inset(ph)),
+            Direction::Right => (INSET, ph / 2),
+            Direction::Left => (pw - 1 - INSET, ph / 2),
+            Direction::Down => (pw / 2, INSET),
+            Direction::Up => (pw / 2, ph - 1 - INSET),
         };
 
         vec![
@@ -228,7 +183,7 @@ impl ServerTransition {
     }
 
     fn push_key_events(&mut self, key_events: Vec<Message>, messages: &mut Vec<Message>) {
-        // Forward real press, release, and source-generated repeat key-downs.
+        // No synthetic repeats. Forward only real press/release transitions.
         messages.extend(key_events);
     }
 
@@ -240,14 +195,12 @@ impl ServerTransition {
         self.update_pressed_keys(&key_events);
         if self.is_escape_combo() {
             self.active = false;
-            self.edge_armed = false;
             return ServerOutput::ForceRelease {
                 messages: self.release_pressed_keys(),
             };
         }
         if self.shortcut_direction().is_some() {
             self.active = false;
-            self.edge_armed = false;
             self.edge_cooldown = SERVER_EDGE_COOLDOWN;
             return ServerOutput::ShortcutRelease {
                 messages: self.release_pressed_keys(),
@@ -273,28 +226,14 @@ impl ServerTransition {
         // Safety escape: Ctrl+Alt+Escape always force-releases
         if self.active && self.is_escape_combo() {
             self.active = false;
-            self.edge_armed = false;
             return ServerOutput::ForceRelease {
                 messages: self.release_pressed_keys(),
             };
         }
 
-        if sw == 0 || sh == 0 {
-            self.edge_dwell = 0;
-            if self.active {
-                self.active = false;
-                self.edge_armed = false;
-                return ServerOutput::ForceRelease {
-                    messages: self.release_pressed_keys(),
-                };
-            }
-            return ServerOutput::Idle;
-        }
-
         if let Some(dir) = self.shortcut_direction() {
             if self.active {
                 self.active = false;
-                self.edge_armed = false;
                 self.edge_cooldown = SERVER_EDGE_COOLDOWN;
                 return ServerOutput::ShortcutRelease {
                     messages: self.release_pressed_keys(),
@@ -311,10 +250,10 @@ impl ServerTransition {
                 let pw = self.peer_screen.width as i32;
                 let ph = self.peer_screen.height as i32;
                 let (rx, ry) = match dir {
-                    Direction::Right => (lower_inset(pw), ph / 2),
-                    Direction::Left => (upper_inset(pw), ph / 2),
-                    Direction::Down => (pw / 2, lower_inset(ph)),
-                    Direction::Up => (pw / 2, upper_inset(ph)),
+                    Direction::Right => (INSET, ph / 2),
+                    Direction::Left => (pw - 1 - INSET, ph / 2),
+                    Direction::Down => (pw / 2, INSET),
+                    Direction::Up => (pw / 2, ph - 1 - INSET),
                 };
 
                 return ServerOutput::Activate {
@@ -332,15 +271,7 @@ impl ServerTransition {
 
         if !self.active {
             let at_edge = edge::detect_edge(clamped_x, clamped_y, sw, sh)
-                .filter(|d| self.trigger_edge.is_none_or(|e| *d == e));
-
-            if !self.edge_armed {
-                if at_edge.is_some() {
-                    self.edge_dwell = 0;
-                    return ServerOutput::Idle;
-                }
-                self.rearm_edge();
-            }
+                .filter(|d| self.trigger_edge.map_or(true, |e| *d == e));
 
             if self.edge_cooldown > 0 {
                 self.edge_cooldown -= 1;
@@ -362,10 +293,10 @@ impl ServerTransition {
                 let pw = self.peer_screen.width as i32;
                 let ph = self.peer_screen.height as i32;
                 let (rx, ry) = match dir {
-                    Direction::Right => (lower_inset(pw), clamp_with_inset(my, ph)),
-                    Direction::Left => (upper_inset(pw), clamp_with_inset(my, ph)),
-                    Direction::Down => (clamp_with_inset(mx, pw), lower_inset(ph)),
-                    Direction::Up => (clamp_with_inset(mx, pw), upper_inset(ph)),
+                    Direction::Right => (INSET, my.clamp(INSET, ph - 1 - INSET)),
+                    Direction::Left => (pw - 1 - INSET, my.clamp(INSET, ph - 1 - INSET)),
+                    Direction::Down => (mx.clamp(INSET, pw - 1 - INSET), INSET),
+                    Direction::Up => (mx.clamp(INSET, pw - 1 - INSET), ph - 1 - INSET),
                 };
 
                 let messages = vec![
@@ -384,8 +315,8 @@ impl ServerTransition {
             let mut messages = Vec::new();
 
             // Mouse movement (relative deltas)
-            let dx = mx.saturating_sub(self.last_x);
-            let dy = my.saturating_sub(self.last_y);
+            let dx = mx - self.last_x;
+            let dy = my - self.last_y;
             if dx != 0 || dy != 0 {
                 messages.push(Message::MouseMove { x: dx, y: dy });
                 self.last_x = mx;
@@ -407,7 +338,7 @@ impl ServerTransition {
                 self.last_buttons = buttons;
             }
 
-            // Forward keyboard events, including source-generated repeats.
+            // Keyboard events: forward originals and synthesize repeats.
             self.push_key_events(key_events, &mut messages);
 
             ServerOutput::Forward { messages }
@@ -415,9 +346,7 @@ impl ServerTransition {
     }
 
     pub fn update_peer_screen(&mut self, screen: ScreenLayout) {
-        if screen.width > 0 && screen.height > 0 {
-            self.peer_screen = screen;
-        }
+        self.peer_screen = screen;
     }
 
     /// Deactivate because the client hit its return edge.
@@ -425,35 +354,20 @@ impl ServerTransition {
     /// Any keys currently considered down on the remote side must be released
     /// before we stop forwarding input; otherwise the client OS can be left
     /// with a synthetic key-down that never gets its key-up.
-    #[cfg(test)]
     pub fn on_switch_back(&mut self) -> Vec<Message> {
         self.active = false;
-        self.edge_armed = false;
         self.edge_cooldown = SERVER_EDGE_COOLDOWN;
         self.release_pressed_keys()
     }
 
     pub fn deactivate(&mut self) {
         self.active = false;
-        self.edge_armed = false;
     }
 
     pub fn deactivate_for_shortcut(&mut self) -> Vec<Message> {
         self.active = false;
-        self.edge_armed = false;
         self.edge_cooldown = SERVER_EDGE_COOLDOWN;
         self.release_pressed_keys()
-    }
-
-    /// Reclaim control on the server and explicitly reset the client's active
-    /// screen state. Used when local safety takes priority over remote input.
-    pub fn reset_to_local(&mut self) -> Vec<Message> {
-        self.active = false;
-        self.edge_armed = false;
-        self.edge_cooldown = SERVER_EDGE_COOLDOWN;
-        let mut messages = vec![Message::ReleaseScreen];
-        messages.extend(self.release_pressed_keys());
-        messages
     }
 }
 
@@ -472,7 +386,6 @@ fn opposite(dir: Direction) -> Direction {
 pub enum ClientOutput {
     Ignore,
     Activate,
-    Deactivate,
     InjectMove {
         x: i32,
         y: i32,
@@ -511,75 +424,11 @@ impl ClientTransition {
         }
     }
 
-    pub fn is_active(&self) -> bool {
-        self.active
-    }
-
     pub fn update_screen_size(&mut self, w: u32, h: u32) {
-        if w == 0 || h == 0 {
-            return;
-        }
-        let changed = (w, h) != (self.screen_w, self.screen_h);
         self.screen_w = w;
         self.screen_h = h;
         self.cursor_x = self.cursor_x.clamp(0, w as i32 - 1);
         self.cursor_y = self.cursor_y.clamp(0, h as i32 - 1);
-        if changed {
-            // Topology changes can relocate the OS cursor onto an edge. Require
-            // fresh movement after the resize rather than switching back from
-            // dwell accumulated on a display that no longer exists.
-            self.edge_dwell = 0;
-            if self.active {
-                self.edge_cooldown = 50;
-            }
-        }
-    }
-
-    pub fn diagnostics(&self) -> (i32, i32, u32, u32, bool, Option<Direction>, u32, u32) {
-        (
-            self.cursor_x,
-            self.cursor_y,
-            self.screen_w,
-            self.screen_h,
-            self.active,
-            self.switch_back_edge,
-            self.edge_dwell,
-            self.edge_cooldown,
-        )
-    }
-
-    pub fn needs_cursor_sync(&self) -> bool {
-        if !self.active {
-            return false;
-        }
-        match self.switch_back_edge {
-            Some(Direction::Left) => self.cursor_x <= CLIENT_CURSOR_SYNC_MARGIN,
-            Some(Direction::Right) => {
-                self.cursor_x >= self.screen_w as i32 - 1 - CLIENT_CURSOR_SYNC_MARGIN
-            }
-            Some(Direction::Up) => self.cursor_y <= CLIENT_CURSOR_SYNC_MARGIN,
-            Some(Direction::Down) => {
-                self.cursor_y >= self.screen_h as i32 - 1 - CLIENT_CURSOR_SYNC_MARGIN
-            }
-            None => false,
-        }
-    }
-
-    /// Reconcile the modeled cursor with the position accepted by the client
-    /// OS. This matters for non-rectangular multi-display layouts, where an OS
-    /// may constrain a requested point out of a gap between displays.
-    pub fn sync_cursor_position(&mut self, x: i32, y: i32) {
-        if !self.active || self.screen_w == 0 || self.screen_h == 0 {
-            return;
-        }
-        self.cursor_x = x.clamp(0, self.screen_w as i32 - 1);
-        self.cursor_y = y.clamp(0, self.screen_h as i32 - 1);
-
-        let actual_edge =
-            edge::detect_edge(self.cursor_x, self.cursor_y, self.screen_w, self.screen_h);
-        if actual_edge != self.switch_back_edge {
-            self.edge_dwell = 0;
-        }
     }
 
     pub fn handle(&mut self, message: Message) -> ClientOutput {
@@ -592,21 +441,14 @@ impl ClientTransition {
                 self.switch_back_edge = Some(opposite(direction));
                 ClientOutput::Activate
             }
-            Message::ReleaseScreen => {
-                self.active = false;
-                self.first_move = false;
-                self.edge_dwell = 0;
-                self.switch_back_edge = None;
-                ClientOutput::Deactivate
-            }
             Message::MouseMove { x, y } if self.active => {
                 if self.first_move {
                     self.cursor_x = x;
                     self.cursor_y = y;
                     self.first_move = false;
                 } else {
-                    self.cursor_x = self.cursor_x.saturating_add(x);
-                    self.cursor_y = self.cursor_y.saturating_add(y);
+                    self.cursor_x += x;
+                    self.cursor_y += y;
                 }
                 self.cursor_x = self.cursor_x.clamp(0, self.screen_w as i32 - 1);
                 self.cursor_y = self.cursor_y.clamp(0, self.screen_h as i32 - 1);
@@ -659,6 +501,13 @@ impl ClientTransition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn server_screen() -> ScreenLayout {
+        ScreenLayout {
+            width: 1920,
+            height: 1080,
+        }
+    }
 
     fn peer_screen() -> ScreenLayout {
         ScreenLayout {
@@ -793,24 +642,6 @@ mod tests {
     }
 
     #[test]
-    fn server_delta_saturates_extreme_positions() {
-        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
-        activate_server(&mut st);
-        st.last_x = i32::MIN;
-        st.last_y = i32::MAX;
-
-        let out = st.poll(i32::MAX, i32::MIN, 1920, 1080, 0, vec![]);
-        assert!(matches!(
-            out,
-            ServerOutput::Forward { messages }
-                if messages.iter().any(|m| matches!(
-                    m,
-                    Message::MouseMove { x: i32::MAX, y: i32::MIN }
-                ))
-        ));
-    }
-
-    #[test]
     fn server_button_change() {
         let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
         for _ in 0..EDGE_DWELL_THRESHOLD - 1 {
@@ -938,20 +769,12 @@ mod tests {
         let releases = st.on_switch_back();
         assert!(releases.is_empty());
 
-        // Remaining at the edge must never re-arm, regardless of time.
-        for _ in 0..SERVER_EDGE_COOLDOWN * 2 {
+        // During cooldown, dwell shouldn't accumulate
+        for _ in 0..SERVER_EDGE_COOLDOWN {
             st.poll(1919, 500, 1920, 1080, 0, vec![]);
         }
-        assert!(!st.edge_is_armed());
-
-        // Moving away explicitly rearms the edge, then the normal cooldown
-        // expires before a fresh dwell can activate it again.
-        st.poll(1000, 500, 1920, 1080, 0, vec![]);
-        assert!(st.edge_is_armed());
-        for _ in 1..SERVER_EDGE_COOLDOWN {
-            st.poll(1919, 500, 1920, 1080, 0, vec![]);
-        }
-        // Cooldown just expired, dwell should be 0. Need full dwell again.
+        // Cooldown just expired, dwell should be 0
+        // Need full dwell again
         for i in 0..EDGE_DWELL_THRESHOLD - 1 {
             let out = st.poll(1919, 500, 1920, 1080, 0, vec![]);
             assert!(matches!(out, ServerOutput::Idle), "at dwell {}", i);
@@ -1153,32 +976,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn server_reset_to_local_deactivates_and_notifies_client() {
-        let mut st = ServerTransition::new(
-            Some(Direction::Right),
-            ScreenLayout {
-                width: 1920,
-                height: 1080,
-            },
-        );
-        activate_server(&mut st);
-        st.update_key(KEY_LEFTCTRL, true);
-
-        let messages = st.reset_to_local();
-
-        assert!(!st.is_active());
-        assert!(matches!(messages.first(), Some(Message::ReleaseScreen)));
-        assert!(messages.iter().any(|message| matches!(
-            message,
-            Message::KeyEvent {
-                keycode: KEY_LEFTCTRL,
-                pressed: false,
-                ..
-            }
-        )));
-    }
-
     // ===== Client Tests =====
 
     #[test]
@@ -1195,20 +992,6 @@ mod tests {
             direction: Direction::Right,
         });
         assert!(matches!(out, ClientOutput::Activate));
-    }
-
-    #[test]
-    fn client_release_screen_deactivates_remote_control() {
-        let mut ct = ClientTransition::new(1920, 1080);
-        ct.handle(Message::SwitchScreen {
-            direction: Direction::Right,
-        });
-
-        let out = ct.handle(Message::ReleaseScreen);
-
-        assert!(matches!(out, ClientOutput::Deactivate));
-        assert!(!ct.active);
-        assert_eq!(ct.switch_back_edge, None);
     }
 
     #[test]
@@ -1267,110 +1050,6 @@ mod tests {
         } else {
             panic!("Expected InjectMove");
         }
-    }
-
-    #[test]
-    fn client_cursor_sync_prevents_false_edge_in_display_gap() {
-        let mut ct = ClientTransition::new(4030, 1440);
-        ct.handle(Message::SwitchScreen {
-            direction: Direction::Right,
-        });
-        ct.handle(Message::MouseMove { x: 1470, y: 1200 });
-        ct.edge_cooldown = 0;
-
-        // The modeled pointer can move into the rectangular union below a
-        // shorter left display, while macOS constrains the real pointer to the
-        // adjacent display at x=1470. Reconciliation must prevent false dwell
-        // at the virtual desktop's x=0 edge.
-        for _ in 0..CLIENT_EDGE_DWELL * 4 {
-            if ct.needs_cursor_sync() {
-                ct.sync_cursor_position(1470, 1200);
-            }
-            let out = ct.handle(Message::MouseMove { x: -500, y: 0 });
-            assert!(matches!(out, ClientOutput::InjectMove { .. }));
-        }
-        assert!(ct.active);
-    }
-
-    #[test]
-    fn client_cursor_sync_preserves_dwell_at_real_return_edge() {
-        let mut ct = ClientTransition::new(4030, 1440);
-        ct.handle(Message::SwitchScreen {
-            direction: Direction::Right,
-        });
-        ct.handle(Message::MouseMove { x: 0, y: 500 });
-        ct.edge_cooldown = 0;
-
-        let mut switched = false;
-        for _ in 0..CLIENT_EDGE_DWELL + 1 {
-            ct.sync_cursor_position(0, 500);
-            if matches!(
-                ct.handle(Message::MouseMove { x: -1, y: 0 }),
-                ClientOutput::SwitchBack { .. }
-            ) {
-                switched = true;
-                break;
-            }
-        }
-        assert!(switched);
-    }
-
-    #[test]
-    fn client_relative_move_saturates_before_clamping() {
-        let mut ct = ClientTransition::new(1920, 1080);
-        ct.handle(Message::SwitchScreen {
-            direction: Direction::Right,
-        });
-        ct.handle(Message::MouseMove {
-            x: i32::MAX,
-            y: i32::MIN,
-        });
-        let out = ct.handle(Message::MouseMove { x: i32::MAX, y: -1 });
-        if let ClientOutput::InjectMove { x, y } = out {
-            assert_eq!(x, 1919);
-            assert_eq!(y, 0);
-        } else {
-            panic!("Expected InjectMove");
-        }
-    }
-
-    #[test]
-    fn client_ignores_zero_sized_screen_update() {
-        let mut ct = ClientTransition::new(1920, 1080);
-        ct.update_screen_size(0, 1080);
-        assert_eq!(ct.screen_w, 1920);
-        assert_eq!(ct.screen_h, 1080);
-        ct.update_screen_size(1920, 0);
-        assert_eq!(ct.screen_w, 1920);
-        assert_eq!(ct.screen_h, 1080);
-    }
-
-    #[test]
-    fn client_display_resize_resets_stale_edge_dwell() {
-        let mut ct = ClientTransition::new(1920, 1080);
-        ct.handle(Message::SwitchScreen {
-            direction: Direction::Right,
-        });
-        ct.handle(Message::MouseMove { x: 100, y: 500 });
-        for _ in 0..50 {
-            ct.handle(Message::MouseMove { x: 0, y: 0 });
-        }
-        ct.handle(Message::MouseMove { x: -100, y: 0 });
-        for _ in 1..CLIENT_EDGE_DWELL - 1 {
-            assert!(matches!(
-                ct.handle(Message::MouseMove { x: 0, y: 0 }),
-                ClientOutput::InjectMove { .. }
-            ));
-        }
-
-        // Closing a laptop lid can resize the desktop while the cursor model is
-        // sitting on the old return edge. It must not complete that old dwell.
-        ct.update_screen_size(1280, 720);
-        assert!(matches!(
-            ct.handle(Message::MouseMove { x: 0, y: 0 }),
-            ClientOutput::InjectMove { .. }
-        ));
-        assert!(ct.is_active());
     }
 
     #[test]
@@ -1607,7 +1286,7 @@ mod tests {
         st.poll(1919, 500, 1920, 1080, 0, key);
 
         // Holding the key without new physical events must not generate more
-        // key-down messages. Source-generated repeats are forwarded separately.
+        // key-down messages. The client OS handles natural key repeat.
         for _ in 0..500 {
             let out = st.poll(1919, 500, 1920, 1080, 0, vec![]);
             if let ServerOutput::Forward { messages } = out {
@@ -1655,55 +1334,6 @@ mod tests {
     }
 
     // ===== activate_instant Tests =====
-
-    #[test]
-    fn server_ignores_zero_sized_peer_screen_update() {
-        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
-        st.update_peer_screen(ScreenLayout {
-            width: 0,
-            height: 1440,
-        });
-        assert_eq!(st.peer_screen.width, 2560);
-        assert_eq!(st.peer_screen.height, 1440);
-        st.update_peer_screen(ScreenLayout {
-            width: 1920,
-            height: 0,
-        });
-        assert_eq!(st.peer_screen.width, 2560);
-        assert_eq!(st.peer_screen.height, 1440);
-    }
-
-    #[test]
-    fn server_activation_handles_tiny_peer_screen() {
-        let mut st = ServerTransition::new(
-            Some(Direction::Right),
-            ScreenLayout {
-                width: 10,
-                height: 10,
-            },
-        );
-        for _ in 0..EDGE_DWELL_THRESHOLD {
-            st.poll(1919, 500, 1920, 1080, 0, vec![]);
-        }
-        assert!(st.is_active());
-    }
-
-    #[test]
-    fn server_ignores_zero_sized_local_screen() {
-        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
-        let out = st.poll(0, 0, 0, 1080, 0, vec![]);
-        assert!(matches!(out, ServerOutput::Idle));
-        assert!(!st.is_active());
-    }
-
-    #[test]
-    fn server_deactivates_on_zero_sized_local_screen() {
-        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
-        activate_server(&mut st);
-        let out = st.poll(0, 0, 1920, 0, 0, vec![]);
-        assert!(matches!(out, ServerOutput::ForceRelease { .. }));
-        assert!(!st.is_active());
-    }
 
     #[test]
     fn server_activate_instant_right() {

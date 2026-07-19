@@ -55,35 +55,17 @@ pub enum Command {
         fingerprint: String,
     },
 
-    /// Manage the background service
-    Daemon {
-        #[command(subcommand)]
-        command: DaemonCommand,
-    },
-
-    /// Show detailed service diagnostics and recent logs
-    Log,
-
-    /// Test input capture (prints mouse position for 10 seconds)
-    TestInput,
-}
-
-#[derive(Subcommand)]
-pub enum DaemonCommand {
-    /// Launch setup and install the background service
+    /// Launch the TUI setup wizard
     Setup,
-
-    /// Start the installed background service
-    Start,
-
-    /// Stop the background service
-    Stop,
 
     /// Show a short service/process/listener status summary
     Status,
 
     /// Show detailed service diagnostics and recent logs
     Log,
+
+    /// Test input capture (prints mouse position for 10 seconds)
+    TestInput,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]

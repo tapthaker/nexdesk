@@ -41,10 +41,6 @@ pub enum LayerShellEvent {
     EdgeEnter {
         direction: Direction,
     },
-    /// Pointer left an edge surface after local ownership was restored.
-    EdgeLeave,
-    /// The compositor broke the persistent pointer constraint unexpectedly.
-    GrabLost,
     MouseMove {
         dx: f64,
         dy: f64,
@@ -73,8 +69,6 @@ pub enum LayerShellEvent {
 /// Commands from the server loop to the Wayland capture task.
 #[derive(Debug)]
 pub enum LayerShellCommand {
-    /// Fall back to wl_keyboard capture when the evdev keyboard grab failed.
-    CaptureKeyboard,
     Release,
     Shutdown,
 }
@@ -244,21 +238,20 @@ pub fn try_create(
 
     // Create properly-sized transparent buffers and attach for configured surfaces
     for edge in &state.edge_surfaces {
-        if edge.configured {
-            let Some((width, height, stride, buf_size)) =
-                layer_buffer_geometry(edge.configured_width, edge.configured_height)
-            else {
-                warn!(
-                    "Skipping layer-shell edge buffer with invalid compositor size {}x{}",
-                    edge.configured_width, edge.configured_height
-                );
-                continue;
-            };
-
+        if edge.configured && edge.configured_width > 0 && edge.configured_height > 0 {
+            let stride = edge.configured_width * 4;
+            let buf_size = (stride * edge.configured_height) as usize;
             let fd = create_shm_file(buf_size)?;
             let pool = shm.create_pool(fd.as_fd(), buf_size as i32, &qh, ());
-            let buffer =
-                pool.create_buffer(0, width, height, stride, wl_shm::Format::Argb8888, &qh, ());
+            let buffer = pool.create_buffer(
+                0,
+                edge.configured_width as i32,
+                edge.configured_height as i32,
+                stride as i32,
+                wl_shm::Format::Argb8888,
+                &qh,
+                (),
+            );
             edge.surface.attach(Some(&buffer), 0, 0);
             edge.surface.commit();
         }
@@ -313,7 +306,6 @@ struct GrabState {
     shortcuts_inhibitor:
         Option<zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1>,
     surface: wl_surface::WlSurface,
-    keyboard_interactive: bool,
 }
 
 /// Key repeat state for a single held key.
@@ -420,10 +412,16 @@ impl WaylandState {
         // Hide cursor
         pointer.set_cursor(self.pointer_serial, None, 0, 0);
 
-        // Keep keyboard focus on the user's current window. The server normally
-        // captures the keyboard directly through evdev; giving this 1px overlay
-        // exclusive keyboard focus can make terminals emit focus/resize updates.
-        // Keyboard interactivity is enabled later only if the evdev grab fails.
+        // Enable keyboard interactivity on the corresponding layer surface
+        for edge in &self.edge_surfaces {
+            if edge.surface == *surface {
+                edge.layer_surface.set_keyboard_interactivity(
+                    zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive,
+                );
+                edge.surface.commit();
+                break;
+            }
+        }
 
         // Lock pointer
         let locked_pointer = pc.lock_pointer(
@@ -438,49 +436,21 @@ impl WaylandState {
         // Get relative pointer
         let relative_pointer = rpm.get_relative_pointer(pointer, qh, ());
 
-        // Inhibit shortcuts if both the protocol and seat are available. Global
-        // discovery order is compositor-dependent, so do not assume a seat is
-        // present just because the inhibitor manager was advertised.
-        let shortcuts_inhibitor = match (&self.shortcuts_inhibit_manager, &self.seat) {
-            (Some(mgr), Some(seat)) => Some(mgr.inhibit_shortcuts(surface, seat, qh, ())),
-            (Some(_), None) => {
-                debug!("Layer-shell: shortcuts inhibitor available before seat; skipping inhibit");
-                None
-            }
-            _ => None,
-        };
+        // Inhibit shortcuts if available
+        let shortcuts_inhibitor = self.shortcuts_inhibit_manager.as_ref().map(|mgr| {
+            let seat = self.seat.as_ref().unwrap();
+            mgr.inhibit_shortcuts(surface, seat, qh, ())
+        });
 
         self.grab = Some(GrabState {
             locked_pointer,
             relative_pointer,
             shortcuts_inhibitor,
             surface: surface.clone(),
-            keyboard_interactive: false,
         });
         self.grabbed = true;
 
         debug!("Layer-shell: pointer grabbed");
-    }
-
-    fn capture_keyboard(&mut self) {
-        let Some(grab) = self.grab.as_mut() else {
-            return;
-        };
-        if grab.keyboard_interactive {
-            return;
-        }
-
-        for edge in &self.edge_surfaces {
-            if edge.surface == grab.surface {
-                edge.layer_surface.set_keyboard_interactivity(
-                    zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive,
-                );
-                edge.surface.commit();
-                grab.keyboard_interactive = true;
-                debug!("Layer-shell: using exclusive keyboard-focus fallback");
-                break;
-            }
-        }
     }
 
     fn release_grab(&mut self) {
@@ -491,17 +461,14 @@ impl WaylandState {
                 inhibitor.destroy();
             }
 
-            // Do not commit the layer surface on the normal evdev path. Avoiding
-            // needless layer reconfiguration keeps terminal geometry stable.
-            if grab.keyboard_interactive {
-                for edge in &self.edge_surfaces {
-                    if edge.surface == grab.surface {
-                        edge.layer_surface.set_keyboard_interactivity(
-                            zwlr_layer_surface_v1::KeyboardInteractivity::None,
-                        );
-                        edge.surface.commit();
-                        break;
-                    }
+            // Disable keyboard interactivity
+            for edge in &self.edge_surfaces {
+                if edge.surface == grab.surface {
+                    edge.layer_surface.set_keyboard_interactivity(
+                        zwlr_layer_surface_v1::KeyboardInteractivity::None,
+                    );
+                    edge.surface.commit();
+                    break;
                 }
             }
         }
@@ -511,11 +478,11 @@ impl WaylandState {
     }
 
     fn next_repeat_deadline(&self) -> Option<Instant> {
-        let repeat_interval = repeat_interval(self.repeat_rate)?;
-        if self.held_keys.is_empty() {
+        if self.repeat_rate == 0 || self.held_keys.is_empty() {
             return None;
         }
-        let delay = repeat_delay_duration(self.repeat_delay);
+        let repeat_interval = Duration::from_millis((1000 / self.repeat_rate.max(1)) as u64);
+        let delay = Duration::from_millis(self.repeat_delay as u64);
 
         self.held_keys
             .iter()
@@ -531,11 +498,12 @@ impl WaylandState {
     }
 
     fn fire_repeats(&mut self) {
-        let Some(repeat_interval) = repeat_interval(self.repeat_rate) else {
+        if self.repeat_rate == 0 {
             return;
-        };
+        }
         let now = Instant::now();
-        let delay = repeat_delay_duration(self.repeat_delay);
+        let repeat_interval = Duration::from_millis((1000 / self.repeat_rate.max(1)) as u64);
+        let delay = Duration::from_millis(self.repeat_delay as u64);
 
         for ks in &mut self.held_keys {
             let elapsed = now.duration_since(ks.started);
@@ -669,14 +637,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                     });
                 }
             }
-            wl_pointer::Event::Leave {
-                serial, surface, ..
-            } => {
+            wl_pointer::Event::Leave { serial, .. } => {
                 state.pointer_serial = serial;
-                if state.is_edge_surface(&surface) && !state.grabbed {
-                    debug!("Layer-shell: pointer left edge surface");
-                    state.send_event(LayerShellEvent::EdgeLeave);
-                }
             }
             wl_pointer::Event::Button {
                 button,
@@ -855,38 +817,6 @@ impl Dispatch<zxdg_output_v1::ZxdgOutputV1, wl_output::WlOutput> for WaylandStat
     }
 }
 
-impl Dispatch<zwp_locked_pointer_v1::ZwpLockedPointerV1, ()> for WaylandState {
-    fn event(
-        state: &mut Self,
-        locked_pointer: &zwp_locked_pointer_v1::ZwpLockedPointerV1,
-        event: zwp_locked_pointer_v1::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-        match event {
-            zwp_locked_pointer_v1::Event::Locked => {
-                debug!("Layer-shell: pointer constraint confirmed locked");
-            }
-            zwp_locked_pointer_v1::Event::Unlocked => {
-                let is_current = state
-                    .grab
-                    .as_ref()
-                    .is_some_and(|grab| grab.locked_pointer == *locked_pointer);
-                if is_current {
-                    warn!("Layer-shell: compositor unexpectedly unlocked pointer constraint");
-                    // Clear local protocol state before the server handles the
-                    // notification so repeated Enter events cannot masquerade
-                    // as a valid active grab.
-                    state.release_grab();
-                    state.send_event(LayerShellEvent::GrabLost);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 // No-op dispatches for protocols that don't need event handling
 delegate_noop!(WaylandState: ignore wl_compositor::WlCompositor);
 delegate_noop!(WaylandState: ignore wl_surface::WlSurface);
@@ -899,24 +829,13 @@ delegate_noop!(WaylandState: ignore wl_seat::WlSeat);
 delegate_noop!(WaylandState: ignore wl_callback::WlCallback);
 delegate_noop!(WaylandState: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 delegate_noop!(WaylandState: ignore zwp_pointer_constraints_v1::ZwpPointerConstraintsV1);
+delegate_noop!(WaylandState: ignore zwp_locked_pointer_v1::ZwpLockedPointerV1);
 delegate_noop!(WaylandState: ignore zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1);
 delegate_noop!(WaylandState: ignore zxdg_output_manager_v1::ZxdgOutputManagerV1);
 delegate_noop!(WaylandState: ignore zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1);
 delegate_noop!(WaylandState: ignore zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1);
 
 // --- Helpers ---
-
-fn repeat_interval(rate: i32) -> Option<Duration> {
-    if rate <= 0 {
-        return None;
-    }
-    let millis = (1000 / u64::try_from(rate).ok()?).max(1);
-    Some(Duration::from_millis(millis))
-}
-
-fn repeat_delay_duration(delay: i32) -> Duration {
-    Duration::from_millis(u64::try_from(delay.max(0)).unwrap_or(0))
-}
 
 fn edge_anchor_size(direction: Direction) -> (zwlr_layer_surface_v1::Anchor, u32, u32) {
     use zwlr_layer_surface_v1::Anchor;
@@ -934,26 +853,6 @@ fn edge_anchor_size(direction: Direction) -> (zwlr_layer_surface_v1::Anchor, u32
         ),
         Direction::Down => (Anchor::Bottom | Anchor::Left | Anchor::Right, 0, 1),
     }
-}
-
-const MAX_LAYER_SHM_BUFFER_BYTES: usize = 64 * 1024 * 1024;
-
-fn layer_buffer_geometry(width: u32, height: u32) -> Option<(i32, i32, i32, usize)> {
-    if width == 0 || height == 0 {
-        return None;
-    }
-
-    let stride = width.checked_mul(4)?;
-    let size = usize::try_from(u64::from(stride).checked_mul(u64::from(height))?).ok()?;
-    if size > MAX_LAYER_SHM_BUFFER_BYTES
-        || width > i32::MAX as u32
-        || height > i32::MAX as u32
-        || stride > i32::MAX as u32
-    {
-        return None;
-    }
-
-    Some((width as i32, height as i32, stride as i32, size))
 }
 
 /// Create a shared memory file for the 1px transparent buffer.
@@ -985,34 +884,6 @@ fn is_modifier(keycode: u32) -> bool {
         125 |  // KEY_LEFTMETA
         126 // KEY_RIGHTMETA
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn key_repeat_timing_handles_malformed_compositor_values() {
-        assert_eq!(repeat_interval(0), None);
-        assert_eq!(repeat_interval(-10), None);
-        assert_eq!(repeat_interval(25), Some(Duration::from_millis(40)));
-        assert_eq!(repeat_interval(2_000), Some(Duration::from_millis(1)));
-        assert_eq!(repeat_delay_duration(-1), Duration::from_millis(0));
-        assert_eq!(repeat_delay_duration(600), Duration::from_millis(600));
-    }
-
-    #[test]
-    fn layer_buffer_geometry_rejects_invalid_or_oversized_compositor_sizes() {
-        assert_eq!(layer_buffer_geometry(0, 1), None);
-        assert_eq!(layer_buffer_geometry(1, 0), None);
-        assert_eq!(layer_buffer_geometry(u32::MAX, 1), None);
-        assert_eq!(layer_buffer_geometry(1, u32::MAX), None);
-        assert_eq!(
-            layer_buffer_geometry(4096, 4096),
-            Some((4096, 4096, 16_384, MAX_LAYER_SHM_BUFFER_BYTES))
-        );
-        assert_eq!(layer_buffer_geometry(4097, 4096), None);
-    }
 }
 
 // --- Async Event Loop ---
@@ -1066,10 +937,6 @@ async fn run_event_loop(
             }
             cmd = command_rx.recv() => {
                 match cmd {
-                    Some(LayerShellCommand::CaptureKeyboard) => {
-                        state.capture_keyboard();
-                        conn.flush().ok();
-                    }
                     Some(LayerShellCommand::Release) => {
                         state.release_grab();
                         conn.flush().ok();

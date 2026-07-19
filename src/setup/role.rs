@@ -3,7 +3,7 @@ use ratatui::{prelude::*, widgets::*};
 use super::app::SetupState;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &SetupState) {
-    let roles = [
+    let roles = vec![
         (
             "Server",
             "Captures input and sends it to clients. Run this on your primary machine.",

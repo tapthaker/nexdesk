@@ -17,13 +17,6 @@ pub trait InputCapture: Send {
     /// Poll for keyboard state changes. Returns key events since last call.
     fn poll_key_events(&mut self) -> Result<Vec<Message>>;
 
-    /// Poll only keyboard devices. Layer-shell already owns pointer delivery and
-    /// must not drain a continuously active evdev pointer queue on the async
-    /// connection task. Other backends may use the regular poll implementation.
-    fn poll_key_events_only(&mut self) -> Result<Vec<Message>> {
-        self.poll_key_events()
-    }
-
     /// Grab or ungrab input devices. When grabbed, the local desktop
     /// does not receive the events (exclusive access for remote sharing).
     fn set_grab(&mut self, _grab: bool) -> Result<()> {
