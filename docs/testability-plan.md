@@ -104,7 +104,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 ### T1.1 — Make client lifecycle decisions testable
 
-- [ ] **T1.1.1** Introduce `SessionExit` values for clean disconnect, retry, restart request, and fatal termination.
+- [x] **T1.1.1** Introduce `SessionExit` values for clean disconnect, retry, restart request, and fatal termination.
 - [ ] **T1.1.2** Change client internals to return restart intent instead of invoking `process::exit` below the composition root.
 - [ ] **T1.1.3** Add tests proving update and latency paths request restart only under intended conditions.
 - [ ] **T1.1.4** Move reconnect delay calculation into a pure retry-policy type with unit tests.
@@ -339,4 +339,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `3779f78` | T0.3.1 | Added property, CLI assertion, and virtual-time test dependencies. |
 | 2026-07-19 | `23b3f25` | T0.3.2 | Added a shared typed observation log for stateful fakes. |
 | 2026-07-19 | `ae2a887` | T0.3.3 | Added background task lifetime tracking for scenarios. |
-| 2026-07-19 | this commit | T0.3.4 | Documented stateful fake scripting and lifecycle conventions. |
+| 2026-07-19 | `86c874d` | T0.3.4 | Documented stateful fake scripting and lifecycle conventions. |
+| 2026-07-19 | this commit | T1.1.1 | Added typed session exit and restart outcomes. |

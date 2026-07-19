@@ -1,0 +1,65 @@
+use std::time::Duration;
+
+use color_eyre::eyre::Report;
+
+/// Why the composition root should restart the current process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestartReason {
+    UpdateInstalled { version: String },
+    LatencyWatchdog,
+}
+
+/// Terminal outcome from one client or server session attempt.
+///
+/// Application code returns lifecycle intent instead of exiting the process.
+/// The binary or service composition root decides how to apply that intent.
+#[derive(Debug)]
+pub enum SessionExit {
+    Disconnected,
+    RetryAfter(Duration),
+    RestartRequested(RestartReason),
+    Fatal(Report),
+}
+
+impl SessionExit {
+    pub fn fatal(error: impl Into<Report>) -> Self {
+        Self::Fatal(error.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use color_eyre::eyre::eyre;
+
+    use super::*;
+
+    #[test]
+    fn retry_outcome_preserves_requested_delay() {
+        let outcome = SessionExit::RetryAfter(Duration::from_secs(2));
+        assert!(matches!(
+            outcome,
+            SessionExit::RetryAfter(delay) if delay == Duration::from_secs(2)
+        ));
+    }
+
+    #[test]
+    fn restart_outcome_carries_a_typed_reason() {
+        let outcome = SessionExit::RestartRequested(RestartReason::UpdateInstalled {
+            version: "v1.2.3".to_string(),
+        });
+        assert!(matches!(
+            outcome,
+            SessionExit::RestartRequested(RestartReason::UpdateInstalled { version })
+                if version == "v1.2.3"
+        ));
+    }
+
+    #[test]
+    fn fatal_outcome_retains_the_error_report() {
+        let outcome = SessionExit::fatal(eyre!("handshake failed"));
+        let SessionExit::Fatal(error) = outcome else {
+            panic!("expected fatal outcome");
+        };
+        assert_eq!(error.to_string(), "handshake failed");
+    }
+}
