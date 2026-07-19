@@ -48,16 +48,56 @@ pub fn print_status() -> Result<()> {
     }
 }
 
-/// Print detailed daemon diagnostics and recent logs.
-pub fn print_log() -> Result<()> {
+/// Start the installed daemon/service.
+pub fn start() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        launchagent::print_log()
+        launchagent::start()
     }
 
     #[cfg(target_os = "linux")]
     {
-        systemd::print_log()
+        systemd::start()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(color_eyre::eyre::eyre!(
+            "Unsupported platform for daemon management"
+        ))
+    }
+}
+
+/// Stop the installed daemon/service.
+pub fn stop() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        launchagent::stop()
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        systemd::stop()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(color_eyre::eyre::eyre!(
+            "Unsupported platform for daemon management"
+        ))
+    }
+}
+
+/// Print detailed daemon diagnostics and recent logs.
+pub fn print_logs() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        launchagent::print_logs()
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        systemd::print_logs()
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

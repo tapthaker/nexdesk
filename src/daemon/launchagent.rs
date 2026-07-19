@@ -54,6 +54,49 @@ fn plist_content(args: &[&str]) -> String {
     )
 }
 
+pub fn start() -> Result<()> {
+    let path = plist_path();
+    if !path.is_file() {
+        return Err(eyre!(
+            "nexdesk daemon is not installed; run `nexdesk setup` first"
+        ));
+    }
+
+    let uid = current_uid();
+    let domain = format!("gui/{uid}");
+    let service = format!("{domain}/{LABEL}");
+
+    if command_stdout("launchctl", &["print", &service]).is_err() {
+        run_launchctl(&["bootstrap", &domain, path.to_string_lossy().as_ref()])
+            .wrap_err("Failed to load nexdesk daemon")?;
+    }
+    run_launchctl(&["enable", &service]).wrap_err("Failed to enable nexdesk daemon")?;
+    run_launchctl(&["kickstart", &service]).wrap_err("Failed to start nexdesk daemon")?;
+
+    println!("nexdesk daemon started");
+    Ok(())
+}
+
+pub fn stop() -> Result<()> {
+    if !plist_path().is_file() {
+        return Err(eyre!(
+            "nexdesk daemon is not installed; run `nexdesk setup` first"
+        ));
+    }
+
+    let uid = current_uid();
+    let service = format!("gui/{uid}/{LABEL}");
+
+    if command_stdout("launchctl", &["print", &service]).is_err() {
+        println!("nexdesk daemon is already stopped");
+        return Ok(());
+    }
+
+    run_launchctl(&["bootout", &service]).wrap_err("Failed to stop nexdesk daemon")?;
+    println!("nexdesk daemon stopped");
+    Ok(())
+}
+
 pub fn print_status() -> Result<()> {
     let uid = current_uid();
     let service = format!("gui/{uid}/{LABEL}");
@@ -62,7 +105,7 @@ pub fn print_status() -> Result<()> {
     let listener = command_stdout("sh", &["-c", "lsof -nP -iUDP:4242 2>/dev/null || true"])
         .unwrap_or_default();
 
-    println!("nexdesk status");
+    println!("nexdesk daemon status");
     println!("Service : {}", if loaded { "loaded" } else { "not loaded" });
     println!(
         "Process : {}",
@@ -81,15 +124,15 @@ pub fn print_status() -> Result<()> {
     );
     print_connection_summary();
     println!("Logs    : /tmp/nexdesk.out.log, /tmp/nexdesk.err.log");
-    println!("\nFor logs: nexdesk log");
+    println!("\nFor logs: nexdesk daemon logs");
     Ok(())
 }
 
-pub fn print_log() -> Result<()> {
+pub fn print_logs() -> Result<()> {
     let uid = current_uid();
     let service = format!("gui/{uid}/{LABEL}");
 
-    println!("nexdesk service log (LaunchAgent)\n");
+    println!("nexdesk daemon logs (LaunchAgent)\n");
     print_command("launchctl", &["print", &service])?;
     print_command("pgrep", &["-a", "nexdesk"])?;
     print_command("sh", &["-c", "lsof -nP -iUDP:4242 2>/dev/null || true"])?;

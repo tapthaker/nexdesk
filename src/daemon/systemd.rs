@@ -72,6 +72,33 @@ WantedBy=default.target
     )
 }
 
+pub fn start() -> Result<()> {
+    if !service_file_path().is_file() {
+        return Err(eyre!(
+            "nexdesk daemon is not installed; run `nexdesk setup` first"
+        ));
+    }
+
+    run_systemctl(&["--user", "daemon-reload"]).wrap_err("Failed to reload systemd user units")?;
+    run_systemctl(&["--user", "start", "nexdesk.service"])
+        .wrap_err("Failed to start nexdesk daemon")?;
+    println!("nexdesk daemon started");
+    Ok(())
+}
+
+pub fn stop() -> Result<()> {
+    if !service_file_path().is_file() {
+        return Err(eyre!(
+            "nexdesk daemon is not installed; run `nexdesk setup` first"
+        ));
+    }
+
+    run_systemctl(&["--user", "stop", "nexdesk.service"])
+        .wrap_err("Failed to stop nexdesk daemon")?;
+    println!("nexdesk daemon stopped");
+    Ok(())
+}
+
 pub fn print_status() -> Result<()> {
     let active = command_stdout("systemctl", &["--user", "is-active", "nexdesk.service"])
         .unwrap_or_else(|_| "unknown".into());
@@ -87,7 +114,7 @@ pub fn print_status() -> Result<()> {
     )
     .unwrap_or_default();
 
-    println!("nexdesk status");
+    println!("nexdesk daemon status");
     println!(
         "Service : {}",
         if active == "active" {
@@ -113,12 +140,12 @@ pub fn print_status() -> Result<()> {
         }
     );
     print_connection_summary();
-    println!("\nFor logs: nexdesk log");
+    println!("\nFor logs: nexdesk daemon logs");
     Ok(())
 }
 
-pub fn print_log() -> Result<()> {
-    println!("nexdesk service log (systemd user)\n");
+pub fn print_logs() -> Result<()> {
+    println!("nexdesk daemon logs (systemd user)\n");
     print_command("systemctl", &["--user", "is-active", "nexdesk.service"])?;
     print_command("systemctl", &["--user", "is-enabled", "nexdesk.service"])?;
     print_command(

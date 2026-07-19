@@ -10,7 +10,7 @@ mod setup;
 mod status;
 
 use clap::Parser;
-use cli::{Cli, Command};
+use cli::{Cli, Command, DaemonCommand};
 use color_eyre::eyre::Result;
 use tracing_subscriber::EnvFilter;
 
@@ -20,8 +20,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Skip tracing init for setup/status/log commands — log output corrupts the TUI/status output.
-    if !matches!(cli.command, Command::Setup | Command::Status | Command::Log) {
+    // Skip tracing for commands whose output is intended for direct terminal use.
+    if !matches!(&cli.command, Command::Setup | Command::Daemon { .. }) {
         let filter = if cli.verbose {
             EnvFilter::new("nexdesk=debug")
         } else {
@@ -91,12 +91,12 @@ async fn main() -> Result<()> {
         Command::Setup => {
             setup::run_setup().await?;
         }
-        Command::Status => {
-            daemon::print_status()?;
-        }
-        Command::Log => {
-            daemon::print_log()?;
-        }
+        Command::Daemon { action } => match action {
+            DaemonCommand::Status => daemon::print_status()?,
+            DaemonCommand::Start => daemon::start()?,
+            DaemonCommand::Stop => daemon::stop()?,
+            DaemonCommand::Logs => daemon::print_logs()?,
+        },
         Command::TestInput => {
             input::ensure_accessibility()?;
             use std::io::Write;

@@ -58,14 +58,29 @@ pub enum Command {
     /// Launch the TUI setup wizard
     Setup,
 
-    /// Show a short service/process/listener status summary
-    Status,
-
-    /// Show detailed service diagnostics and recent logs
-    Log,
+    /// Manage the background service
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonCommand,
+    },
 
     /// Test input capture (prints mouse position for 10 seconds)
     TestInput,
+}
+
+#[derive(Clone, Copy, Debug, Subcommand)]
+pub enum DaemonCommand {
+    /// Show service, process, listener, and connection status
+    Status,
+
+    /// Start the background service
+    Start,
+
+    /// Stop the background service
+    Stop,
+
+    /// Show service diagnostics and recent logs
+    Logs,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -74,4 +89,34 @@ pub enum Edge {
     Right,
     Up,
     Down,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_daemon_action(name: &str) -> DaemonCommand {
+        let cli = Cli::try_parse_from(["nexdesk", "daemon", name]).unwrap();
+        match cli.command {
+            Command::Daemon { action } => action,
+            _ => panic!("expected daemon command"),
+        }
+    }
+
+    #[test]
+    fn parses_all_daemon_actions() {
+        assert!(matches!(
+            parse_daemon_action("status"),
+            DaemonCommand::Status
+        ));
+        assert!(matches!(parse_daemon_action("start"), DaemonCommand::Start));
+        assert!(matches!(parse_daemon_action("stop"), DaemonCommand::Stop));
+        assert!(matches!(parse_daemon_action("logs"), DaemonCommand::Logs));
+    }
+
+    #[test]
+    fn rejects_removed_legacy_daemon_commands() {
+        assert!(Cli::try_parse_from(["nexdesk", "status"]).is_err());
+        assert!(Cli::try_parse_from(["nexdesk", "log"]).is_err());
+    }
 }
