@@ -8,6 +8,7 @@ mod input;
 mod net;
 mod setup;
 mod status;
+pub mod testing;
 
 use std::io::{IsTerminal, Write};
 
