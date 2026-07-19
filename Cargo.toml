@@ -56,6 +56,12 @@ libc = "0.2"
 # Temp directories (file transfer staging)
 tempfile = "3"
 
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+proptest = "1"
+tokio = { version = "1", features = ["test-util"] }
+
 # Platform-specific: Linux X11 input (Phase 3)
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["xtest"] }

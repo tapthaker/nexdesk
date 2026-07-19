@@ -93,7 +93,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 ### T0.3 — Establish test support conventions
 
-- [ ] **T0.3.1** Add dev dependencies for property testing, CLI assertions, and Tokio virtual-time support.
+- [x] **T0.3.1** Add dev dependencies for property testing, CLI assertions, and Tokio virtual-time support.
 - [ ] **T0.3.2** Create `src/testing` with a typed observation log shared by stateful fakes.
 - [ ] **T0.3.3** Add a task tracker capable of detecting background tasks that outlive a scenario.
 - [ ] **T0.3.4** Document fake behavior conventions: scripted results, blocking gates, call recording, and unexpected-call failures.
@@ -335,4 +335,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `a3e6fd8` | T0.2.1 | Introduced the library target and shared module tree. |
 | 2026-07-19 | `e4a517d` | T0.2.2 | Moved parsed CLI dispatch into the library. |
 | 2026-07-19 | `338284f` | T0.2.3 | Restricted internal modules and kept the binary as composition root. |
-| 2026-07-19 | this commit | T0.2.4 | Added public library and CLI parsing integration smoke tests. |
+| 2026-07-19 | `4e6e560` | T0.2.4 | Added public library and CLI parsing integration smoke tests. |
+| 2026-07-19 | this commit | T0.3.1 | Added property, CLI assertion, and virtual-time test dependencies. |
