@@ -1,13 +1,13 @@
 pub mod cli;
 mod clipboard;
-pub mod config;
+mod config;
 mod cursor;
-pub mod daemon;
+mod daemon;
 mod filetransfer;
-pub mod input;
-pub mod net;
-pub mod setup;
-pub mod status;
+mod input;
+mod net;
+mod setup;
+mod status;
 
 use std::io::{IsTerminal, Write};
 
