@@ -87,7 +87,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 ### T0.2 — Expose a library without changing CLI behavior
 
 - [x] **T0.2.1** Create `src/lib.rs`, move the shared module tree out of `main.rs`, and update the binary to consume the library without changing CLI behavior.
-- [ ] **T0.2.2** Move CLI dispatch into a library `run` function that accepts parsed CLI arguments while leaving process setup in `main.rs`.
+- [x] **T0.2.2** Move CLI dispatch into a library `run` function that accepts parsed CLI arguments while leaving process setup in `main.rs`.
 - [ ] **T0.2.3** Reduce the library's exposed module surface and leave `main.rs` as a thin composition root.
 - [ ] **T0.2.4** Add an integration smoke test proving public library access and CLI parsing.
 
@@ -332,4 +332,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `2943e1f` | T0.1.3 | Added macOS test CI for target-gated adapters. |
 | 2026-07-19 | `5ece775` | T0.1.4 | Added advisory Linux clippy CI without a warning gate. |
 | 2026-07-19 | `3107586` | T0.1.5 | Added informational LCOV generation and artifact storage. |
-| 2026-07-19 | this commit | T0.2.1 | Introduced the library target and shared module tree. |
+| 2026-07-19 | `a3e6fd8` | T0.2.1 | Introduced the library target and shared module tree. |
+| 2026-07-19 | this commit | T0.2.2 | Moved parsed CLI dispatch into the library. |
