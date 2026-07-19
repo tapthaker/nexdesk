@@ -80,7 +80,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 - [x] **T0.1.1** Add a repository test command document covering formatting, unit tests, platform limitations, and the current strict-clippy baseline.
 - [x] **T0.1.2** Add a test CI workflow that runs formatting and `cargo test --all-targets` on Linux with required native packages.
-- [ ] **T0.1.3** Add a macOS test job so macOS-only adapters and tests compile and run.
+- [x] **T0.1.3** Add a macOS test job so macOS-only adapters and tests compile and run.
 - [ ] **T0.1.4** Add a non-blocking clippy job without `-D warnings`, then separately track the existing warning cleanup.
 - [ ] **T0.1.5** Add `cargo-llvm-cov` reporting and publish/store the coverage artifact without imposing an initial threshold.
 
@@ -328,4 +328,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 |---|---|---|---|
 | 2026-07-19 | `bef8a99` | Plan created | Baseline before implementation. |
 | 2026-07-19 | `013906d` | T0.1.1 | Documented test commands, platform limits, and lint baseline. |
-| 2026-07-19 | this commit | T0.1.2 | Added Linux formatting and test CI. |
+| 2026-07-19 | `0855e7d` | T0.1.2 | Added Linux formatting and test CI. |
+| 2026-07-19 | this commit | T0.1.3 | Added macOS test CI for target-gated adapters. |
