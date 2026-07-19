@@ -78,7 +78,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 ### T0.1 — Record and protect the baseline
 
-- [ ] **T0.1.1** Add a repository test command document covering formatting, unit tests, platform limitations, and the current strict-clippy baseline.
+- [x] **T0.1.1** Add a repository test command document covering formatting, unit tests, platform limitations, and the current strict-clippy baseline.
 - [ ] **T0.1.2** Add a test CI workflow that runs formatting and `cargo test --all-targets` on Linux with required native packages.
 - [ ] **T0.1.3** Add a macOS test job so macOS-only adapters and tests compile and run.
 - [ ] **T0.1.4** Add a non-blocking clippy job without `-D warnings`, then separately track the existing warning cleanup.
@@ -326,4 +326,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 
 | Date | Commit | Completed item | Notes |
 |---|---|---|---|
-| 2025-07-19 | pending | Plan created | Baseline before implementation. |
+| 2026-07-19 | `bef8a99` | Plan created | Baseline before implementation. |
+| 2026-07-19 | this commit | T0.1.1 | Documented test commands, platform limits, and lint baseline. |

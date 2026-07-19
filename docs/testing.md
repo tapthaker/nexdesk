@@ -1,0 +1,97 @@
+# Testing Nexdesk
+
+This document describes the repository's current verification commands and known platform limitations. The broader testability roadmap is tracked in [`testability-plan.md`](testability-plan.md).
+
+## Required toolchain
+
+- Stable Rust toolchain
+- Cargo
+- Platform-native development libraries listed below
+
+### Linux packages
+
+On Ubuntu runners and development machines, install:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  libxcb1-dev \
+  libxcb-shape0-dev \
+  libxcb-xfixes0-dev \
+  libx11-dev \
+  libevdev-dev \
+  pkg-config
+```
+
+These are compile-time dependencies. The unit tests do not require a running X11 or Wayland session.
+
+### macOS
+
+Use a macOS host with the stable Rust toolchain. Unit tests should not request Accessibility permission or inject real input. Linux-only X11, evdev, and Wayland modules are excluded by target configuration; macOS input modules are only compiled and tested on macOS.
+
+## Local verification commands
+
+Run formatting verification:
+
+```bash
+cargo fmt --all -- --check
+```
+
+Run the target platform's complete unit-test suite:
+
+```bash
+cargo test --all-targets
+```
+
+Run advisory linting:
+
+```bash
+cargo clippy --all-targets
+```
+
+Before committing a change, run the narrowest relevant test command while developing, followed by formatting and `cargo test --all-targets` when the change can affect shared behavior.
+
+A single test can be run with a fully qualified filter, for example:
+
+```bash
+cargo test net::transition::tests::server_switch_back_releases_held_keys
+```
+
+## Current baseline
+
+At the start of the testability project on 2026-07-19:
+
+- `cargo fmt --all -- --check` passes.
+- Linux `cargo test --all-targets` runs 233 tests successfully.
+- The source contains additional target-gated macOS tests that do not run on Linux.
+- There are no tests in a top-level `tests/` integration-test directory yet.
+- `cargo clippy --all-targets` succeeds with warnings.
+- Strict clippy is not yet a passing gate:
+
+  ```bash
+  cargo clippy --all-targets -- -D warnings
+  ```
+
+  Current findings include dead code in target-specific input mappings, unused Wayland event fields, type-complexity suggestions, collapsible matches, items placed after test modules, and other style findings. These are existing quality debt tracked separately in Phase 5 of the testability plan; structural test work should not silently mix in unrelated lint cleanup.
+
+## Platform coverage rules
+
+- A Linux run does not establish that macOS adapters compile or behave correctly.
+- A macOS run does not exercise Linux X11, evdev, or Wayland adapters.
+- Pure protocol, transition, configuration, and orchestration behavior should remain platform-independent and run on both platforms.
+- Adapter tests may be target-gated when they genuinely require platform APIs.
+- Tests must not rely on the developer's active clipboard, display server, service manager, home-directory configuration, or network peers.
+- Real-network smoke tests must bind ephemeral localhost ports. Multicast or live-service tests must be opt-in and excluded from the normal deterministic suite.
+
+## Test categories during migration
+
+The repository will incrementally add these layers:
+
+1. Pure unit tests in source modules.
+2. Deterministic session scenarios using stateful fakes.
+3. Integration tests through the public library API.
+4. Localhost QUIC and local HTTP adapter contract tests.
+5. Platform-specific adapter smoke tests.
+6. Property, fuzz, coverage, and mutation-testing jobs.
+
+Until those layers exist, a green unit suite should not be interpreted as complete end-to-end coverage.
