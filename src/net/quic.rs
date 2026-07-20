@@ -3102,6 +3102,68 @@ mod lifecycle_tests {
         ]);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn local_lock_releases_sharing_in_polling_and_layer_shell_modes() {
+        for layer_shell in [false, true] {
+            let rig = crate::testing::ServerRig::new();
+            let mut capture = rig.capture.clone();
+            let mut transition = ServerTransition::new(
+                None,
+                ScreenLayout {
+                    width: 2560,
+                    height: 1440,
+                },
+            );
+            transition.activate_instant(protocol::Direction::Right);
+            transition.update_key(30, true);
+            if layer_shell {
+                capture.set_keyboard_grab(true).unwrap();
+            } else {
+                capture.set_grab(true).unwrap();
+            }
+            rig.lock.push_state(true);
+            rig.advance_time(LOCAL_LOCK_CHECK_INTERVAL).await;
+            assert!(server_session_is_locked(&rig.lock));
+
+            let messages = transition.deactivate_for_shortcut();
+            rig.peer
+                .succeed_next_send(crate::testing::ServerSendOperation::Input);
+            notify_after_local_input_release(
+                || {
+                    if layer_shell {
+                        capture.set_keyboard_grab(false).unwrap();
+                    } else {
+                        capture.set_grab(false).unwrap();
+                    }
+                },
+                send_server_input_messages(&rig.peer, messages),
+            )
+            .await
+            .unwrap();
+
+            assert!(!transition.is_active());
+            let expected = if layer_shell {
+                vec![
+                    crate::testing::GrabChange::Keyboard(true),
+                    crate::testing::GrabChange::Keyboard(false),
+                ]
+            } else {
+                vec![
+                    crate::testing::GrabChange::All(true),
+                    crate::testing::GrabChange::All(false),
+                ]
+            };
+            rig.assert_grab_history(&expected);
+            rig.assert_outbound_peer_messages(&[crate::testing::ServerPeerObservation::InputSend(
+                ServerInputCommand::KeyChanged {
+                    keycode: 30,
+                    pressed: false,
+                    modifiers: 0,
+                },
+            )]);
+        }
+    }
+
     #[test]
     fn server_wire_input_is_routed_through_typed_commands() {
         assert_eq!(
