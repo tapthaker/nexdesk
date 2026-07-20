@@ -3,6 +3,7 @@ mod fake_update;
 mod memory_trust_store;
 mod observation;
 mod recording_injector;
+mod scripted_peer_link;
 mod task_tracker;
 
 pub use fake_display_control::{
@@ -17,5 +18,8 @@ pub use observation::{Observation, ObservationLog};
 pub use recording_injector::{
     InjectorObservation, InjectorOperation, RecordedInput, RecordingInjector,
     RecordingInjectorFactory,
+};
+pub use scripted_peer_link::{
+    BlockingPeerEvent, PeerLinkObservation, PeerSendOperation, ScriptedPeerLink,
 };
 pub use task_tracker::{RunningTask, RunningTasksError, TaskGuard, TaskTracker};
