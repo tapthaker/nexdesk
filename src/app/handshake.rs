@@ -1,5 +1,7 @@
 use color_eyre::eyre::{eyre, Result};
 
+use crate::ports::PeerScreen;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HandshakeMessage<T> {
     Expected(T),
@@ -17,6 +19,49 @@ pub(crate) enum PairingDecision {
 pub(crate) enum PairingCompletion {
     Established,
     PersistTrust,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ServerHelloAck {
+    pub accepted: bool,
+    pub otp: Option<String>,
+    pub screen: Option<PeerScreen>,
+    pub build_version: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ServerPairingMethod {
+    Otp,
+    TrustedCertificate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ServerHandshakeOutcome {
+    pub peer_screen: PeerScreen,
+    pub peer_build_version: String,
+    pub pairing_method: ServerPairingMethod,
+    pub version_mismatch: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ServerHandshakeDecision {
+    Accept {
+        pairing_result: bool,
+        outcome: ServerHandshakeOutcome,
+    },
+    Reject {
+        pairing_result: Option<bool>,
+        reason: String,
+    },
+}
+
+impl ServerHandshakeDecision {
+    pub(crate) fn into_result(self) -> Result<ServerHandshakeOutcome> {
+        match self {
+            Self::Accept { outcome, .. } => Ok(outcome),
+            Self::Reject { reason, .. } => Err(eyre!(reason)),
+        }
+    }
 }
 
 pub(crate) fn require_handshake_message<T>(
@@ -72,6 +117,60 @@ pub(crate) fn client_pairing_decision(server_is_trusted: bool) -> PairingDecisio
     }
 }
 
+pub(crate) fn require_server_certificate_fingerprint(
+    fingerprint: Option<String>,
+) -> Result<String> {
+    fingerprint.ok_or_else(|| eyre!("Server certificate is absent"))
+}
+
+pub(crate) fn decide_server_handshake(
+    expected_otp: &str,
+    local_build_version: &str,
+    response: HandshakeMessage<ServerHelloAck>,
+) -> ServerHandshakeDecision {
+    let ack = match require_handshake_message("HelloAck", response) {
+        Ok(ack) => ack,
+        Err(error) => {
+            return ServerHandshakeDecision::Reject {
+                pairing_result: None,
+                reason: error.to_string(),
+            };
+        }
+    };
+    if !ack.accepted {
+        return ServerHandshakeDecision::Reject {
+            pairing_result: None,
+            reason: "Peer rejected connection".to_string(),
+        };
+    }
+
+    let pairing_method = match ack.otp.as_deref() {
+        Some(code) if code == expected_otp => ServerPairingMethod::Otp,
+        Some(_) => {
+            return ServerHandshakeDecision::Reject {
+                pairing_result: Some(false),
+                reason: "Invalid pairing code".to_string(),
+            };
+        }
+        None => ServerPairingMethod::TrustedCertificate,
+    };
+    let peer_build_version = ack.build_version.unwrap_or_else(|| "unknown".to_string());
+    let peer_screen = ack.screen.unwrap_or(PeerScreen {
+        width: 1920,
+        height: 1080,
+    });
+
+    ServerHandshakeDecision::Accept {
+        pairing_result: true,
+        outcome: ServerHandshakeOutcome {
+            peer_screen,
+            version_mismatch: peer_build_version != local_build_version,
+            peer_build_version,
+            pairing_method,
+        },
+    }
+}
+
 pub(crate) fn complete_client_pairing(
     decision: PairingDecision,
     response: HandshakeMessage<bool>,
@@ -91,6 +190,63 @@ mod tests {
     use super::*;
 
     const FINGERPRINT: &str = "fingerprint";
+
+    #[test]
+    fn server_handshake_decision_is_independent_of_wire_streams() {
+        let decision = decide_server_handshake(
+            "123456",
+            "v1",
+            HandshakeMessage::Expected(ServerHelloAck {
+                accepted: true,
+                otp: Some("123456".to_string()),
+                screen: Some(PeerScreen {
+                    width: 2560,
+                    height: 1440,
+                }),
+                build_version: Some("v1".to_string()),
+            }),
+        );
+
+        assert_eq!(
+            decision,
+            ServerHandshakeDecision::Accept {
+                pairing_result: true,
+                outcome: ServerHandshakeOutcome {
+                    peer_screen: PeerScreen {
+                        width: 2560,
+                        height: 1440,
+                    },
+                    peer_build_version: "v1".to_string(),
+                    pairing_method: ServerPairingMethod::Otp,
+                    version_mismatch: false,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn server_handshake_rejection_describes_response_policy() {
+        assert_eq!(
+            decide_server_handshake(
+                "123456",
+                "v1",
+                HandshakeMessage::Expected(ServerHelloAck {
+                    accepted: true,
+                    otp: Some("000000".to_string()),
+                    screen: None,
+                    build_version: None,
+                }),
+            ),
+            ServerHandshakeDecision::Reject {
+                pairing_result: Some(false),
+                reason: "Invalid pairing code".to_string(),
+            }
+        );
+        assert!(require_server_certificate_fingerprint(None)
+            .unwrap_err()
+            .to_string()
+            .contains("absent"));
+    }
 
     #[test]
     fn valid_hello_selects_pairing_from_persisted_trust() {

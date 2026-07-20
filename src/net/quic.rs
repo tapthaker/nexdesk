@@ -11,10 +11,11 @@ use tokio::time::{self, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::app::{
-    client_channel_disposition, client_pairing_decision, complete_client_pairing, execute_update,
-    require_handshake_message, validate_client_server_hello, CancellationToken,
-    ClientChannelDisposition, HandshakeMessage, PairingCompletion, PairingDecision, RestartReason,
-    RetryPolicy, SessionExit, UpdateExecution, UpdatePolicy, UpdateSource,
+    client_channel_disposition, client_pairing_decision, complete_client_pairing,
+    decide_server_handshake, execute_update, require_handshake_message,
+    validate_client_server_hello, CancellationToken, ClientChannelDisposition, HandshakeMessage,
+    PairingCompletion, PairingDecision, RestartReason, RetryPolicy, ServerHandshakeDecision,
+    ServerHelloAck, ServerPairingMethod, SessionExit, UpdateExecution, UpdatePolicy, UpdateSource,
 };
 use crate::clipboard::PlatformClipboard;
 use crate::input::capture::{InputCapture, InputCaptureFactory, PlatformInputCaptureFactory};
@@ -681,56 +682,54 @@ async fn handle_server_connection(
     };
     send_message(&mut control_send, &hello).await?;
 
-    // Receive HelloAck with optional OTP
-    let peer_screen = match recv_message(&mut control_recv).await? {
+    // Receive HelloAck with optional OTP. Stream decoding stays here while
+    // the handshake policy is decided independently of Quinn.
+    let response = match recv_message(&mut control_recv).await? {
         Some(Message::HelloAck {
-            accepted: true,
+            accepted,
             otp,
             screen,
             build_version,
-        }) => {
-            // Validate OTP if provided
-            match otp {
-                Some(code) => {
-                    if code == server_otp {
-                        info!("Peer {} paired successfully via OTP", remote);
-                        let result = Message::PairingResult { success: true };
-                        send_message(&mut control_send, &result).await?;
-                    } else {
-                        warn!("Peer {} provided invalid OTP", remote);
-                        let result = Message::PairingResult { success: false };
-                        send_message(&mut control_send, &result).await?;
-                        return Err(eyre!("Invalid pairing code from {}", remote));
-                    }
-                }
-                None => {
-                    // Client already trusts us (fingerprint stored from previous pairing)
-                    info!("Peer {} reconnected (already paired)", remote);
-                    let result = Message::PairingResult { success: true };
-                    send_message(&mut control_send, &result).await?;
-                }
-            }
-            let peer_version = build_version.as_deref().unwrap_or("unknown");
-            info!("Peer {} build version: {}", remote, peer_version);
-            if peer_version != BUILD_VERSION {
-                warn!(
-                    "Version mismatch: server={}, client={}",
-                    BUILD_VERSION, peer_version
-                );
-            }
-            screen.unwrap_or(ScreenLayout {
-                width: 1920,
-                height: 1080,
-            })
+        }) => HandshakeMessage::Expected(ServerHelloAck {
+            accepted,
+            otp,
+            screen: screen.map(|screen| PeerScreen {
+                width: screen.width,
+                height: screen.height,
+            }),
+            build_version,
+        }),
+        Some(other) => HandshakeMessage::Unexpected(protocol::message_summary(&other)),
+        None => HandshakeMessage::StreamClosed,
+    };
+    let decision = decide_server_handshake(server_otp, BUILD_VERSION, response);
+    let pairing_result = match &decision {
+        ServerHandshakeDecision::Accept { pairing_result, .. } => Some(*pairing_result),
+        ServerHandshakeDecision::Reject { pairing_result, .. } => *pairing_result,
+    };
+    if let Some(success) = pairing_result {
+        send_message(&mut control_send, &Message::PairingResult { success }).await?;
+    }
+    let outcome = decision.into_result()?;
+    match outcome.pairing_method {
+        ServerPairingMethod::Otp => info!("Peer {} paired successfully via OTP", remote),
+        ServerPairingMethod::TrustedCertificate => {
+            info!("Peer {} reconnected (already trusts certificate)", remote)
         }
-        Some(Message::HelloAck {
-            accepted: false, ..
-        }) => {
-            return Err(eyre!("Peer rejected connection"));
-        }
-        other => {
-            return Err(eyre!("Unexpected response: {:?}", other));
-        }
+    }
+    info!(
+        "Peer {} build version: {}",
+        remote, outcome.peer_build_version
+    );
+    if outcome.version_mismatch {
+        warn!(
+            "Version mismatch: server={}, client={}",
+            BUILD_VERSION, outcome.peer_build_version
+        );
+    }
+    let peer_screen = ScreenLayout {
+        width: outcome.peer_screen.width,
+        height: outcome.peer_screen.height,
     };
 
     // Open clipboard stream (bidirectional) — must be before uni stream
