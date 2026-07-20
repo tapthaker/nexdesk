@@ -163,7 +163,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T1.7.5** Add switch-back/key-up race and duplicate-release scenarios.
 - [x] **T1.7.6** Add screen resize, invalid screen, injector failure, and control-stream failure scenarios.
 - [x] **T1.7.7** Add heartbeat latency, delayed acknowledgement, watchdog recovery, and watchdog restart scenarios using virtual time.
-- [ ] **T1.7.8** Add assertions that every client exit restores input and cursor state and terminates all tasks.
+- [x] **T1.7.8** Add assertions that every client exit restores input and cursor state and terminates all tasks.
 
 ---
 
@@ -380,4 +380,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `d64834b` | T1.7.4 | Covered disconnect cleanup with held keys and mouse buttons. |
 | 2026-07-19 | `2d05d75` | T1.7.5 | Covered late key-up races and duplicate release suppression. |
 | 2026-07-19 | `12e2b3c` | T1.7.6 | Covered resize validation, injector errors, and control failures. |
-| 2026-07-19 | this commit | T1.7.7 | Added virtual-time latency, recovery, and watchdog scenarios. |
+| 2026-07-19 | `63fa581` | T1.7.7 | Added virtual-time latency, recovery, and watchdog scenarios. |
+| 2026-07-19 | this commit | T1.7.8 | Restored client input/cursor state and joined tasks on every exit. |

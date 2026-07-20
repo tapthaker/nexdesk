@@ -343,6 +343,28 @@ fn release_injected_inputs(
     }
 }
 
+fn restore_client_input_state(
+    injector: &mut dyn InputInjector,
+    display_control: &dyn DisplaySessionControl,
+    injected_keys: &mut HashSet<u32>,
+    injected_buttons: &mut HashSet<u8>,
+) {
+    release_injected_inputs(injector, display_control, injected_keys, injected_buttons);
+    release_defensive_keyups(injector);
+    if let Err(error) = injector.set_cursor_visible(true) {
+        warn!("Failed to restore client cursor visibility: {}", error);
+    }
+}
+
+async fn terminate_client_tasks(tasks: Vec<tokio::task::JoinHandle<()>>) {
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+}
+
 fn release_defensive_keyups(injector: &mut dyn InputInjector) {
     // Last-resort cleanup for cases where our bookkeeping missed a key-down
     // (e.g. a disconnect/restart race). Key-up events for keys that are not
@@ -1625,7 +1647,7 @@ async fn run_client_session(
     let clipboard_worker = clipboard_sync.clone();
     let clipboard_peer = peer.clone();
     let mut shutdown_rx1 = shutdown_tx.subscribe();
-    tokio::spawn(async move {
+    let clipboard_task = tokio::spawn(async move {
         let interval = crate::clipboard::sync::ClipboardSync::poll_interval();
         loop {
             tokio::select! {
@@ -1662,14 +1684,15 @@ async fn run_client_session(
     let ft_conn = connection.clone();
     let receive_clipboard = clipboard_port.clone();
     let mut shutdown_rx3 = shutdown_tx.subscribe();
-    tokio::spawn(async move {
+    let file_acceptor_task = tokio::spawn(async move {
+        let mut transfer_tasks = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 result = ft_conn.accept_bi() => {
                     match result {
                         Ok((send, recv)) => {
                             let receive_clipboard = receive_clipboard.clone();
-                            tokio::spawn(async move {
+                            transfer_tasks.spawn(async move {
                                 match crate::filetransfer::recv::receive_files(send, recv).await {
                                     Ok(paths) if !paths.is_empty() => {
                                         info!("Received {} file(s) from server", paths.len());
@@ -1687,11 +1710,14 @@ async fn run_client_session(
                         Err(_) => break,
                     }
                 }
+                _ = transfer_tasks.join_next(), if !transfer_tasks.is_empty() => {}
                 _ = shutdown_rx3.changed() => {
                     break;
                 }
             }
         }
+        transfer_tasks.abort_all();
+        while transfer_tasks.join_next().await.is_some() {}
     });
 
     info!("Client ready. Waiting for server to share mouse...");
@@ -1702,7 +1728,7 @@ async fn run_client_session(
     let input_reader_queue = input_queue.clone();
     let (peer_event_send, mut peer_events) = tokio::sync::mpsc::channel(64);
     let peer_reader = peer.clone();
-    tokio::spawn(async move {
+    let peer_reader_task = tokio::spawn(async move {
         loop {
             match peer_reader.next_event().await {
                 Some(ClientTransportEvent::Input(event)) => {
@@ -1747,6 +1773,7 @@ async fn run_client_session(
     let mut activation_superseded_moves: u64 = 0;
     let mut activation_first_inject_logged = false;
     let mut pending_mouse_move: Option<(i32, i32)> = None;
+    let mut file_send_tasks = Vec::new();
 
     loop {
         tokio::select! {
@@ -1828,13 +1855,12 @@ async fn run_client_session(
                                 // Release any remote-held keys immediately on switch-back. The
                                 // server also sends cleanup releases, but those can arrive after
                                 // this transition has become inactive.
-                                release_injected_inputs(
+                                restore_client_input_state(
                                     &mut *injector,
                                     display_control,
                                     &mut injected_keys,
                                     &mut injected_buttons,
                                 );
-                                release_defensive_keyups(&mut *injector);
                                 info!("Edge on client: {:?} — requesting switch back", direction);
                                 peer.send_control(ClientControlCommand::RequestSwitchBack {
                                     direction: peer_direction(direction),
@@ -1844,7 +1870,7 @@ async fn run_client_session(
                                 // Check clipboard for files and transfer them
                                 let ft_conn = connection.clone();
                                 let send_clipboard = clipboard_port.clone();
-                                tokio::spawn(async move {
+                                file_send_tasks.push(tokio::spawn(async move {
                                     let files = tokio::task::spawn_blocking(move || {
                                         send_clipboard.read_files().ok()
                                     }).await.ok().flatten();
@@ -1854,7 +1880,7 @@ async fn run_client_session(
                                             warn!("File transfer error: {}", e);
                                         }
                                     }
-                                });
+                                }));
                             }
                         }
                     }
@@ -2016,19 +2042,22 @@ async fn run_client_session(
 
     // Release any synthetic input that may still be down if the stream ended
     // before key-up/button-up events were processed (for example during display sleep).
-    release_injected_inputs(
+    restore_client_input_state(
         &mut *injector,
         display_control,
         &mut injected_keys,
         &mut injected_buttons,
     );
-    release_defensive_keyups(&mut *injector);
 
     // Signal clipboard tasks to shut down
     shutdown_tx.send(true).ok();
 
-    // Gracefully close the connection
+    // Closing the connection releases transport waits. Abort any task still
+    // waiting on a blocking adapter, then join every connection-owned task.
     connection.close(0u32.into(), b"disconnected");
+    let mut session_tasks = vec![clipboard_task, file_acceptor_task, peer_reader_task];
+    session_tasks.append(&mut file_send_tasks);
+    terminate_client_tasks(session_tasks).await;
 
     // Suppress unused variable warning
     let _ = server_screen;
@@ -2623,6 +2652,55 @@ mod lifecycle_tests {
             poll.await.unwrap().unwrap(),
             Some(Message::ClipboardUpdate { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn every_client_exit_restores_input_cursor_and_tasks() {
+        for restart_for_latency in [false, true] {
+            let rig = crate::testing::ClientRig::new();
+            let mut injector = rig.injector_factory.create().unwrap();
+            injector.set_cursor_visible(false).unwrap();
+            injector
+                .inject(&Message::KeyEvent {
+                    keycode: 30,
+                    pressed: true,
+                    modifiers: 0,
+                })
+                .unwrap();
+            injector
+                .inject(&Message::MouseButton {
+                    button: 0,
+                    pressed: true,
+                })
+                .unwrap();
+            let mut keys = HashSet::from([30]);
+            let mut buttons = HashSet::from([0]);
+
+            let tasks = rig.tasks.clone();
+            let background = tokio::spawn(async move {
+                tasks
+                    .run("client background", std::future::pending::<()>())
+                    .await;
+            });
+            tokio::task::yield_now().await;
+
+            restore_client_input_state(&mut *injector, &rig.display, &mut keys, &mut buttons);
+            terminate_client_tasks(vec![background]).await;
+
+            rig.assert_pressed_inputs(&[], &[]);
+            rig.assert_cursor_visible(true);
+            rig.assert_tasks_completed();
+            assert!(keys.is_empty());
+            assert!(buttons.is_empty());
+            match (
+                restart_for_latency,
+                client_shutdown_exit(restart_for_latency),
+            ) {
+                (false, SessionExit::Disconnected)
+                | (true, SessionExit::RestartRequested(RestartReason::LatencyWatchdog)) => {}
+                (_, exit) => panic!("unexpected client exit: {exit:?}"),
+            }
+        }
     }
 
     #[test]
