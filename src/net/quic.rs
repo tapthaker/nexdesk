@@ -1,13 +1,13 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::IsTerminal;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use quinn::{Endpoint, RecvStream, SendStream};
 use rand::Rng;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
@@ -19,12 +19,123 @@ use crate::net::transition::{ClientOutput, ClientTransition, ServerOutput, Serve
 use crate::status::{self, RuntimeStatus};
 
 const DEFAULT_PORT: u16 = 4242;
+/// Maximum rate at which pointer positions are sent to or injected by a peer.
+/// Intermediate relative movements are accumulated, never discarded.
+const POINTER_FRAME_INTERVAL: Duration = Duration::from_micros(4_167); // ~240 Hz
 const MOUSE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const USER_ACTIVITY_INTERVAL: Duration = Duration::from_secs(20);
 const LOCAL_LOCK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const CLIENT_LATENCY_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const CLIENT_LATENCY_RESTART_THRESHOLD: Duration = Duration::from_secs(3);
 const CLIENT_LATENCY_RESTART_STRIKES: u8 = 3;
+
+#[derive(Debug)]
+enum InputQueueItem {
+    Message(Message),
+    Closed,
+    Error(String),
+}
+
+#[derive(Default)]
+struct InputQueueState {
+    items: VecDeque<InputQueueItem>,
+    terminal_queued: bool,
+}
+
+/// Queue between the QUIC reader and the input injector. Reading remains active
+/// while an OS injection call blocks, and the consumer applies every relative
+/// delta to logical pointer state before replacing the pending absolute frame.
+#[derive(Clone, Default)]
+struct InputMessageQueue {
+    state: Arc<StdMutex<InputQueueState>>,
+    notify: Arc<Notify>,
+}
+
+impl InputMessageQueue {
+    fn push(&self, message: Message) {
+        let mut state = self.state.lock().unwrap();
+        if state.terminal_queued {
+            return;
+        }
+
+        state.items.push_back(InputQueueItem::Message(message));
+        drop(state);
+        self.notify.notify_one();
+    }
+
+    fn close(&self) {
+        self.push_terminal(InputQueueItem::Closed);
+    }
+
+    fn fail(&self, error: String) {
+        self.push_terminal(InputQueueItem::Error(error));
+    }
+
+    fn push_terminal(&self, item: InputQueueItem) {
+        let mut state = self.state.lock().unwrap();
+        if state.terminal_queued {
+            return;
+        }
+        state.terminal_queued = true;
+        state.items.push_back(item);
+        drop(state);
+        self.notify.notify_one();
+    }
+
+    async fn recv(&self) -> InputQueueItem {
+        loop {
+            // Register before checking the queue so a push between the check
+            // and await cannot be missed.
+            let notified = self.notify.notified();
+            if let Some(item) = self.state.lock().unwrap().items.pop_front() {
+                return item;
+            }
+            notified.await;
+        }
+    }
+}
+
+fn take_accumulated_motion(pending: &mut (f64, f64)) -> Option<Message> {
+    let dx = pending.0.trunc() as i32;
+    let dy = pending.1.trunc() as i32;
+    pending.0 -= f64::from(dx);
+    pending.1 -= f64::from(dy);
+
+    if dx == 0 && dy == 0 {
+        None
+    } else {
+        Some(Message::MouseMove { x: dx, y: dy })
+    }
+}
+
+fn flush_pending_mouse(
+    injector: &mut dyn InputInjector,
+    pending: &mut Option<(i32, i32)>,
+    activation_started: Option<Instant>,
+    injected_count: &mut u64,
+    first_inject_logged: &mut bool,
+    context: &str,
+) {
+    let Some((x, y)) = pending.take() else {
+        return;
+    };
+
+    *injected_count += 1;
+    if let Some(started) = activation_started {
+        if !*first_inject_logged {
+            *first_inject_logged = true;
+            info!(
+                "Activation diagnostics: first injected mouse move after {:.0}ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    let message = Message::MouseMove { x, y };
+    if let Err(e) = inject_with_timing(injector, &message, context) {
+        warn!("Inject mouse move error: {}", e);
+    }
+}
 
 fn track_injected_input(
     message: &Message,
@@ -441,6 +552,9 @@ async fn handle_server_connection(
 
     let mut poll_interval = time::interval(MOUSE_POLL_INTERVAL);
     let mut layer_shell_key_poll_interval = time::interval(MOUSE_POLL_INTERVAL);
+    let mut pointer_send_interval = time::interval(POINTER_FRAME_INTERVAL);
+    pointer_send_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut pending_layer_shell_motion = (0.0f64, 0.0f64);
     let mut debug_counter: u64 = 0;
     let mut last_screen_w = screen_w;
     let mut last_screen_h = screen_h;
@@ -488,6 +602,7 @@ async fn handle_server_connection(
                     ServerOutput::Idle => {}
                     ServerOutput::Activate { messages, .. } => {
                         info!("Edge detected — switching to remote");
+                        pending_layer_shell_motion = (0.0, 0.0);
                         capturer.lock().unwrap().set_grab(true).ok();
                         let mut sender = input_send.lock().await;
                         for msg in messages {
@@ -510,6 +625,14 @@ async fn handle_server_connection(
                     ServerOutput::Forward { messages } => {
                         let mut sender = input_send.lock().await;
                         for msg in messages {
+                            if let Message::MouseMove { x, y } = msg {
+                                pending_layer_shell_motion.0 += f64::from(x);
+                                pending_layer_shell_motion.1 += f64::from(y);
+                                continue;
+                            }
+                            if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
+                                send_message_uni(&mut sender, &motion).await.ok();
+                            }
                             if let Err(e) = send_message_uni(&mut sender, &msg).await {
                                 warn!("Failed to send: {}", e);
                                 transition.deactivate();
@@ -521,6 +644,9 @@ async fn handle_server_connection(
                     ServerOutput::ShortcutRelease { messages } => {
                         info!("Shortcut switch back — releasing grab");
                         let mut sender = input_send.lock().await;
+                        if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
+                            send_message_uni(&mut sender, &motion).await.ok();
+                        }
                         for msg in messages {
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
@@ -529,6 +655,9 @@ async fn handle_server_connection(
                     ServerOutput::ForceRelease { messages } => {
                         warn!("Safety escape (Ctrl+Alt+Escape) — releasing grab");
                         let mut sender = input_send.lock().await;
+                        if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
+                            send_message_uni(&mut sender, &motion).await.ok();
+                        }
                         for msg in messages {
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
@@ -559,6 +688,9 @@ async fn handle_server_connection(
                     ServerOutput::ShortcutRelease { messages } => {
                         info!("Shortcut switch back — releasing layer-shell grab");
                         let mut sender = input_send.lock().await;
+                        if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
+                            send_message_uni(&mut sender, &motion).await.ok();
+                        }
                         for msg in messages {
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
@@ -572,6 +704,9 @@ async fn handle_server_connection(
                     ServerOutput::Forward { messages } => {
                         if !messages.is_empty() {
                             let mut sender = input_send.lock().await;
+                            if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
+                                send_message_uni(&mut sender, &motion).await.ok();
+                            }
                             for msg in messages {
                                 if let Err(e) = send_message_uni(&mut sender, &msg).await {
                                     warn!("Failed to send key event: {}", e);
@@ -590,6 +725,9 @@ async fn handle_server_connection(
                     ServerOutput::ForceRelease { messages } => {
                         warn!("Safety escape (Ctrl+Alt+Escape) — releasing layer-shell grab");
                         let mut sender = input_send.lock().await;
+                        if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
+                            send_message_uni(&mut sender, &motion).await.ok();
+                        }
                         for msg in messages {
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
@@ -599,6 +737,28 @@ async fn handle_server_connection(
                         }
                         capturer.lock().unwrap().set_keyboard_grab(false).ok();
                         layer_shell_keyboard_grabbed = false;
+                    }
+                }
+            }
+            // Send at most one accumulated pointer movement per frame. If the
+            // network or peer is slow, newer deltas merge into this position
+            // instead of forming an unbounded queue of stale movements.
+            _ = pointer_send_interval.tick(), if transition.is_active() => {
+                if let Some(message) = take_accumulated_motion(&mut pending_layer_shell_motion) {
+                    let mut sender = input_send.lock().await;
+                    if let Err(e) = send_message_uni(&mut sender, &message).await {
+                        warn!("Failed to send accumulated mouse move: {}", e);
+                        transition.deactivate();
+                        if use_layer_shell {
+                            if let Some(ref tx) = capture_tx {
+                                use crate::input::wayland_layer_shell::LayerShellCommand;
+                                tx.send(LayerShellCommand::Release).ok();
+                            }
+                            capturer.lock().unwrap().set_keyboard_grab(false).ok();
+                            layer_shell_keyboard_grabbed = false;
+                        } else {
+                            capturer.lock().unwrap().set_grab(false).ok();
+                        }
                     }
                 }
             }
@@ -614,6 +774,7 @@ async fn handle_server_connection(
 
                 match event {
                     LayerShellEvent::EdgeEnter { direction } => {
+                        pending_layer_shell_motion = (0.0, 0.0);
                         let messages = transition.activate_instant(direction);
                         info!("Layer-shell edge enter ({:?}) — switching to remote", direction);
                         match capturer.lock().unwrap().set_keyboard_grab(true) {
@@ -645,17 +806,8 @@ async fn handle_server_connection(
                     }
                     LayerShellEvent::MouseMove { dx, dy } => {
                         if transition.is_active() {
-                            let msg = Message::MouseMove { x: dx as i32, y: dy as i32 };
-                            let mut sender = input_send.lock().await;
-                            if let Err(e) = send_message_uni(&mut sender, &msg).await {
-                                warn!("Failed to send mouse move: {}", e);
-                                transition.deactivate();
-                                if let Some(ref tx) = capture_tx {
-                                    tx.send(LayerShellCommand::Release).ok();
-                                }
-                                capturer.lock().unwrap().set_keyboard_grab(false).ok();
-                                layer_shell_keyboard_grabbed = false;
-                            }
+                            pending_layer_shell_motion.0 += dx;
+                            pending_layer_shell_motion.1 += dy;
                         }
                     }
                     LayerShellEvent::MouseButton { button, pressed } => {
@@ -670,6 +822,9 @@ async fn handle_server_connection(
                             };
                             let msg = Message::MouseButton { button: btn_id, pressed };
                             let mut sender = input_send.lock().await;
+                            if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
+                                send_message_uni(&mut sender, &motion).await.ok();
+                            }
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
                     }
@@ -683,6 +838,9 @@ async fn handle_server_connection(
                             };
                             let msg = Message::MouseScroll { dx, dy, phase };
                             let mut sender = input_send.lock().await;
+                            if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
+                                send_message_uni(&mut sender, &motion).await.ok();
+                            }
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
                     }
@@ -694,6 +852,9 @@ async fn handle_server_connection(
                                 phase: crate::net::protocol::ScrollPhase::Ended,
                             };
                             let mut sender = input_send.lock().await;
+                            if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
+                                send_message_uni(&mut sender, &motion).await.ok();
+                            }
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
                     }
@@ -704,6 +865,9 @@ async fn handle_server_connection(
                                 warn!("Safety escape (Ctrl+Alt+Escape) — releasing layer-shell grab");
                                 let messages = transition.deactivate_for_shortcut();
                                 let mut sender = input_send.lock().await;
+                                if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
+                                    send_message_uni(&mut sender, &motion).await.ok();
+                                }
                                 for msg in messages {
                                     send_message_uni(&mut sender, &msg).await.ok();
                                 }
@@ -714,6 +878,9 @@ async fn handle_server_connection(
                                 info!("Shortcut switch back — releasing layer-shell grab");
                                 let messages = transition.deactivate_for_shortcut();
                                 let mut sender = input_send.lock().await;
+                                if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
+                                    send_message_uni(&mut sender, &motion).await.ok();
+                                }
                                 for msg in messages {
                                     send_message_uni(&mut sender, &msg).await.ok();
                                 }
@@ -725,6 +892,9 @@ async fn handle_server_connection(
                             } else {
                                 let msg = Message::KeyEvent { keycode, pressed, modifiers: 0 };
                                 let mut sender = input_send.lock().await;
+                                if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
+                                    send_message_uni(&mut sender, &motion).await.ok();
+                                }
                                 send_message_uni(&mut sender, &msg).await.ok();
                             }
                         }
@@ -743,6 +913,7 @@ async fn handle_server_connection(
                     }
                     Ok(Some(Message::SwitchScreen { direction })) => {
                         request_wake_display();
+                        pending_layer_shell_motion = (0.0, 0.0);
                         info!("Client requested switch back: {:?}", direction);
                         let messages = transition.on_switch_back();
                         if !messages.is_empty() {
@@ -1137,10 +1308,33 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     let _marker = recv_message_uni(&mut input_recv).await?;
     debug!("Input stream accepted");
 
+    // Keep draining QUIC even while CoreGraphics is busy. Relative movement
+    // still updates logical state in order, but only the newest absolute
+    // position is retained for the next injection frame.
+    let input_queue = InputMessageQueue::default();
+    let input_reader_queue = input_queue.clone();
+    tokio::spawn(async move {
+        loop {
+            match recv_message_uni(&mut input_recv).await {
+                Ok(Some(message)) => input_reader_queue.push(message),
+                Ok(None) => {
+                    input_reader_queue.close();
+                    break;
+                }
+                Err(e) => {
+                    input_reader_queue.fail(e.to_string());
+                    break;
+                }
+            }
+        }
+    });
+
     let mut last_screen_w = my_w;
     let mut last_screen_h = my_h;
     let mut screen_check = time::interval(Duration::from_secs(5));
     let mut latency_check = time::interval(CLIENT_LATENCY_CHECK_INTERVAL);
+    let mut pointer_injection_interval = time::interval(POINTER_FRAME_INTERVAL);
+    pointer_injection_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut pending_latency_ping: Option<(u64, Instant)> = None;
     let mut latency_strikes: u8 = 0;
     let mut restart_for_latency = false;
@@ -1149,19 +1343,37 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     let mut activation_started: Option<Instant> = None;
     let mut activation_input_messages: u64 = 0;
     let mut activation_inject_moves: u64 = 0;
+    let mut activation_superseded_moves: u64 = 0;
     let mut activation_first_inject_logged = false;
+    let mut pending_mouse_move: Option<(i32, i32)> = None;
 
     loop {
         tokio::select! {
-            msg = recv_message_uni(&mut input_recv) => {
-                match msg {
-                    Ok(Some(message)) => {
+            // Drain buffered movement before posting another pointer frame.
+            // This is what makes the pending slot jump to the newest position
+            // after a slow CoreGraphics call instead of replaying stale frames.
+            biased;
+            item = input_queue.recv() => {
+                match item {
+                    InputQueueItem::Message(message) => {
                         if activation_started.is_some() {
                             activation_input_messages += 1;
                         }
                         let original_message = message.clone();
                         match transition.handle(message) {
                             ClientOutput::Ignore => {
+                                // Preserve ordering if a discrete release follows a
+                                // pointer position that has not reached CoreGraphics yet.
+                                if matches!(&original_message, Message::KeyEvent { .. } | Message::MouseButton { .. } | Message::MouseScroll { .. }) {
+                                    flush_pending_mouse(
+                                        &mut *injector,
+                                        &mut pending_mouse_move,
+                                        activation_started,
+                                        &mut activation_inject_moves,
+                                        &mut activation_first_inject_logged,
+                                        "before ignored input",
+                                    );
+                                }
                                 // A switch-back can deactivate the client before cleanup
                                 // releases arrive. Still inject releases for inputs we
                                 // previously pressed, or the client OS can be left sticky.
@@ -1191,29 +1403,28 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                             }
                             ClientOutput::Activate => {
                                 info!("Server sharing mouse");
+                                pending_mouse_move = None;
                                 activation_started = Some(Instant::now());
                                 activation_input_messages = 0;
                                 activation_inject_moves = 0;
+                                activation_superseded_moves = 0;
                                 activation_first_inject_logged = false;
                                 request_wake_display();
                             }
                             ClientOutput::InjectMove { x, y } => {
-                                activation_inject_moves += 1;
-                                if let Some(started) = activation_started {
-                                    if !activation_first_inject_logged {
-                                        activation_first_inject_logged = true;
-                                        info!(
-                                            "Activation diagnostics: first injected mouse move after {:.0}ms",
-                                            started.elapsed().as_secs_f64() * 1000.0
-                                        );
-                                    }
-                                }
-                                let msg = Message::MouseMove { x, y };
-                                if let Err(e) = inject_with_timing(&mut *injector, &msg, "mouse move") {
-                                    warn!("Inject mouse move error: {}", e);
+                                if pending_mouse_move.replace((x, y)).is_some() {
+                                    activation_superseded_moves += 1;
                                 }
                             }
                             ClientOutput::Forward(msg) => {
+                                flush_pending_mouse(
+                                    &mut *injector,
+                                    &mut pending_mouse_move,
+                                    activation_started,
+                                    &mut activation_inject_moves,
+                                    &mut activation_first_inject_logged,
+                                    "before discrete input",
+                                );
                                 if let Err(e) = inject_with_timing(&mut *injector, &msg, "forward") {
                                     warn!("Inject error: {}", e);
                                 } else {
@@ -1221,6 +1432,9 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                                 }
                             }
                             ClientOutput::SwitchBack { direction, inject } => {
+                                // The switch-back position supersedes any older pending
+                                // frame and must be posted before releasing input.
+                                pending_mouse_move = None;
                                 if let Some((x, y)) = inject {
                                     let msg = Message::MouseMove { x, y };
                                     inject_with_timing(&mut *injector, &msg, "switch back").ok();
@@ -1249,15 +1463,25 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                             }
                         }
                     }
-                    Ok(None) => {
+                    InputQueueItem::Closed => {
                         info!("Input stream closed");
                         break;
                     }
-                    Err(e) => {
+                    InputQueueItem::Error(e) => {
                         warn!("Input stream error: {}", e);
                         break;
                     }
                 }
+            }
+            _ = pointer_injection_interval.tick(), if pending_mouse_move.is_some() => {
+                flush_pending_mouse(
+                    &mut *injector,
+                    &mut pending_mouse_move,
+                    activation_started,
+                    &mut activation_inject_moves,
+                    &mut activation_first_inject_logged,
+                    "pointer frame",
+                );
             }
             msg = recv_message(&mut control_recv) => {
                 match msg {
@@ -1312,10 +1536,11 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
                 if activation_started.is_some_and(|started| started.elapsed() >= Duration::from_secs(10)) {
                     let elapsed = activation_started.unwrap().elapsed();
                     info!(
-                        "Activation diagnostics: {:.0}s summary: input_messages={}, injected_mouse_moves={}",
+                        "Activation diagnostics: {:.0}s summary: input_messages={}, injected_mouse_moves={}, superseded_mouse_moves={}",
                         elapsed.as_secs_f64(),
                         activation_input_messages,
-                        activation_inject_moves
+                        activation_inject_moves,
+                        activation_superseded_moves
                     );
                     activation_started = None;
                 }
@@ -1656,4 +1881,75 @@ async fn recv_message(recv: &mut RecvStream) -> Result<Option<Message>> {
 
 async fn recv_message_uni(recv: &mut quinn::RecvStream) -> Result<Option<Message>> {
     recv_message(recv).await
+}
+
+#[cfg(test)]
+mod input_coalescing_tests {
+    use super::*;
+    use crate::net::protocol::Direction;
+
+    #[tokio::test]
+    async fn input_queue_preserves_relative_moves_and_barriers() {
+        let queue = InputMessageQueue::default();
+        queue.push(Message::SwitchScreen {
+            direction: Direction::Right,
+        });
+        queue.push(Message::MouseMove { x: 100, y: 50 });
+        queue.push(Message::MouseMove { x: 3, y: -2 });
+        queue.push(Message::KeyEvent {
+            keycode: 30,
+            pressed: true,
+            modifiers: 0,
+        });
+        queue.push(Message::MouseMove { x: 7, y: 8 });
+        queue.push(Message::MouseMove { x: -2, y: 4 });
+        queue.close();
+
+        assert!(matches!(
+            queue.recv().await,
+            InputQueueItem::Message(Message::SwitchScreen {
+                direction: Direction::Right
+            })
+        ));
+        assert!(matches!(
+            queue.recv().await,
+            InputQueueItem::Message(Message::MouseMove { x: 100, y: 50 })
+        ));
+        assert!(matches!(
+            queue.recv().await,
+            InputQueueItem::Message(Message::MouseMove { x: 3, y: -2 })
+        ));
+        assert!(matches!(
+            queue.recv().await,
+            InputQueueItem::Message(Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            queue.recv().await,
+            InputQueueItem::Message(Message::MouseMove { x: 7, y: 8 })
+        ));
+        assert!(matches!(
+            queue.recv().await,
+            InputQueueItem::Message(Message::MouseMove { x: -2, y: 4 })
+        ));
+        assert!(matches!(queue.recv().await, InputQueueItem::Closed));
+    }
+
+    #[test]
+    fn accumulated_motion_retains_fractional_deltas() {
+        let mut pending = (0.5, -0.75);
+        assert!(take_accumulated_motion(&mut pending).is_none());
+
+        pending.0 += 1.75;
+        pending.1 -= 1.5;
+        assert!(matches!(
+            take_accumulated_motion(&mut pending),
+            Some(Message::MouseMove { x: 2, y: -2 })
+        ));
+        assert!((pending.0 - 0.25).abs() < f64::EPSILON);
+        assert!((pending.1 + 0.25).abs() < f64::EPSILON);
+    }
 }

@@ -5,13 +5,15 @@
 //! pointer, and forward relative motion + keyboard events to the server loop.
 //! This provides zero-latency edge detection compared to the evdev polling fallback.
 
+use std::collections::VecDeque;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::io::FromRawFd;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 
 use wayland_client::protocol::{
@@ -73,13 +75,97 @@ pub enum LayerShellCommand {
     Shutdown,
 }
 
+#[derive(Default)]
+struct LayerShellEventQueueState {
+    events: VecDeque<LayerShellEvent>,
+    closed: bool,
+}
+
+struct LayerShellEventSender {
+    state: Arc<Mutex<LayerShellEventQueueState>>,
+    notify: Arc<Notify>,
+}
+
+/// Receiver for layer-shell input. Adjacent pointer movements are accumulated
+/// before the async server loop sees them, while discrete events remain
+/// ordering barriers.
+pub struct LayerShellEventReceiver {
+    state: Arc<Mutex<LayerShellEventQueueState>>,
+    notify: Arc<Notify>,
+}
+
+fn layer_shell_event_channel() -> (LayerShellEventSender, LayerShellEventReceiver) {
+    let state = Arc::new(Mutex::new(LayerShellEventQueueState::default()));
+    let notify = Arc::new(Notify::new());
+    (
+        LayerShellEventSender {
+            state: state.clone(),
+            notify: notify.clone(),
+        },
+        LayerShellEventReceiver { state, notify },
+    )
+}
+
+impl LayerShellEventSender {
+    fn send(&self, event: LayerShellEvent) {
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return;
+        }
+
+        if let LayerShellEvent::MouseMove { dx, dy } = event {
+            if let Some(LayerShellEvent::MouseMove {
+                dx: queued_dx,
+                dy: queued_dy,
+            }) = state.events.back_mut()
+            {
+                *queued_dx += dx;
+                *queued_dy += dy;
+                return;
+            }
+            state
+                .events
+                .push_back(LayerShellEvent::MouseMove { dx, dy });
+        } else {
+            state.events.push_back(event);
+        }
+        drop(state);
+        self.notify.notify_one();
+    }
+}
+
+impl Drop for LayerShellEventSender {
+    fn drop(&mut self) {
+        self.state.lock().unwrap().closed = true;
+        self.notify.notify_one();
+    }
+}
+
+impl LayerShellEventReceiver {
+    pub async fn recv(&mut self) -> Option<LayerShellEvent> {
+        loop {
+            let notified = self.notify.notified();
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(event) = state.events.pop_front() {
+                    return Some(event);
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
 /// Try to create a layer-shell capture. Returns None if the layer-shell
 /// protocol is not available (GNOME, KDE, X11 session).
 pub fn try_create(
     trigger_edge: Direction,
 ) -> Result<
     Option<(
-        mpsc::UnboundedReceiver<LayerShellEvent>,
+        LayerShellEventReceiver,
         mpsc::UnboundedSender<LayerShellCommand>,
         u32, // screen_width
         u32, // screen_height
@@ -265,7 +351,7 @@ pub fn try_create(
     state.pointer_constraints = Some(pointer_constraints);
     state.relative_pointer_manager = Some(relative_pointer_manager);
 
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = layer_shell_event_channel();
     let (command_tx, command_rx) = mpsc::unbounded_channel();
 
     state.event_tx = Some(event_tx);
@@ -344,7 +430,7 @@ struct WaylandState {
     grabbed: bool,
 
     // Event channel
-    event_tx: Option<mpsc::UnboundedSender<LayerShellEvent>>,
+    event_tx: Option<LayerShellEventSender>,
 
     // Pointer enter serial (needed for set_cursor and lock)
     pointer_serial: u32,
@@ -383,7 +469,7 @@ impl WaylandState {
 
     fn send_event(&self, event: LayerShellEvent) {
         if let Some(ref tx) = self.event_tx {
-            tx.send(event).ok();
+            tx.send(event);
         }
     }
 
@@ -508,13 +594,12 @@ impl WaylandState {
         for ks in &mut self.held_keys {
             let elapsed = now.duration_since(ks.started);
             if elapsed >= delay && now >= ks.last_repeat + repeat_interval {
-                self.event_tx.as_ref().map(|tx| {
+                if let Some(tx) = self.event_tx.as_ref() {
                     tx.send(LayerShellEvent::KeyEvent {
                         keycode: ks.keycode,
                         pressed: true,
-                    })
-                    .ok()
-                });
+                    });
+                }
                 ks.last_repeat = now;
             }
         }
@@ -961,4 +1046,39 @@ async fn run_event_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn event_queue_accumulates_motion_and_preserves_barriers() {
+        let (sender, mut receiver) = layer_shell_event_channel();
+        sender.send(LayerShellEvent::MouseMove { dx: 0.25, dy: 1.5 });
+        sender.send(LayerShellEvent::MouseMove { dx: 0.75, dy: -0.5 });
+        sender.send(LayerShellEvent::MouseButton {
+            button: 0x110,
+            pressed: true,
+        });
+        sender.send(LayerShellEvent::MouseMove { dx: 2.0, dy: 3.0 });
+        drop(sender);
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(LayerShellEvent::MouseMove { dx, dy }) if dx == 1.0 && dy == 1.0
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(LayerShellEvent::MouseButton {
+                button: 0x110,
+                pressed: true
+            })
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(LayerShellEvent::MouseMove { dx, dy }) if dx == 2.0 && dy == 3.0
+        ));
+        assert!(receiver.recv().await.is_none());
+    }
 }
