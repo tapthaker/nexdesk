@@ -3,6 +3,7 @@ pub(crate) mod framing;
 pub mod pairing;
 pub mod protocol;
 pub mod quic;
+pub(crate) mod quinn_client;
 pub mod tls;
 pub mod transition;
 pub mod update;

@@ -1,3 +1,10 @@
+use std::future::Future;
+use std::pin::Pin;
+
+use color_eyre::eyre::Result;
+
+pub type TransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 /// Logical client transport channels. Closure and failure are reported per
 /// channel so one stream cannot silently masquerade as another.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,9 +125,43 @@ impl ClientTransportEvent {
     }
 }
 
+/// Post-handshake client transport boundary.
+pub trait ClientPeerLink: Send + Sync {
+    fn next_event(&mut self) -> TransportFuture<'_, Option<ClientTransportEvent>>;
+
+    fn send_control(&self, command: ClientControlCommand) -> TransportFuture<'_, Result<()>>;
+
+    fn send_clipboard(&self, command: ClientClipboardCommand) -> TransportFuture<'_, Result<()>>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ClosedLink;
+
+    impl ClientPeerLink for ClosedLink {
+        fn next_event(&mut self) -> TransportFuture<'_, Option<ClientTransportEvent>> {
+            Box::pin(async { None })
+        }
+
+        fn send_control(&self, _command: ClientControlCommand) -> TransportFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn send_clipboard(
+            &self,
+            _command: ClientClipboardCommand,
+        ) -> TransportFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[test]
+    fn client_peer_link_is_object_safe() {
+        fn assert_object_safe(_: &dyn ClientPeerLink) {}
+        assert_object_safe(&ClosedLink);
+    }
 
     #[test]
     fn every_event_identifies_its_logical_channel_table() {

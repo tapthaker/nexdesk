@@ -8,8 +8,8 @@ pub use pairing::{PairingPrompt, PairingPromptFuture};
 pub use platform::{DisplaySessionControl, SleepInhibitor};
 pub use transport::{
     ClientChannel, ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand,
-    ClientControlEvent, ClientInputEvent, ClientTransportEvent, PeerDirection, PeerScreen,
-    PeerScrollPhase, TransportFailure,
+    ClientControlEvent, ClientInputEvent, ClientPeerLink, ClientTransportEvent, PeerDirection,
+    PeerScreen, PeerScrollPhase, TransportFailure, TransportFuture,
 };
 pub use trust::TrustStore;
 pub use update::{
