@@ -2876,6 +2876,116 @@ mod lifecycle_tests {
         }
     }
 
+    #[tokio::test]
+    async fn server_edge_activation_scenario() {
+        let rig = crate::testing::ServerRig::new();
+        let mut capture = rig.capture.clone();
+        for index in 0..50 {
+            capture.push_position(1919, 540);
+            if index > 0 {
+                capture.push_screen_size(1920, 1080);
+            }
+            capture.push_buttons(0);
+            capture.push_key_events(Vec::new());
+        }
+        let mut transition = ServerTransition::new(
+            Some(protocol::Direction::Right),
+            ScreenLayout {
+                width: 2560,
+                height: 1440,
+            },
+        );
+        let mut activation = None;
+
+        for _ in 0..50 {
+            let keys = capture.poll_key_events().unwrap();
+            let (x, y) = capture.mouse_position().unwrap();
+            let (width, height) = capture.screen_size().unwrap();
+            let buttons = capture.mouse_buttons().unwrap();
+            if let ServerOutput::Activate { messages, .. } =
+                transition.poll(x, y, width, height, buttons, keys)
+            {
+                activation = Some(messages);
+                break;
+            }
+        }
+        let messages = activation.expect("edge dwell should activate sharing");
+        capture.set_grab(true).unwrap();
+        rig.peer
+            .succeed_next_send(crate::testing::ServerSendOperation::Input);
+        rig.peer
+            .succeed_next_send(crate::testing::ServerSendOperation::Input);
+        send_server_input_messages(&rig.peer, messages)
+            .await
+            .unwrap();
+
+        rig.assert_grab_history(&[crate::testing::GrabChange::All(true)]);
+        rig.assert_outbound_peer_messages(&[
+            crate::testing::ServerPeerObservation::InputSend(ServerInputCommand::SwitchToPeer {
+                direction: PeerDirection::Right,
+            }),
+            crate::testing::ServerPeerObservation::InputSend(ServerInputCommand::MouseMoved {
+                x: 20,
+                y: 540,
+            }),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn server_shortcut_activation_scenario() {
+        let rig = crate::testing::ServerRig::new();
+        let mut capture = rig.capture.clone();
+        capture.push_position(400, 300);
+        capture.push_buttons(0);
+        capture.push_key_events(
+            [29, 56, 42, 106]
+                .into_iter()
+                .map(|keycode| Message::KeyEvent {
+                    keycode,
+                    pressed: true,
+                    modifiers: 0,
+                })
+                .collect(),
+        );
+        let keys = capture.poll_key_events().unwrap();
+        let (x, y) = capture.mouse_position().unwrap();
+        let (width, height) = capture.screen_size().unwrap();
+        let buttons = capture.mouse_buttons().unwrap();
+        let mut transition = ServerTransition::new(
+            Some(protocol::Direction::Right),
+            ScreenLayout {
+                width: 2560,
+                height: 1440,
+            },
+        );
+        let ServerOutput::Activate { messages, .. } =
+            transition.poll(x, y, width, height, buttons, keys)
+        else {
+            panic!("shortcut should activate sharing");
+        };
+        capture.set_grab(true).unwrap();
+        rig.peer
+            .succeed_next_send(crate::testing::ServerSendOperation::Input);
+        rig.peer
+            .succeed_next_send(crate::testing::ServerSendOperation::Input);
+
+        send_server_input_messages(&rig.peer, messages)
+            .await
+            .unwrap();
+
+        assert!(transition.is_active());
+        rig.assert_grab_history(&[crate::testing::GrabChange::All(true)]);
+        rig.assert_outbound_peer_messages(&[
+            crate::testing::ServerPeerObservation::InputSend(ServerInputCommand::SwitchToPeer {
+                direction: PeerDirection::Right,
+            }),
+            crate::testing::ServerPeerObservation::InputSend(ServerInputCommand::MouseMoved {
+                x: 20,
+                y: 720,
+            }),
+        ]);
+    }
+
     #[test]
     fn server_wire_input_is_routed_through_typed_commands() {
         assert_eq!(

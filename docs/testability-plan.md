@@ -190,7 +190,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 ### T2.3 — Build the deterministic server rig
 
 - [x] **T2.3.1** Create `ServerRig` with scripted capture, peer, clipboard, lock source, status sink, clock, and task tracker.
-- [ ] **T2.3.2** Add edge activation and shortcut activation scenarios.
+- [x] **T2.3.2** Add edge activation and shortcut activation scenarios.
 - [ ] **T2.3.3** Add safety escape and switch-back cleanup scenarios.
 - [ ] **T2.3.4** Add local-lock-during-sharing scenarios for polling and layer-shell modes.
 - [ ] **T2.3.5** Add blocked-send, input-capture failure, peer resize, and disconnect scenarios.
@@ -394,4 +394,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `81e6d2c` | T2.2.4 | Moved server channel events and sends onto typed transport operations. |
 | 2026-07-19 | `a343f61` | T2.2.5 | Supervised and joined server connection tasks during shutdown. |
 | 2026-07-19 | `e61877e` | T2.2.6 | Covered closure and failure policy for every server channel. |
-| 2026-07-19 | this commit | T2.3.1 | Added a deterministic server rig and scripted lock source. |
+| 2026-07-19 | `54950a5` | T2.3.1 | Added a deterministic server rig and scripted lock source. |
+| 2026-07-19 | this commit | T2.3.2 | Added server edge and shortcut activation scenarios. |
