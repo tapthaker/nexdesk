@@ -15,7 +15,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Skip tracing init for setup/service commands — log output corrupts their user-facing output.
-    if !matches!(cli.command, Command::Daemon { .. } | Command::Log) {
+    if !matches!(cli.command, Command::Setup | Command::Daemon { .. }) {
         let filter = if cli.verbose {
             EnvFilter::new("nexdesk=debug")
         } else {

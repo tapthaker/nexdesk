@@ -29,10 +29,10 @@ use crate::net::tls::ConfigTrustStore;
 use crate::net::transition::{ClientOutput, ClientTransition, ServerOutput, ServerTransition};
 use crate::net::update::{ExecutableUpdateInstaller, GithubReleaseRepository};
 use crate::ports::{
-    ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand, ClientControlEvent,
-    ClientInputEvent, ClientPeerLink, ClientTransportEvent, Clipboard, DisplaySessionControl,
-    PairingPrompt, PeerDirection, PeerScreen, PeerScrollPhase, Release, ReleaseRepository,
-    TrustStore, UpdateInstaller,
+    ClientChannel, ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand,
+    ClientControlEvent, ClientInputEvent, ClientPeerLink, ClientTransportEvent, Clipboard,
+    DisplaySessionControl, PairingPrompt, PeerDirection, PeerScreen, PeerScrollPhase, Release,
+    ReleaseRepository, TrustStore, UpdateInstaller,
 };
 use crate::status::{self, RuntimeStatus};
 
@@ -376,7 +376,6 @@ fn protocol_input_message(event: ClientInputEvent) -> Message {
         ClientInputEvent::SwitchToClient { direction } => Message::SwitchScreen {
             direction: protocol_direction(direction),
         },
-        ClientInputEvent::ReleaseClient => Message::ReleaseScreen,
     }
 }
 
@@ -570,20 +569,14 @@ async fn handle_server_connection(
     tokio::spawn(async move {
         let interval = crate::clipboard::sync::ClipboardSync::poll_interval();
         loop {
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {
-                    let msg = {
-                        let mut clipboard = lock_recover(&clipboard_poll, "clipboard");
-                        clipboard.poll_change()
-                    };
-                    if let Ok(Some(msg)) = msg {
-                        let mut sender = clip_send_clone.lock().await;
-                        if send_message(&mut *sender, &msg).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                _ = shutdown_rx1.changed() => {
+            tokio::time::sleep(interval).await;
+            let msg = {
+                let mut clipboard = lock_recover(&clipboard_poll, "clipboard");
+                clipboard.poll_change()
+            };
+            if let Ok(Some(msg)) = msg {
+                let mut sender = clip_send_clone.lock().await;
+                if send_message(&mut *sender, &msg).await.is_err() {
                     break;
                 }
             }
@@ -645,34 +638,20 @@ async fn handle_server_connection(
     let ft_conn = connection.clone();
     tokio::spawn(async move {
         loop {
-            tokio::select! {
-                result = ft_conn.accept_bi() => {
-                    match result {
-                        Ok((send, recv)) => {
-                            let Ok(permit) = ft_semaphore.clone().try_acquire_owned() else {
-                                warn!(
-                                    "Rejecting incoming file transfer: too many concurrent transfers (max {})",
-                                    MAX_CONCURRENT_FILE_TRANSFERS
-                                );
-                                continue;
-                            };
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                match crate::filetransfer::recv::receive_files(send, recv).await {
-                                    Ok(paths) if !paths.is_empty() => {
-                                        info!("Received {} file(s) from client", paths.len());
-                                        tokio::task::spawn_blocking(move || {
-                                            PlatformClipboard.write_files(&paths).ok();
-                                        })
-                                        .await
-                                        .ok();
-                                    }
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        warn!("File transfer receive error: {}", e);
-                                    }
-                                }
-                            });
+            match ft_conn.accept_bi().await {
+                Ok((send, recv)) => {
+                    tokio::spawn(async move {
+                        match crate::filetransfer::recv::receive_files(send, recv).await {
+                            Ok(paths) if !paths.is_empty() => {
+                                info!("Received {} file(s) from client", paths.len());
+                                tokio::task::spawn_blocking(move || {
+                                    PlatformClipboard.write_files(&paths).ok();
+                                })
+                                .await
+                                .ok();
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!("File transfer receive error: {}", e),
                         }
                     });
                 }
@@ -1145,6 +1124,14 @@ async fn handle_server_connection(
     Ok(())
 }
 
+fn normalize_connect_addr_input(addr: &str) -> Result<&str> {
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return Err(eyre!("Connect address cannot be empty"));
+    }
+    Ok(addr)
+}
+
 fn explicit_connect_addr_arg(addr: Option<&str>) -> Result<Option<String>> {
     addr.map(normalize_connect_addr_input)
         .transpose()
@@ -1374,6 +1361,10 @@ async fn run_client_session(
     // Create input injector early so we can send screen size in handshake
     let mut injector = injector_factory.create()?;
     let (my_w, my_h) = injector.screen_size()?;
+    let my_screen = ScreenLayout {
+        width: my_w,
+        height: my_h,
+    };
     info!("Local screen: {}x{}", my_w, my_h);
 
     // Accept control stream and do handshake
@@ -1449,7 +1440,6 @@ async fn run_client_session(
 
     let ack = Message::HelloAck {
         accepted: true,
-        version: PROTOCOL_VERSION,
         otp,
         screen: Some(my_screen),
         build_version: Some(protocol::local_build_version()),
@@ -1586,17 +1576,23 @@ async fn run_client_session(
     tokio::spawn(async move {
         loop {
             match peer_reader.next_event().await {
-                Some(ClientTransportEvent::Input(event)) => input_reader_queue.push(protocol_input_message(event)),
+                Some(ClientTransportEvent::Input(event)) => {
+                    input_reader_queue.push(protocol_input_message(event))
+                }
                 Some(ClientTransportEvent::Closed(ClientChannel::Input)) => {
                     input_reader_queue.close();
                     break;
                 }
-                Some(ClientTransportEvent::Failed(failure)) if failure.channel == ClientChannel::Input => {
+                Some(ClientTransportEvent::Failed(failure))
+                    if failure.channel == ClientChannel::Input =>
+                {
                     input_reader_queue.fail(failure.message);
                     break;
                 }
                 Some(event) => {
-                    if peer_event_send.send(event).await.is_err() { break; }
+                    if peer_event_send.send(event).await.is_err() {
+                        break;
+                    }
                 }
                 None => {
                     input_reader_queue.close();
@@ -1807,7 +1803,7 @@ async fn run_client_session(
                             width: screen.width,
                             height: screen.height,
                         };
-                        if validate_screen_layout(&wire_screen, "server resize").is_ok() {
+                        if wire_screen.width > 0 && wire_screen.height > 0 {
                             info!("Server screen changed: {}x{}", screen.width, screen.height);
                             server_screen = wire_screen;
                         } else {
@@ -1842,6 +1838,10 @@ async fn run_client_session(
                         ) {
                             break;
                         }
+                    }
+                    Some(ClientTransportEvent::Input(event)) => {
+                        // The reader task normally routes input to the coalescing queue.
+                        input_queue.push(protocol_input_message(event));
                     }
                     None => {
                         info!("Client peer link closed");
@@ -2374,11 +2374,6 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn file_transfer_concurrency_limit_is_small() {
-        assert_eq!(MAX_CONCURRENT_FILE_TRANSFERS, 2);
-    }
-
-    #[test]
     fn injected_input_cleanup_uses_display_control_port() {
         let mut injector = crate::testing::RecordingInjector::new((1920, 1080));
         let display = crate::testing::FakeDisplaySessionControl::new();
@@ -2401,16 +2396,6 @@ mod lifecycle_tests {
         let mutex = std::sync::Mutex::new(1u32);
         *lock_recover(&mutex, "test") = 2;
         assert_eq!(*lock_recover(&mutex, "test"), 2);
-    }
-
-    #[test]
-    fn local_peer_hostname_metadata_is_protocol_safe() {
-        assert_eq!(sanitize_peer_hostname("host\nname"), "host�name");
-        assert_eq!(sanitize_peer_hostname(""), "nexdesk");
-        assert_eq!(
-            sanitize_peer_hostname(&"h".repeat(protocol::MAX_PEER_NAME_BYTES + 1)).len(),
-            protocol::MAX_PEER_NAME_BYTES
-        );
     }
 
     #[test]
@@ -2438,34 +2423,6 @@ mod lifecycle_tests {
         assert_eq!(layer_shell_button_to_protocol(0x112), Some(2));
         assert_eq!(layer_shell_button_to_protocol(0x113), None);
         assert_eq!(layer_shell_button_to_protocol(256), None);
-    }
-
-    #[test]
-    fn layer_shell_key_mapping_matches_protocol_range() {
-        assert_eq!(
-            layer_shell_key_to_protocol(protocol::MAX_KEYCODE),
-            Some(protocol::MAX_KEYCODE)
-        );
-        assert_eq!(layer_shell_key_to_protocol(protocol::MAX_KEYCODE + 1), None);
-    }
-
-    #[test]
-    fn layer_shell_float_inputs_are_normalized_to_protocol_safe_values() {
-        assert_eq!(layer_shell_motion_delta(f64::NAN), 0);
-        assert_eq!(layer_shell_motion_delta(f64::INFINITY), 0);
-        assert_eq!(layer_shell_motion_delta(i32::MAX as f64 * 2.0), i32::MAX);
-        assert_eq!(layer_shell_scroll_delta(f64::NAN), 0.0);
-        assert_eq!(
-            layer_shell_scroll_delta(protocol::MAX_SCROLL_DELTA * 2.0),
-            protocol::MAX_SCROLL_DELTA
-        );
-    }
-
-    #[test]
-    fn nonzero_screen_layout_rejects_zero_dimensions() {
-        assert!(nonzero_screen_layout(0, 1080).is_none());
-        assert!(nonzero_screen_layout(1920, 0).is_none());
-        assert_eq!(nonzero_screen_layout(1920, 1080).unwrap().width, 1920);
     }
 
     #[cfg(test)]

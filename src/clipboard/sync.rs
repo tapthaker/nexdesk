@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use color_eyre::eyre::{eyre, Result};
 use ring::digest;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::net::protocol::{ClipboardContent, Message, MAX_CLIPBOARD_TEXT_BYTES};
 use crate::ports::Clipboard;
@@ -41,6 +41,14 @@ impl ClipboardSync {
         }
 
         self.last_hash = Some(hash_bytes);
+        if !clipboard_text_size_ok(&text) {
+            warn!(
+                "Clipboard changed but is too large to sync ({} bytes, max {})",
+                text.len(),
+                MAX_CLIPBOARD_TEXT_BYTES
+            );
+            return Ok(None);
+        }
         info!("Clipboard changed ({} bytes), sending to peer", text.len());
 
         Ok(Some(Message::ClipboardUpdate {
@@ -82,66 +90,159 @@ impl ClipboardSync {
 // On Linux: try wl-paste/wl-copy first, fall back to xclip
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "macos")]
-fn read_clipboard() -> Result<String> {
-    let mut clipboard = arboard::Clipboard::new().map_err(|e| eyre!("clipboard init: {}", e))?;
-    clipboard
-        .get_text()
-        .map_err(|e| eyre!("clipboard read: {}", e))
-}
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn read_text_from_command(
+    mut command: std::process::Command,
+    name: &str,
+    max_bytes: usize,
+) -> Result<String> {
+    use std::io::Read;
+    use std::process::Stdio;
 
-#[cfg(target_os = "macos")]
-fn write_clipboard(text: &str) -> Result<()> {
-    let mut clipboard = arboard::Clipboard::new().map_err(|e| eyre!("clipboard init: {}", e))?;
-    clipboard
-        .set_text(text.to_owned())
-        .map_err(|e| eyre!("clipboard write: {}", e))
-}
-
-#[cfg(target_os = "linux")]
-fn read_clipboard() -> Result<String> {
-    // Try wl-paste first (Wayland), fall back to xclip (X11)
-    if let Ok(output) = std::process::Command::new("wl-paste")
-        .args(["--no-newline"])
-        .output()
-    {
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
-        }
-    }
-
-    let output = std::process::Command::new("xclip")
-        .args(["-selection", "clipboard", "-o"])
-        .output()
-        .map_err(|e| eyre!("xclip: {}", e))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        Err(eyre!(
-            "xclip failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn write_clipboard(text: &str) -> Result<()> {
-    use std::io::Write;
-
-    // Try wl-copy first (Wayland), fall back to xclip (X11)
-    if let Ok(mut child) = std::process::Command::new("wl-copy")
-        .stdin(std::process::Stdio::piped())
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
-    {
-        if let Some(stdin) = child.stdin.as_mut() {
-            if stdin.write_all(text.as_bytes()).is_ok() {
-                if let Ok(status) = child.wait() {
-                    if status.success() {
-                        return Ok(());
-                    }
-                }
+        .map_err(|e| eyre!("{}: {}", name, e))?;
+
+    let Some(mut stdout) = child.stdout.take() else {
+        child.kill().ok();
+        child.wait().ok();
+        return Err(eyre!("{} stdout unavailable", name));
+    };
+
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match stdout.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                child.kill().ok();
+                child.wait().ok();
+                return Err(eyre!("{} read: {}", name, e));
             }
+        };
+        if n == 0 {
+            break;
         }
+        if bytes.len().saturating_add(n) > max_bytes {
+            child.kill().ok();
+            child.wait().ok();
+            return Err(eyre!(
+                "{} output too large: exceeds {} bytes",
+                name,
+                max_bytes
+            ));
+        }
+        bytes.extend_from_slice(&buf[..n]);
+    }
+
+    let status = child.wait().map_err(|e| eyre!("{} wait: {}", name, e))?;
+    if !status.success() {
+        return Err(eyre!("{} exited with {}", name, status));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn write_text_to_command(mut command: std::process::Command, text: &str, name: &str) -> Result<()> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| eyre!("{}: {}", name, e))?;
+
+    let write_result = match child.stdin.take() {
+        Some(mut stdin) => stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| eyre!("{} write: {}", name, e)),
+        None => Err(eyre!("{} stdin unavailable", name)),
+    };
+
+    if let Err(err) = write_result {
+        child.kill().ok();
+        child.wait().ok();
+        return Err(err);
+    }
+
+    let Some(mut stderr) = child.stderr.take() else {
+        child.kill().ok();
+        child.wait().ok();
+        return Err(eyre!("{} stderr unavailable", name));
+    };
+    let mut stderr_bytes = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match stderr.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                child.kill().ok();
+                child.wait().ok();
+                return Err(eyre!("{} stderr read: {}", name, e));
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        if stderr_bytes.len().saturating_add(n) > crate::status::MAX_COMMAND_OUTPUT_DISPLAY_BYTES {
+            child.kill().ok();
+            child.wait().ok();
+            return Err(eyre!(
+                "{} stderr too large: exceeds {} bytes",
+                name,
+                crate::status::MAX_COMMAND_OUTPUT_DISPLAY_BYTES
+            ));
+        }
+        stderr_bytes.extend_from_slice(&buf[..n]);
+    }
+
+    let status = child.wait().map_err(|e| eyre!("{} wait: {}", name, e))?;
+    if status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        let stderr = crate::status::terminal_safe_multiline(
+            &stderr,
+            crate::status::MAX_COMMAND_OUTPUT_DISPLAY_BYTES,
+        );
+        Err(eyre!("{} exited with {}: {}", name, status, stderr.trim()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_text_to_daemonizing_command(
+    mut command: std::process::Command,
+    text: &str,
+    name: &str,
+) -> Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // wl-copy and xclip may fork a long-lived clipboard owner. Do not pipe
+    // stderr: the owner inherits that pipe, so waiting for EOF would block the
+    // clipboard receive task indefinitely and eventually stall QUIC traffic.
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| eyre!("{}: {}", name, e))?;
+
+    let write_result = match child.stdin.take() {
+        Some(mut stdin) => stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| eyre!("{} write: {}", name, e)),
+        None => Err(eyre!("{} stdin unavailable", name)),
+    };
+    if let Err(err) = write_result {
+        child.kill().ok();
+        child.wait().ok();
+        return Err(err);
     }
 
     let status = child.wait().map_err(|e| eyre!("{} wait: {}", name, e))?;

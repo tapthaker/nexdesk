@@ -116,14 +116,13 @@ pub async fn run(cli: Cli) -> Result<RunOutcome> {
         Command::Trust { fingerprint } => {
             net::tls::trust_fingerprint(&fingerprint)?;
         }
-        Command::Daemon { command } => match command {
-            DaemonCommand::Setup => setup::run_setup().await?,
-            DaemonCommand::Start => daemon::start_service()?,
-            DaemonCommand::Stop => daemon::stop_service()?,
+        Command::Setup => setup::run_setup().await?,
+        Command::Daemon { action } => match action {
+            DaemonCommand::Start => daemon::start()?,
+            DaemonCommand::Stop => daemon::stop()?,
             DaemonCommand::Status => daemon::print_status()?,
-            DaemonCommand::Log => daemon::print_log()?,
+            DaemonCommand::Logs => daemon::print_logs()?,
         },
-        Command::Log => daemon::print_log()?,
         Command::TestInput => {
             input::ensure_accessibility()?;
             let mut cap = input::capture::create_capturer()?;

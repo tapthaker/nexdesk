@@ -111,6 +111,13 @@ pub fn is_fingerprint_trusted(fp: &str) -> bool {
     ConfigTrustStore.is_trusted(fp).unwrap_or(false)
 }
 
+/// Return the SHA-256 fingerprint of the peer certificate used by a QUIC connection.
+pub fn peer_fingerprint(connection: &quinn::Connection) -> Option<String> {
+    let identity = connection.peer_identity()?;
+    let certs = identity.downcast::<Vec<CertificateDer<'static>>>().ok()?;
+    certs.first().map(fingerprint)
+}
+
 /// Build a quinn server config with our self-signed cert.
 pub fn server_config() -> Result<quinn::ServerConfig> {
     let (cert_der, key_der) = load_or_generate_certs()?;

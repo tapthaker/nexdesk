@@ -6,6 +6,37 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::NexdeskConfig;
 
+pub const MAX_STATUS_DISPLAY_BYTES: usize = 1024;
+pub const MAX_COMMAND_OUTPUT_DISPLAY_BYTES: usize = 64 * 1024;
+
+pub fn terminal_safe(value: &str, max_bytes: usize) -> String {
+    terminal_safe_with(value, max_bytes, |_| false)
+}
+
+pub fn terminal_safe_multiline(value: &str, max_bytes: usize) -> String {
+    terminal_safe_with(value, max_bytes, |ch| matches!(ch, '\n' | '\t'))
+}
+
+fn terminal_safe_with(
+    value: &str,
+    max_bytes: usize,
+    preserve_control: impl Fn(char) -> bool,
+) -> String {
+    let mut sanitized = String::new();
+    for ch in value.chars() {
+        let ch = if ch.is_control() && !preserve_control(ch) {
+            '�'
+        } else {
+            ch
+        };
+        if sanitized.len().saturating_add(ch.len_utf8()) > max_bytes {
+            break;
+        }
+        sanitized.push(ch);
+    }
+    sanitized
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeStatus {
     pub role: String,

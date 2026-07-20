@@ -171,7 +171,6 @@ fn map_input_message(message: Message) -> std::result::Result<ClientTransportEve
         Message::SwitchScreen { direction } => ClientInputEvent::SwitchToClient {
             direction: map_direction(direction),
         },
-        Message::ReleaseScreen => ClientInputEvent::ReleaseClient,
         other => return Err(unexpected_message(ClientChannel::Input, &other)),
     };
     Ok(ClientTransportEvent::Input(event))
@@ -273,9 +272,9 @@ mod tests {
 
     #[test]
     fn unexpected_cross_channel_messages_become_transport_failures() {
-        let error = map_control_message(Message::ReleaseScreen).unwrap_err();
+        let error = map_control_message(Message::FileTransferDone { transfer_id: 1 }).unwrap_err();
         assert!(error.contains("Control channel"));
-        assert!(error.contains("ReleaseScreen"));
+        assert!(error.contains("FileTransferDone"));
     }
 
     #[test]

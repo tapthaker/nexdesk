@@ -263,14 +263,42 @@ pub async fn self_update(target_version: &str) -> Result<()> {
     ExecutableUpdateInstaller.install(&release, asset).await
 }
 
+fn create_update_temp_file(dir: &Path) -> Result<(tokio::fs::File, tempfile::TempPath)> {
+    let mut tmp_file = tempfile::Builder::new()
+        .prefix(".nexdesk-update.")
+        .tempfile_in(dir)
+        .map_err(|e| eyre!("Failed to create temp update file: {}", e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp_file
+            .as_file_mut()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| eyre!("Failed to restrict temp update file permissions: {}", e))?;
+    }
+
+    let (file, path) = tmp_file.into_parts();
+    Ok((tokio::fs::File::from_std(file), path))
+}
+
+fn sync_file_path(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+fn sync_directory(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
 /// Fetches the latest release tag from GitHub (e.g. "v0.1.8").
 pub async fn check_latest_version() -> Result<String> {
     let client = reqwest::Client::builder()
         .user_agent("nexdesk")
+        .timeout(UPDATE_HTTP_TIMEOUT)
         .build()
         .map_err(|e| eyre!("Failed to build HTTP client: {}", e))?;
 
-    let resp = client
+    let mut resp = client
         .get("https://api.github.com/repos/tapthaker/nexdesk/releases/latest")
         .send()
         .await
@@ -279,67 +307,79 @@ pub async fn check_latest_version() -> Result<String> {
     if !resp.status().is_success() {
         return Err(eyre!("GitHub API returned HTTP {}", resp.status()));
     }
+    if let Some(length) = resp.content_length() {
+        if length > MAX_RELEASE_API_RESPONSE_SIZE {
+            return Err(eyre!(
+                "GitHub API response too large: {} bytes (max {})",
+                length,
+                MAX_RELEASE_API_RESPONSE_SIZE
+            ));
+        }
+    }
 
-    let body: serde_json::Value = resp
-        .json()
+    let mut body_bytes = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
         .await
+        .map_err(|e| eyre!("Failed to read GitHub response: {}", e))?
+    {
+        if (body_bytes.len() as u64).saturating_add(chunk.len() as u64)
+            > MAX_RELEASE_API_RESPONSE_SIZE
+        {
+            return Err(eyre!(
+                "GitHub API response exceeded max size: {} bytes",
+                MAX_RELEASE_API_RESPONSE_SIZE
+            ));
+        }
+        body_bytes.extend_from_slice(&chunk);
+    }
+
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| eyre!("Failed to parse GitHub response: {}", e))?;
 
-    body["tag_name"]
+    let tag = body["tag_name"]
         .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| eyre!("No tag_name in GitHub response"))
+        .ok_or_else(|| eyre!("No tag_name in GitHub response"))?;
+    validate_release_tag_text(tag)?;
+    Ok(tag.to_string())
 }
 
-/// Periodically checks for new releases and self-updates. Exits the process
-/// on successful update so the service manager (LaunchAgent/systemd) restarts
-/// with the new binary.
+/// Periodically checks for new releases and self-updates. The first check runs
+/// immediately so a restarted or manually installed stale daemon does not wait
+/// 30 minutes. A successful update exits so the service manager restarts the
+/// new binary.
 pub async fn update_check_loop() {
     use crate::net::protocol::BUILD_VERSION;
     use std::time::Duration;
 
-    // Skip update checks for dev builds
     if !is_release_version(BUILD_VERSION) {
         info!("Dev build ({}), skipping update checks", BUILD_VERSION);
         return;
     }
 
-    let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
-    interval.tick().await; // skip the immediate first tick
-
     loop {
-        interval.tick().await;
-
-        let latest = match check_latest_version().await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("Update check failed: {}", e);
-                continue;
+        match check_latest_version().await {
+            Ok(latest) if latest == BUILD_VERSION => {
+                info!("Up to date ({})", BUILD_VERSION);
             }
-        };
-
-        if latest == BUILD_VERSION {
-            info!("Up to date ({})", BUILD_VERSION);
-            continue;
+            Ok(latest) if is_release_version(&latest) && is_newer(&latest, BUILD_VERSION) => {
+                info!(
+                    "New version available: {} (current: {})",
+                    latest, BUILD_VERSION
+                );
+                match self_update(&latest).await {
+                    Ok(()) => {
+                        info!("Updated to {}. Exiting for restart...", latest);
+                        std::process::exit(0);
+                    }
+                    Err(e) => warn!("Self-update to {} failed: {}", latest, e),
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!("Update check failed: {}", e),
         }
 
-        if !is_release_version(&latest) || !is_newer(&latest, BUILD_VERSION) {
-            continue;
-        }
-
-        info!(
-            "New version available: {} (current: {})",
-            latest, BUILD_VERSION
-        );
-        match self_update(&latest).await {
-            Ok(()) => {
-                info!("Updated to {}. Exiting for restart...", latest);
-                std::process::exit(0);
-            }
-            Err(e) => {
-                warn!("Self-update to {} failed: {}", latest, e);
-            }
-        }
+        tokio::time::sleep(Duration::from_secs(30 * 60)).await;
     }
 }
 

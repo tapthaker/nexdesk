@@ -12,6 +12,11 @@ pub trait InputInjector: Send {
 
     /// Get the screen dimensions.
     fn screen_size(&self) -> Result<(u32, u32)>;
+
+    /// Show or hide the local cursor when supported by the platform adapter.
+    fn set_cursor_visible(&mut self, _visible: bool) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Factory boundary for creating an input injector for one client session.
@@ -49,7 +54,10 @@ fn create_platform_injector() -> Result<Box<dyn InputInjector>> {
         if std::env::var("NEXDESK_MACOS_INJECTOR").ok().as_deref() == Some("hid") {
             match crate::input::macos_hid::MacOSHidInjector::new() {
                 Ok(i) => return Ok(Box::new(i) as Box<dyn InputInjector>),
-                Err(e) => tracing::warn!("Experimental HID injector unavailable: {}; falling back to CGEvent", e),
+                Err(e) => tracing::warn!(
+                    "Experimental HID injector unavailable: {}; falling back to CGEvent",
+                    e
+                ),
             }
         }
         crate::input::macos::MacOSInjector::new().map(|i| Box::new(i) as Box<dyn InputInjector>)

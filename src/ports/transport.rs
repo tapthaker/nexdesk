@@ -67,7 +67,6 @@ pub enum ClientInputEvent {
     SwitchToClient {
         direction: PeerDirection,
     },
-    ReleaseClient,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,7 +170,7 @@ mod tests {
                 ClientChannel::Control,
             ),
             (
-                ClientTransportEvent::Input(ClientInputEvent::ReleaseClient),
+                ClientTransportEvent::Input(ClientInputEvent::MouseMoved { x: 0, y: 0 }),
                 ClientChannel::Input,
             ),
             (

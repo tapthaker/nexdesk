@@ -339,7 +339,10 @@ mod tests {
     #[tokio::test]
     async fn blocked_event_waits_for_explicit_release() {
         let peer = ScriptedPeerLink::new();
-        let gate = peer.block_event(ClientTransportEvent::Input(ClientInputEvent::ReleaseClient));
+        let gate = peer.block_event(ClientTransportEvent::Input(ClientInputEvent::MouseMoved {
+            x: 10,
+            y: 20,
+        }));
         gate.wait_until_entered().await;
 
         let receiver = peer.clone();
@@ -349,7 +352,10 @@ mod tests {
         gate.release();
         assert_eq!(
             waiting.await.unwrap(),
-            Some(ClientTransportEvent::Input(ClientInputEvent::ReleaseClient))
+            Some(ClientTransportEvent::Input(ClientInputEvent::MouseMoved {
+                x: 10,
+                y: 20,
+            }))
         );
     }
 
