@@ -403,6 +403,14 @@ async fn terminate_server_tasks(tasks: &mut tokio::task::JoinSet<()>) {
     while tasks.join_next().await.is_some() {}
 }
 
+async fn shutdown_server_connection_tasks(
+    tasks: &mut tokio::task::JoinSet<()>,
+    peer: &dyn ServerPeerLink,
+) {
+    terminate_server_tasks(tasks).await;
+    peer.shutdown().await;
+}
+
 async fn terminate_client_tasks(tasks: Vec<tokio::task::JoinHandle<()>>) {
     for task in &tasks {
         task.abort();
@@ -1451,8 +1459,7 @@ async fn handle_server_connection(
         }
     }
 
-    terminate_server_tasks(&mut connection_tasks).await;
-    peer.shutdown().await;
+    shutdown_server_connection_tasks(&mut connection_tasks, peer.as_ref()).await;
     Ok(())
 }
 
@@ -2874,6 +2881,33 @@ mod lifecycle_tests {
 
         tracker.ensure_idle().unwrap();
         assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_connection_shutdown_terminates_every_owned_task() {
+        let rig = crate::testing::ServerRig::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        for name in ["clipboard poll", "file acceptor", "file send"] {
+            let tracker = rig.tasks.clone();
+            tasks.spawn(async move {
+                tracker.run(name, std::future::pending::<()>()).await;
+            });
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if rig.tasks.running_tasks().len() == 3 {
+                break;
+            }
+        }
+        assert_eq!(rig.tasks.running_tasks().len(), 3);
+
+        rig.shutdown();
+        shutdown_server_connection_tasks(&mut tasks, &rig.peer).await;
+
+        assert!(rig.is_shutdown());
+        assert!(rig.peer.is_shutdown());
+        assert!(tasks.is_empty());
+        rig.assert_tasks_completed();
     }
 
     #[tokio::test]
