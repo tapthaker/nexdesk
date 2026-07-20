@@ -1,5 +1,4 @@
 use std::collections::{HashSet, VecDeque};
-use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -19,11 +18,12 @@ use crate::app::{
 use crate::input::inject::{InputInjector, InputInjectorFactory, PlatformInputInjectorFactory};
 use crate::input::wake::PlatformDisplaySessionControl;
 use crate::net::discovery;
+use crate::net::pairing::{self, TerminalPairingPrompt};
 use crate::net::protocol::{self, Message, ScreenLayout, BUILD_VERSION, PROTOCOL_VERSION};
 use crate::net::tls;
 use crate::net::tls::ConfigTrustStore;
 use crate::net::transition::{ClientOutput, ClientTransition, ServerOutput, ServerTransition};
-use crate::ports::{DisplaySessionControl, TrustStore};
+use crate::ports::{DisplaySessionControl, PairingPrompt, TrustStore};
 use crate::status::{self, RuntimeStatus};
 
 const DEFAULT_PORT: u16 = 4242;
@@ -310,10 +310,14 @@ async fn send_user_activity(send: &mut SendStream, last_sent: &mut Instant) {
 }
 
 fn unix_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    system_time_millis_u64(std::time::SystemTime::now())
+}
+
+fn system_time_millis_u64(time: std::time::SystemTime) -> u64 {
+    let Ok(duration) = time.duration_since(std::time::UNIX_EPOCH) else {
+        return 0;
+    };
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn should_attempt_client_update(server_build: &str) -> bool {
@@ -1087,6 +1091,7 @@ struct ProductionClientDriver {
     injector_factory: Arc<dyn InputInjectorFactory>,
     display_control: Arc<dyn DisplaySessionControl>,
     trust_store: Arc<dyn TrustStore>,
+    pairing_prompt: Arc<dyn PairingPrompt>,
 }
 
 struct ConnectedClient {
@@ -1128,6 +1133,7 @@ impl ClientReconnectDriver for ProductionClientDriver {
             self.injector_factory.as_ref(),
             self.display_control.as_ref(),
             self.trust_store.as_ref(),
+            self.pairing_prompt.as_ref(),
         )
         .await
     }
@@ -1237,6 +1243,7 @@ async fn connect_with_cancellation(
         Arc::new(PlatformInputInjectorFactory),
         Arc::new(PlatformDisplaySessionControl),
         Arc::new(ConfigTrustStore),
+        Arc::new(TerminalPairingPrompt::new()),
     )
     .await
 }
@@ -1247,6 +1254,7 @@ async fn connect_with_dependencies(
     injector_factory: Arc<dyn InputInjectorFactory>,
     display_control: Arc<dyn DisplaySessionControl>,
     trust_store: Arc<dyn TrustStore>,
+    pairing_prompt: Arc<dyn PairingPrompt>,
 ) -> Result<SessionExit> {
     let explicit_addr = explicit_connect_addr_arg(addr)?;
     let _idle_sleep_inhibitor = display_control.inhibit_idle_sleep()?;
@@ -1255,6 +1263,7 @@ async fn connect_with_dependencies(
         injector_factory,
         display_control,
         trust_store,
+        pairing_prompt,
     };
     run_client_reconnect_loop(&mut driver, RetryPolicy::default(), cancellation).await
 }
@@ -1266,6 +1275,7 @@ async fn run_client_session(
     injector_factory: &dyn InputInjectorFactory,
     display_control: &dyn DisplaySessionControl,
     trust_store: &dyn TrustStore,
+    pairing_prompt: &dyn PairingPrompt,
 ) -> Result<SessionExit> {
     let tls_fingerprint = tls::peer_fingerprint(&connection)
         .ok_or_else(|| eyre!("Server did not present a certificate"))?;
@@ -1324,7 +1334,7 @@ async fn run_client_session(
             info!("Server fingerprint already trusted");
             None
         }
-        PairingDecision::PromptForOtp => Some(prompt_pairing_code(addr).await?),
+        PairingDecision::PromptForOtp => Some(pairing_prompt.prompt(addr).await?),
     };
 
     let ack = Message::HelloAck {
@@ -1845,15 +1855,7 @@ pub async fn ping(addr: &str) -> Result<()> {
             let otp = if tls::is_fingerprint_trusted(&fingerprint) {
                 None
             } else {
-                let code = tokio::task::spawn_blocking(|| {
-                    eprint!("Enter pairing code: ");
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input).ok();
-                    input.trim().to_string()
-                })
-                .await
-                .wrap_err("Failed to read pairing code")?;
-                Some(code)
+                Some(pairing::prompt_pairing_code(addr).await?)
             };
 
             let ack = Message::HelloAck {
@@ -1947,21 +1949,7 @@ pub async fn pair(addr: &str) -> Result<()> {
                 info!("Server fingerprint already trusted");
                 None
             } else {
-                if !std::io::stdin().is_terminal() {
-                    return Err(eyre!(
-                        "Server fingerprint is not trusted and no interactive terminal is available for pairing. Run `nexdesk connect {}` from a terminal once, enter the pairing code, then restart the background service.",
-                        addr
-                    ));
-                }
-                let code = tokio::task::spawn_blocking(|| {
-                    eprint!("Enter pairing code: ");
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input).ok();
-                    input.trim().to_string()
-                })
-                .await
-                .wrap_err("Failed to read pairing code")?;
-                Some(code)
+                Some(pairing::prompt_pairing_code(addr).await?)
             };
 
             let ack = Message::HelloAck {
@@ -2327,22 +2315,6 @@ mod lifecycle_tests {
         let mutex = std::sync::Mutex::new(1u32);
         *lock_recover(&mutex, "test") = 2;
         assert_eq!(*lock_recover(&mutex, "test"), 2);
-    }
-
-    #[test]
-    fn pairing_prompt_is_flushed_and_user_visible() {
-        let mut output = Vec::new();
-        write_pairing_prompt(&mut output).unwrap();
-        assert_eq!(output, b"Enter pairing code: ");
-    }
-
-    #[test]
-    fn invalid_pairing_codes_are_rejected_before_send() {
-        assert_eq!(normalize_pairing_input(" 123456\n").unwrap(), "123456");
-        assert!(normalize_pairing_input("\n").is_err());
-        assert!(normalize_pairing_input("12345").is_err());
-        assert!(normalize_pairing_input("1234567").is_err());
-        assert!(normalize_pairing_input("12a456").is_err());
     }
 
     #[test]
