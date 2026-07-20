@@ -121,7 +121,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 ### T1.3 — Extract trust and pairing decisions
 
-- [ ] **T1.3.1** Introduce a focused `TrustStore` interface.
+- [x] **T1.3.1** Introduce a focused `TrustStore` interface.
 - [ ] **T1.3.2** Adapt the existing TLS/config trust functions behind the production store.
 - [ ] **T1.3.3** Add an in-memory trust store supporting read/write failures.
 - [ ] **T1.3.4** Extract client handshake decision logic from Quinn stream mechanics.
@@ -350,4 +350,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `4a2620c` | T1.2.3 | Injected the input factory through client connection sessions. |
 | 2026-07-19 | `8c522ef` | T1.2.4 | Added display wake and sleep-inhibition platform ports. |
 | 2026-07-19 | `4da1a86` | T1.2.5 | Added scripted display control with blocking gates and observations. |
-| 2026-07-19 | this commit | T1.2.6 | Routed client wake and sleep inhibition through the platform port. |
+| 2026-07-19 | `7a0f65b` | T1.2.6 | Routed client wake and sleep inhibition through the platform port. |
+| 2026-07-19 | this commit | T1.3.1 | Added an object-safe peer trust persistence port. |
