@@ -107,7 +107,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T1.1.1** Introduce `SessionExit` values for clean disconnect, retry, restart request, and fatal termination.
 - [x] **T1.1.2** Change client internals to return restart intent instead of invoking `process::exit` below the composition root.
 - [x] **T1.1.3** Add tests proving update and latency paths request restart only under intended conditions.
-- [ ] **T1.1.4** Move reconnect delay calculation into a pure retry-policy type with unit tests.
+- [x] **T1.1.4** Move reconnect delay calculation into a pure retry-policy type with unit tests.
 - [ ] **T1.1.5** Make the client reconnect loop cancellable and test cancellation during resolution, connection, session, and backoff.
 
 ### T1.2 — Inject client platform behavior
@@ -342,4 +342,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `86c874d` | T0.3.4 | Documented stateful fake scripting and lifecycle conventions. |
 | 2026-07-19 | `3998d95` | T1.1.1 | Added typed session exit and restart outcomes. |
 | 2026-07-19 | `8e4651a` | T1.1.2 | Propagated client restart intent to the binary composition root. |
-| 2026-07-19 | this commit | T1.1.3 | Covered update and latency restart decision paths. |
+| 2026-07-19 | `6bcd135` | T1.1.3 | Covered update and latency restart decision paths. |
+| 2026-07-19 | this commit | T1.1.4 | Moved reconnect delay calculation into a pure policy. |

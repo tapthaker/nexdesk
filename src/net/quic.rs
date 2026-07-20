@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
-use crate::app::{RestartReason, SessionExit};
+use crate::app::{RestartReason, RetryPolicy, SessionExit};
 use crate::input::inject::InputInjector;
 use crate::net::discovery;
 use crate::net::protocol::{self, Message, ScreenLayout, BUILD_VERSION, PROTOCOL_VERSION};
@@ -1039,7 +1039,7 @@ async fn handle_server_connection(
 
 /// Connect to a QUIC server as a client (receives and injects input).
 /// If `addr` is None, discovers the server via mDNS.
-/// Automatically reconnects with exponential backoff on disconnection.
+/// Automatically reconnects according to the configured retry policy.
 pub async fn connect(addr: Option<&str>) -> Result<SessionExit> {
     let resolved_addr = match addr {
         Some(a) => Some(resolve_addr(a)?),
@@ -1047,6 +1047,8 @@ pub async fn connect(addr: Option<&str>) -> Result<SessionExit> {
     };
 
     let endpoint = make_client_endpoint()?;
+    let retry_policy = RetryPolicy::default();
+    let mut retry_attempt = 0u32;
 
     loop {
         let target_addr = match resolved_addr {
@@ -1054,8 +1056,10 @@ pub async fn connect(addr: Option<&str>) -> Result<SessionExit> {
             None => match discovery::discover_one(Duration::from_secs(10)).await {
                 Ok(a) => a,
                 Err(e) => {
-                    warn!("Discovery failed: {}. Retrying in 2s...", e);
-                    time::sleep(Duration::from_secs(2)).await;
+                    let delay = retry_policy.delay_for_attempt(retry_attempt);
+                    retry_attempt = retry_attempt.saturating_add(1);
+                    warn!("Discovery failed: {}. Retrying in {:?}...", e, delay);
+                    time::sleep(delay).await;
                     continue;
                 }
             },
@@ -1075,15 +1079,20 @@ pub async fn connect(addr: Option<&str>) -> Result<SessionExit> {
             Ok(Ok(SessionExit::RetryAfter(delay))) => delay,
             Ok(Ok(SessionExit::Disconnected)) => {
                 info!("Connection closed cleanly");
-                Duration::from_secs(2)
+                retry_attempt = 0;
+                retry_policy.delay_for_attempt(retry_attempt)
             }
             Ok(Err(e)) => {
                 warn!("Connection error: {}", e);
-                Duration::from_secs(2)
+                let delay = retry_policy.delay_for_attempt(retry_attempt);
+                retry_attempt = retry_attempt.saturating_add(1);
+                delay
             }
             Err(join_err) => {
                 error!("Connection panicked: {}", join_err);
-                Duration::from_secs(2)
+                let delay = retry_policy.delay_for_attempt(retry_attempt);
+                retry_attempt = retry_attempt.saturating_add(1);
+                delay
             }
         };
         let mut runtime = RuntimeStatus::new("client", "disconnected");
