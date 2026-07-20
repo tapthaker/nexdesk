@@ -5,6 +5,7 @@ use ring::digest;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, info, warn};
 
+use crate::net::framing;
 use crate::net::protocol::{self, FileInfo, Message};
 
 /// Send files over a dedicated QUIC bi-stream.
@@ -134,26 +135,9 @@ pub async fn send_files(connection: &quinn::Connection, files: Vec<PathBuf>) -> 
 }
 
 async fn send_msg(send: &mut quinn::SendStream, msg: &Message) -> Result<()> {
-    let bytes = protocol::encode(msg)?;
-    send.write_all(&bytes).await?;
-    Ok(())
+    framing::send_message(send, msg).await
 }
 
 async fn recv_msg(recv: &mut quinn::RecvStream) -> Result<Option<Message>> {
-    let mut len_buf = [0u8; 4];
-    match recv.read_exact(&mut len_buf).await {
-        Ok(()) => {}
-        Err(quinn::ReadExactError::FinishedEarly(_)) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut body = vec![0u8; len];
-    recv.read_exact(&mut body).await.map_err(|e| match e {
-        quinn::ReadExactError::FinishedEarly(_) => {
-            color_eyre::eyre::eyre!("Connection closed mid-message")
-        }
-        other => other.into(),
-    })?;
-    let msg: Message = bincode::deserialize(&body)?;
-    Ok(Some(msg))
+    framing::recv_message(recv).await
 }

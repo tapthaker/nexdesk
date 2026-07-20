@@ -19,6 +19,7 @@ use crate::app::{
 use crate::input::inject::{InputInjector, InputInjectorFactory, PlatformInputInjectorFactory};
 use crate::input::wake::PlatformDisplaySessionControl;
 use crate::net::discovery;
+use crate::net::framing::{recv_message, send_message};
 use crate::net::pairing::{self, TerminalPairingPrompt};
 use crate::net::protocol::{self, Message, ScreenLayout, BUILD_VERSION, PROTOCOL_VERSION};
 use crate::net::tls;
@@ -514,14 +515,20 @@ async fn handle_server_connection(
     tokio::spawn(async move {
         let interval = crate::clipboard::sync::ClipboardSync::poll_interval();
         loop {
-            tokio::time::sleep(interval).await;
-            let msg = {
-                let mut clipboard = clipboard_poll.lock().unwrap();
-                clipboard.poll_change()
-            };
-            if let Ok(Some(msg)) = msg {
-                let mut sender = clip_send_clone.lock().await;
-                if send_message(&mut sender, &msg).await.is_err() {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {
+                    let msg = {
+                        let mut clipboard = lock_recover(&clipboard_poll, "clipboard");
+                        clipboard.poll_change()
+                    };
+                    if let Ok(Some(msg)) = msg {
+                        let mut sender = clip_send_clone.lock().await;
+                        if send_message(&mut *sender, &msg).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                _ = shutdown_rx1.changed() => {
                     break;
                 }
             }
@@ -1461,7 +1468,7 @@ async fn run_client_session(
                     };
                     if let Ok(Some(msg)) = msg {
                         let mut sender = clip_send_clone.lock().await;
-                        if send_message(&mut sender, &msg).await.is_err() {
+                        if send_message(&mut *sender, &msg).await.is_err() {
                             break;
                         }
                     }
@@ -2076,35 +2083,8 @@ async fn connect_with_retry(endpoint: &Endpoint, addr: SocketAddr) -> Result<qui
     Err(eyre!("Failed to connect after {} attempts", max_attempts))
 }
 
-async fn send_message(send: &mut SendStream, msg: &Message) -> Result<()> {
-    let bytes = protocol::encode(msg)?;
-    send.write_all(&bytes).await?;
-    Ok(())
-}
-
 async fn send_message_uni(send: &mut quinn::SendStream, msg: &Message) -> Result<()> {
-    let bytes = protocol::encode(msg)?;
-    send.write_all(&bytes).await?;
-    Ok(())
-}
-
-async fn recv_message(recv: &mut RecvStream) -> Result<Option<Message>> {
-    let mut len_buf = [0u8; 4];
-    match recv.read_exact(&mut len_buf).await {
-        Ok(()) => {}
-        Err(quinn::ReadExactError::FinishedEarly(_)) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    let len = u32::from_be_bytes(len_buf) as usize;
-
-    let mut body = vec![0u8; len];
-    recv.read_exact(&mut body).await.map_err(|e| match e {
-        quinn::ReadExactError::FinishedEarly(_) => eyre!("Connection closed mid-message"),
-        other => other.into(),
-    })?;
-
-    let msg: Message = bincode::deserialize(&body)?;
-    Ok(Some(msg))
+    send_message(send, msg).await
 }
 
 async fn recv_message_uni(recv: &mut quinn::RecvStream) -> Result<Option<Message>> {
