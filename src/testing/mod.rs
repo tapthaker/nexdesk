@@ -1,12 +1,15 @@
+mod client_rig;
 mod fake_display_control;
 mod fake_update;
 mod memory_clipboard;
 mod memory_trust_store;
 mod observation;
 mod recording_injector;
+mod scripted_pairing_prompt;
 mod scripted_peer_link;
 mod task_tracker;
 
+pub use client_rig::{ClientRig, DEFAULT_CLIENT_PEER_FINGERPRINT, DEFAULT_CLIENT_SCREEN};
 pub use fake_display_control::{
     BlockingDisplayCall, DisplayObservation, DisplayOperation, FakeDisplaySessionControl,
 };
@@ -24,6 +27,7 @@ pub use recording_injector::{
     InjectorObservation, InjectorOperation, RecordedInput, RecordingInjector,
     RecordingInjectorFactory,
 };
+pub use scripted_pairing_prompt::{PairingPromptObservation, ScriptedPairingPrompt};
 pub use scripted_peer_link::{
     BlockingPeerEvent, PeerLinkObservation, PeerSendOperation, ScriptedPeerLink,
 };

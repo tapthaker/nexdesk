@@ -156,7 +156,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 ### T1.7 — Build the deterministic client rig
 
-- [ ] **T1.7.1** Create `ClientRig` with sensible trusted-peer defaults and access to every fake.
+- [x] **T1.7.1** Create `ClientRig` with sensible trusted-peer defaults and access to every fake.
 - [ ] **T1.7.2** Add `run_until_idle`, explicit shutdown, and virtual-time advancement helpers.
 - [ ] **T1.7.3** Add assertions for pressed inputs, cursor state, status history, outbound peer messages, and task completion.
 - [ ] **T1.7.4** Add disconnect-while-key-held and disconnect-while-button-held scenarios.
@@ -373,4 +373,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `31e4aca` | T1.6.3 | Added stateful clipboard scripting, blocking gates, and history. |
 | 2026-07-19 | `85ee8ab` | T1.6.4 | Injected clipboard access into sync logic and the client session. |
 | 2026-07-19 | `ed7491d` | T1.6.5 | Covered clipboard echo, limits, failures, blocking, and shutdown. |
-| 2026-07-19 | this commit | T1.6.6 | Moved clipboard OS calls to workers and proved async responsiveness. |
+| 2026-07-19 | `908b1aa` | T1.6.6 | Moved clipboard OS calls to workers and proved async responsiveness. |
+| 2026-07-19 | this commit | T1.7.1 | Added a trusted-peer client rig exposing stateful test dependencies. |
