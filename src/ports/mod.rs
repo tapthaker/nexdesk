@@ -1,6 +1,7 @@
 mod clipboard;
 mod pairing;
 mod platform;
+mod status;
 mod transport;
 mod trust;
 mod update;
@@ -8,6 +9,7 @@ mod update;
 pub use clipboard::Clipboard;
 pub use pairing::{PairingPrompt, PairingPromptFuture};
 pub use platform::{DisplaySessionControl, SleepInhibitor};
+pub use status::StatusSink;
 pub use transport::{
     ClientChannel, ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand,
     ClientControlEvent, ClientInputEvent, ClientPeerLink, ClientTransportEvent, PeerDirection,

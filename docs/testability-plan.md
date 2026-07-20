@@ -158,7 +158,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 - [x] **T1.7.1** Create `ClientRig` with sensible trusted-peer defaults and access to every fake.
 - [x] **T1.7.2** Add `run_until_idle`, explicit shutdown, and virtual-time advancement helpers.
-- [ ] **T1.7.3** Add assertions for pressed inputs, cursor state, status history, outbound peer messages, and task completion.
+- [x] **T1.7.3** Add assertions for pressed inputs, cursor state, status history, outbound peer messages, and task completion.
 - [ ] **T1.7.4** Add disconnect-while-key-held and disconnect-while-button-held scenarios.
 - [ ] **T1.7.5** Add switch-back/key-up race and duplicate-release scenarios.
 - [ ] **T1.7.6** Add screen resize, invalid screen, injector failure, and control-stream failure scenarios.
@@ -375,4 +375,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `ed7491d` | T1.6.5 | Covered clipboard echo, limits, failures, blocking, and shutdown. |
 | 2026-07-19 | `908b1aa` | T1.6.6 | Moved clipboard OS calls to workers and proved async responsiveness. |
 | 2026-07-19 | `ee5b0d9` | T1.7.1 | Added a trusted-peer client rig exposing stateful test dependencies. |
-| 2026-07-19 | this commit | T1.7.2 | Added client rig settling, shutdown, and virtual-time controls. |
+| 2026-07-19 | `06e62d7` | T1.7.2 | Added client rig settling, shutdown, and virtual-time controls. |
+| 2026-07-19 | this commit | T1.7.3 | Added client state, status, peer-message, and task assertions. |

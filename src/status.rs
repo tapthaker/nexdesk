@@ -5,6 +5,7 @@ use color_eyre::eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
 
 use crate::config::NexdeskConfig;
+use crate::ports::StatusSink;
 
 pub const MAX_STATUS_DISPLAY_BYTES: usize = 1024;
 pub const MAX_COMMAND_OUTPUT_DISPLAY_BYTES: usize = 64 * 1024;
@@ -68,6 +69,15 @@ impl RuntimeStatus {
 
 pub fn status_path() -> Result<PathBuf> {
     Ok(NexdeskConfig::config_dir()?.join("runtime-status.json"))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FileStatusSink;
+
+impl StatusSink for FileStatusSink {
+    fn write(&self, status: RuntimeStatus) -> Result<()> {
+        write_status(status)
+    }
 }
 
 pub fn write_status(mut status: RuntimeStatus) -> Result<()> {

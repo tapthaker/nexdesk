@@ -1,11 +1,13 @@
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use crate::app::CancellationToken;
 use crate::net::protocol::BUILD_VERSION;
 use crate::testing::{
     FakeDisplaySessionControl, FakeUpdateInstaller, MemoryClipboard, MemoryTrustStore,
-    RecordingInjector, RecordingInjectorFactory, RestartRecorder, ScriptedPairingPrompt,
-    ScriptedPeerLink, ScriptedReleaseRepository, TaskTracker,
+    PeerLinkObservation, RecordingInjector, RecordingInjectorFactory, RecordingStatusSink,
+    RestartRecorder, ScriptedPairingPrompt, ScriptedPeerLink, ScriptedReleaseRepository,
+    TaskTracker,
 };
 
 pub const DEFAULT_CLIENT_PEER_FINGERPRINT: &str = "test-peer-fingerprint";
@@ -26,6 +28,7 @@ pub struct ClientRig {
     pub installer: FakeUpdateInstaller,
     pub restart: RestartRecorder,
     pub clipboard: MemoryClipboard,
+    pub status: RecordingStatusSink,
     pub tasks: TaskTracker,
     shutdown: CancellationToken,
 }
@@ -48,6 +51,7 @@ impl ClientRig {
             installer: FakeUpdateInstaller::new(),
             restart: RestartRecorder::new(),
             clipboard: MemoryClipboard::new(),
+            status: RecordingStatusSink::new(),
             tasks: TaskTracker::new(),
             shutdown: CancellationToken::new(),
         }
@@ -91,6 +95,59 @@ impl ClientRig {
         tokio::time::advance(duration).await;
         self.run_until_idle().await;
     }
+
+    pub fn assert_pressed_inputs(&self, keys: &[u32], buttons: &[u8]) {
+        assert_eq!(
+            self.injector.pressed_keys(),
+            keys.iter().copied().collect::<BTreeSet<_>>(),
+            "pressed key state"
+        );
+        assert_eq!(
+            self.injector.pressed_buttons(),
+            buttons.iter().copied().collect::<BTreeSet<_>>(),
+            "pressed button state"
+        );
+    }
+
+    pub fn assert_cursor_visible(&self, expected: bool) {
+        assert_eq!(
+            self.injector.cursor_visibility().last().copied(),
+            Some(expected),
+            "latest cursor visibility"
+        );
+    }
+
+    pub fn assert_status_history(&self, expected_states: &[&str]) {
+        assert_eq!(
+            self.status.states(),
+            expected_states
+                .iter()
+                .map(|state| (*state).to_string())
+                .collect::<Vec<_>>(),
+            "runtime status history"
+        );
+    }
+
+    pub fn assert_outbound_peer_messages(&self, expected: &[PeerLinkObservation]) {
+        let actual = self
+            .peer
+            .observations()
+            .snapshot()
+            .into_iter()
+            .filter_map(|entry| match entry.event {
+                event @ (PeerLinkObservation::ControlSend(_)
+                | PeerLinkObservation::ClipboardSend(_)) => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "outbound peer messages");
+    }
+
+    pub fn assert_tasks_completed(&self) {
+        if let Err(error) = self.tasks.ensure_idle() {
+            panic!("client rig tasks did not complete: {error}");
+        }
+    }
 }
 
 impl Default for ClientRig {
@@ -103,7 +160,9 @@ impl Default for ClientRig {
 mod tests {
     use super::*;
     use crate::input::inject::InputInjectorFactory;
-    use crate::ports::TrustStore;
+    use crate::net::protocol::Message;
+    use crate::ports::{ClientControlCommand, ClientPeerLink, StatusSink, TrustStore};
+    use crate::status::RuntimeStatus;
 
     #[test]
     fn defaults_model_a_trusted_peer_and_expose_shared_fakes() {
@@ -141,6 +200,36 @@ mod tests {
 
         assert!(rig.is_shutdown());
         assert!(rig.tasks.is_idle());
+    }
+
+    #[tokio::test]
+    async fn assertion_helpers_cover_client_visible_state() {
+        let rig = ClientRig::new();
+        let mut injector = rig.injector_factory.create().unwrap();
+        injector
+            .inject(&Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            })
+            .unwrap();
+        injector.set_cursor_visible(false).unwrap();
+        rig.status
+            .write(RuntimeStatus::new("client", "connected"))
+            .unwrap();
+        rig.peer.succeed_next_control_send();
+        rig.peer
+            .send_control(ClientControlCommand::Heartbeat { timestamp: 7 })
+            .await
+            .unwrap();
+
+        rig.assert_pressed_inputs(&[30], &[]);
+        rig.assert_cursor_visible(false);
+        rig.assert_status_history(&["connected"]);
+        rig.assert_outbound_peer_messages(&[PeerLinkObservation::ControlSend(
+            ClientControlCommand::Heartbeat { timestamp: 7 },
+        )]);
+        rig.assert_tasks_completed();
     }
 
     #[tokio::test(start_paused = true)]

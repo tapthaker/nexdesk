@@ -5,6 +5,7 @@ mod memory_clipboard;
 mod memory_trust_store;
 mod observation;
 mod recording_injector;
+mod recording_status;
 mod scripted_pairing_prompt;
 mod scripted_peer_link;
 mod task_tracker;
@@ -27,6 +28,7 @@ pub use recording_injector::{
     InjectorObservation, InjectorOperation, RecordedInput, RecordingInjector,
     RecordingInjectorFactory,
 };
+pub use recording_status::RecordingStatusSink;
 pub use scripted_pairing_prompt::{PairingPromptObservation, ScriptedPairingPrompt};
 pub use scripted_peer_link::{
     BlockingPeerEvent, PeerLinkObservation, PeerSendOperation, ScriptedPeerLink,

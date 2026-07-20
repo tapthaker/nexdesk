@@ -32,9 +32,9 @@ use crate::ports::{
     ClientChannel, ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand,
     ClientControlEvent, ClientInputEvent, ClientPeerLink, ClientTransportEvent, Clipboard,
     DisplaySessionControl, PairingPrompt, PeerDirection, PeerScreen, PeerScrollPhase, Release,
-    ReleaseRepository, TrustStore, UpdateInstaller,
+    ReleaseRepository, StatusSink, TrustStore, UpdateInstaller,
 };
-use crate::status::{self, RuntimeStatus};
+use crate::status::{self, FileStatusSink, RuntimeStatus};
 
 const DEFAULT_PORT: u16 = 4242;
 /// Maximum rate at which pointer positions are sent to or injected by a peer.
@@ -1179,6 +1179,7 @@ struct ProductionClientDriver {
     release_repository: Arc<dyn ReleaseRepository>,
     update_installer: Arc<dyn UpdateInstaller>,
     clipboard: Arc<dyn Clipboard>,
+    status_sink: Arc<dyn StatusSink>,
 }
 
 struct ConnectedClient {
@@ -1204,7 +1205,7 @@ impl ClientReconnectDriver for ProductionClientDriver {
         let endpoint = make_client_endpoint()?;
         let mut runtime = RuntimeStatus::new("client", "connecting");
         runtime.peer_addr = Some(addr.to_string());
-        status::write_status(runtime).ok();
+        self.status_sink.write(runtime).ok();
         let connection = connect_with_retry(&endpoint, addr).await?;
         Ok(ConnectedClient {
             _endpoint: endpoint,
@@ -1224,6 +1225,7 @@ impl ClientReconnectDriver for ProductionClientDriver {
             self.release_repository.as_ref(),
             self.update_installer.as_ref(),
             self.clipboard.clone(),
+            self.status_sink.as_ref(),
         )
         .await
     }
@@ -1231,7 +1233,7 @@ impl ClientReconnectDriver for ProductionClientDriver {
     fn record_disconnected(&mut self, addr: SocketAddr) {
         let mut runtime = RuntimeStatus::new("client", "disconnected");
         runtime.peer_addr = Some(addr.to_string());
-        status::write_status(runtime).ok();
+        self.status_sink.write(runtime).ok();
     }
 }
 
@@ -1337,6 +1339,7 @@ async fn connect_with_cancellation(
         Arc::new(GithubReleaseRepository),
         Arc::new(ExecutableUpdateInstaller),
         Arc::new(PlatformClipboard),
+        Arc::new(FileStatusSink),
     )
     .await
 }
@@ -1351,6 +1354,7 @@ async fn connect_with_dependencies(
     release_repository: Arc<dyn ReleaseRepository>,
     update_installer: Arc<dyn UpdateInstaller>,
     clipboard: Arc<dyn Clipboard>,
+    status_sink: Arc<dyn StatusSink>,
 ) -> Result<SessionExit> {
     let explicit_addr = explicit_connect_addr_arg(addr)?;
     let _idle_sleep_inhibitor = display_control.inhibit_idle_sleep()?;
@@ -1363,6 +1367,7 @@ async fn connect_with_dependencies(
         release_repository,
         update_installer,
         clipboard,
+        status_sink,
     };
     run_client_reconnect_loop(&mut driver, RetryPolicy::default(), cancellation).await
 }
@@ -1378,6 +1383,7 @@ async fn run_client_session(
     release_repository: &dyn ReleaseRepository,
     update_installer: &dyn UpdateInstaller,
     clipboard_port: Arc<dyn Clipboard>,
+    status_sink: &dyn StatusSink,
 ) -> Result<SessionExit> {
     let tls_fingerprint = tls::peer_fingerprint(&connection)
         .ok_or_else(|| eyre!("Server did not present a certificate"))?;
@@ -1385,7 +1391,7 @@ async fn run_client_session(
     info!("Connected to {}", addr);
     let mut runtime = RuntimeStatus::new("client", "connected");
     runtime.peer_addr = Some(addr.to_string());
-    status::write_status(runtime).ok();
+    status_sink.write(runtime).ok();
 
     // Create input injector early so we can send screen size in handshake
     let mut injector = injector_factory.create()?;
@@ -1494,7 +1500,7 @@ async fn run_client_session(
     runtime.peer_name = Some(hostname);
     runtime.peer_screen = Some(format!("{}x{}", screen.width, screen.height));
     runtime.peer_build = Some(server_build_version.clone());
-    status::write_status(runtime).ok();
+    status_sink.write(runtime).ok();
     let mut server_screen = screen;
 
     match attempt_client_update(
