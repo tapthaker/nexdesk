@@ -243,6 +243,21 @@ async fn notify_after_local_input_release<T>(
     notification.await
 }
 
+fn restore_server_input_state(
+    capturer: &mut dyn InputCapture,
+    keyboard_only: bool,
+    transition: &mut ServerTransition,
+) -> Vec<Message> {
+    let releases = transition.release_remote_inputs();
+    transition.deactivate();
+    if keyboard_only {
+        capturer.set_keyboard_grab(false).ok();
+    } else {
+        capturer.set_grab(false).ok();
+    }
+    releases
+}
+
 fn server_session_is_locked(lock_source: &dyn LocalSessionLockSource) -> bool {
     match lock_source.is_locked() {
         Ok(locked) => locked,
@@ -1204,6 +1219,7 @@ async fn handle_server_connection(
                                 0x112 => 2,   // middle
                                 _ => button as u8,
                             };
+                            transition.update_button(btn_id, pressed);
                             let msg = Message::MouseButton { button: btn_id, pressed };
                             let mut sender = input_send.lock().await;
                             if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
@@ -1417,9 +1433,22 @@ async fn handle_server_connection(
             use crate::input::wayland_layer_shell::LayerShellCommand;
             tx.send(LayerShellCommand::Shutdown).ok();
         }
-        capturer.lock().unwrap().set_keyboard_grab(false).ok();
-    } else {
-        capturer.lock().unwrap().set_grab(false).ok();
+    }
+    let release_messages = {
+        let mut capturer = capturer.lock().unwrap();
+        restore_server_input_state(&mut **capturer, use_layer_shell, &mut transition)
+    };
+    if !release_messages.is_empty() {
+        match time::timeout(
+            Duration::from_millis(250),
+            send_server_input_messages(peer.as_ref(), release_messages),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!("Failed to release remote input during cleanup: {}", error),
+            Err(_) => warn!("Timed out releasing remote input during cleanup"),
+        }
     }
 
     terminate_server_tasks(&mut connection_tasks).await;
@@ -3318,6 +3347,81 @@ mod lifecycle_tests {
             crate::testing::GrabChange::All(true),
             crate::testing::GrabChange::All(false),
         ]);
+    }
+
+    #[tokio::test]
+    async fn every_server_exit_releases_grabs_and_remote_inputs() {
+        for exit in ["disconnect", "capture failure", "send failure", "shutdown"] {
+            for keyboard_only in [false, true] {
+                let rig = crate::testing::ServerRig::new();
+                let mut capture = rig.capture.clone();
+                let mut transition = ServerTransition::new(
+                    None,
+                    ScreenLayout {
+                        width: 2560,
+                        height: 1440,
+                    },
+                );
+                transition.activate_instant(protocol::Direction::Right);
+                if keyboard_only {
+                    capture.set_keyboard_grab(true).unwrap();
+                } else {
+                    capture.set_grab(true).unwrap();
+                }
+                let output = transition.poll(
+                    0,
+                    0,
+                    1920,
+                    1080,
+                    1,
+                    vec![Message::KeyEvent {
+                        keycode: 30,
+                        pressed: true,
+                        modifiers: 0,
+                    }],
+                );
+                assert!(matches!(output, ServerOutput::Forward { .. }), "{exit}");
+
+                let releases =
+                    restore_server_input_state(&mut capture, keyboard_only, &mut transition);
+                for _ in &releases {
+                    rig.peer
+                        .succeed_next_send(crate::testing::ServerSendOperation::Input);
+                }
+                send_server_input_messages(&rig.peer, releases)
+                    .await
+                    .unwrap();
+
+                let expected_grabs = if keyboard_only {
+                    vec![
+                        crate::testing::GrabChange::Keyboard(true),
+                        crate::testing::GrabChange::Keyboard(false),
+                    ]
+                } else {
+                    vec![
+                        crate::testing::GrabChange::All(true),
+                        crate::testing::GrabChange::All(false),
+                    ]
+                };
+                rig.assert_grab_history(&expected_grabs);
+                rig.assert_outbound_peer_messages(&[
+                    crate::testing::ServerPeerObservation::InputSend(
+                        ServerInputCommand::KeyChanged {
+                            keycode: 30,
+                            pressed: false,
+                            modifiers: 0,
+                        },
+                    ),
+                    crate::testing::ServerPeerObservation::InputSend(
+                        ServerInputCommand::MouseButtonChanged {
+                            button: 0,
+                            pressed: false,
+                        },
+                    ),
+                ]);
+                assert!(!transition.is_active(), "{exit}");
+            }
+        }
     }
 
     #[test]

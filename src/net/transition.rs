@@ -59,6 +59,7 @@ pub struct ServerTransition {
     edge_cooldown: u32,
     edge_dwell: u32,
     pressed_keys: HashSet<u32>,
+    pressed_buttons: HashSet<u8>,
 }
 
 impl ServerTransition {
@@ -73,6 +74,7 @@ impl ServerTransition {
             edge_cooldown: 0,
             edge_dwell: 0,
             pressed_keys: HashSet::new(),
+            pressed_buttons: HashSet::new(),
         }
     }
 
@@ -135,18 +137,33 @@ impl ServerTransition {
         }
     }
 
-    fn release_pressed_keys(&mut self) -> Vec<Message> {
-        let mut keys: Vec<u32> = self.pressed_keys.iter().copied().collect();
-        keys.sort_unstable();
-        self.pressed_keys.clear();
+    pub fn update_button(&mut self, button: u8, pressed: bool) {
+        if pressed {
+            self.pressed_buttons.insert(button);
+        } else {
+            self.pressed_buttons.remove(&button);
+        }
+    }
 
-        keys.into_iter()
+    pub fn release_remote_inputs(&mut self) -> Vec<Message> {
+        let mut keys: Vec<u32> = self.pressed_keys.drain().collect();
+        keys.sort_unstable();
+        let mut buttons: Vec<u8> = self.pressed_buttons.drain().collect();
+        buttons.sort_unstable();
+
+        let mut releases = keys
+            .into_iter()
             .map(|keycode| Message::KeyEvent {
                 keycode,
                 pressed: false,
                 modifiers: 0,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        releases.extend(buttons.into_iter().map(|button| Message::MouseButton {
+            button,
+            pressed: false,
+        }));
+        releases
     }
 
     /// Activate immediately (layer-shell: edge detection is instant, no dwell needed).
@@ -157,6 +174,7 @@ impl ServerTransition {
         self.last_y = 0;
         self.edge_dwell = 0;
         self.edge_cooldown = 0;
+        self.pressed_buttons.clear();
 
         let pw = self.peer_screen.width as i32;
         let ph = self.peer_screen.height as i32;
@@ -196,14 +214,14 @@ impl ServerTransition {
         if self.is_escape_combo() {
             self.active = false;
             return ServerOutput::ForceRelease {
-                messages: self.release_pressed_keys(),
+                messages: self.release_remote_inputs(),
             };
         }
         if self.shortcut_direction().is_some() {
             self.active = false;
             self.edge_cooldown = SERVER_EDGE_COOLDOWN;
             return ServerOutput::ShortcutRelease {
-                messages: self.release_pressed_keys(),
+                messages: self.release_remote_inputs(),
             };
         }
 
@@ -227,7 +245,7 @@ impl ServerTransition {
         if self.active && self.is_escape_combo() {
             self.active = false;
             return ServerOutput::ForceRelease {
-                messages: self.release_pressed_keys(),
+                messages: self.release_remote_inputs(),
             };
         }
 
@@ -236,13 +254,14 @@ impl ServerTransition {
                 self.active = false;
                 self.edge_cooldown = SERVER_EDGE_COOLDOWN;
                 return ServerOutput::ShortcutRelease {
-                    messages: self.release_pressed_keys(),
+                    messages: self.release_remote_inputs(),
                 };
             }
 
             if self.edge_cooldown == 0 {
                 self.active = true;
                 self.last_buttons = buttons;
+                self.pressed_buttons.clear();
                 self.last_x = mx;
                 self.last_y = my;
                 self.edge_dwell = 0;
@@ -287,6 +306,7 @@ impl ServerTransition {
                 self.edge_dwell = 0;
                 self.active = true;
                 self.last_buttons = buttons;
+                self.pressed_buttons.clear();
                 self.last_x = mx;
                 self.last_y = my;
 
@@ -329,6 +349,7 @@ impl ServerTransition {
                     let was = (self.last_buttons >> bit) & 1 != 0;
                     let now = (buttons >> bit) & 1 != 0;
                     if was != now {
+                        self.update_button(bit, now);
                         messages.push(Message::MouseButton {
                             button: bit,
                             pressed: now,
@@ -357,7 +378,7 @@ impl ServerTransition {
     pub fn on_switch_back(&mut self) -> Vec<Message> {
         self.active = false;
         self.edge_cooldown = SERVER_EDGE_COOLDOWN;
-        self.release_pressed_keys()
+        self.release_remote_inputs()
     }
 
     pub fn deactivate(&mut self) {
@@ -367,7 +388,7 @@ impl ServerTransition {
     pub fn deactivate_for_shortcut(&mut self) -> Vec<Message> {
         self.active = false;
         self.edge_cooldown = SERVER_EDGE_COOLDOWN;
-        self.release_pressed_keys()
+        self.release_remote_inputs()
     }
 }
 
