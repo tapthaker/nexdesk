@@ -2419,6 +2419,45 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn disconnect_while_key_held_releases_the_client_key() {
+        let rig = crate::testing::ClientRig::new();
+        let mut injector = rig.injector_factory.create().unwrap();
+        injector
+            .inject(&Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            })
+            .unwrap();
+        let mut keys = HashSet::from([30]);
+        let mut buttons = HashSet::new();
+
+        release_injected_inputs(&mut *injector, &rig.display, &mut keys, &mut buttons);
+
+        rig.assert_pressed_inputs(&[], &[]);
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn disconnect_while_button_held_releases_the_client_button() {
+        let rig = crate::testing::ClientRig::new();
+        let mut injector = rig.injector_factory.create().unwrap();
+        injector
+            .inject(&Message::MouseButton {
+                button: 0,
+                pressed: true,
+            })
+            .unwrap();
+        let mut keys = HashSet::new();
+        let mut buttons = HashSet::from([0]);
+
+        release_injected_inputs(&mut *injector, &rig.display, &mut keys, &mut buttons);
+
+        rig.assert_pressed_inputs(&[], &[]);
+        assert!(buttons.is_empty());
+    }
+
+    #[test]
     fn injected_input_cleanup_uses_display_control_port() {
         let mut injector = crate::testing::RecordingInjector::new((1920, 1080));
         let display = crate::testing::FakeDisplaySessionControl::new();
