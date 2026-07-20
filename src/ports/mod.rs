@@ -8,7 +8,7 @@ mod update;
 
 pub use clipboard::Clipboard;
 pub use pairing::{PairingPrompt, PairingPromptFuture};
-pub use platform::{DisplaySessionControl, SleepInhibitor};
+pub use platform::{DisplaySessionControl, LocalSessionLockSource, SleepInhibitor};
 pub use status::StatusSink;
 pub use transport::{
     ClientChannel, ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand,

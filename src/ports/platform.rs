@@ -1,5 +1,10 @@
 use color_eyre::eyre::Result;
 
+/// Source for the local graphical session's lock state.
+pub trait LocalSessionLockSource: Send + Sync {
+    fn is_locked(&self) -> Result<bool>;
+}
+
 /// Process-lifetime guard returned by a platform sleep inhibitor.
 pub trait SleepInhibitor: Send {}
 
@@ -15,6 +20,14 @@ pub trait DisplaySessionControl: Send + Sync {
 mod tests {
     use super::*;
 
+    struct UnlockedSession;
+
+    impl LocalSessionLockSource for UnlockedSession {
+        fn is_locked(&self) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
     struct NoopDisplayControl;
 
     impl DisplaySessionControl for NoopDisplayControl {
@@ -25,6 +38,12 @@ mod tests {
         fn wake_display(&self) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn local_session_lock_port_is_object_safe() {
+        let source: &dyn LocalSessionLockSource = &UnlockedSession;
+        assert!(!source.is_locked().unwrap());
     }
 
     #[test]

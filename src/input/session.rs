@@ -5,6 +5,19 @@
 #[cfg(target_os = "linux")]
 use std::process::Command;
 
+use color_eyre::eyre::Result;
+
+use crate::ports::LocalSessionLockSource;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlatformLocalSessionLockSource;
+
+impl LocalSessionLockSource for PlatformLocalSessionLockSource {
+    fn is_locked(&self) -> Result<bool> {
+        Ok(is_session_locked())
+    }
+}
+
 /// Returns true when the current graphical session appears to be locked.
 ///
 /// This is intentionally best-effort: if we cannot query logind, return false
