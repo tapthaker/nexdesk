@@ -26,6 +26,7 @@ use crate::net::framing::{recv_message, send_message};
 use crate::net::pairing::{self, TerminalPairingPrompt};
 use crate::net::protocol::{self, Message, ScreenLayout, BUILD_VERSION, PROTOCOL_VERSION};
 use crate::net::quinn_client::QuinnClientPeerLink;
+use crate::net::quinn_server::QuinnServerPeerLink;
 use crate::net::tls;
 use crate::net::tls::ConfigTrustStore;
 use crate::net::transition::{ClientOutput, ClientTransition, ServerOutput, ServerTransition};
@@ -34,7 +35,9 @@ use crate::ports::{
     ClientChannel, ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand,
     ClientControlEvent, ClientInputEvent, ClientPeerLink, ClientTransportEvent, Clipboard,
     DisplaySessionControl, LocalSessionLockSource, PairingPrompt, PeerDirection, PeerScreen,
-    PeerScrollPhase, Release, ReleaseRepository, StatusSink, TrustStore, UpdateInstaller,
+    PeerScrollPhase, Release, ReleaseRepository, ServerChannel, ServerClipboardCommand,
+    ServerClipboardEvent, ServerControlCommand, ServerControlEvent, ServerInputCommand,
+    ServerPeerLink, ServerTransportEvent, StatusSink, TrustStore, UpdateInstaller,
 };
 use crate::status::{self, FileStatusSink, RuntimeStatus};
 
@@ -408,14 +411,83 @@ fn release_defensive_keyups(injector: &mut dyn InputInjector) {
     }
 }
 
-async fn send_user_activity(send: &mut SendStream, last_sent: &mut Instant) {
+async fn send_user_activity(peer: &dyn ServerPeerLink, last_sent: &mut Instant) {
     if last_sent.elapsed() < USER_ACTIVITY_INTERVAL {
         return;
     }
 
-    if send_message(send, &Message::WakeDisplay).await.is_ok() {
+    if peer
+        .send_control(ServerControlCommand::WakePeerDisplay)
+        .await
+        .is_ok()
+    {
         *last_sent = Instant::now();
     }
+}
+
+fn server_input_command(message: Message) -> Result<ServerInputCommand> {
+    let command = match message {
+        Message::MouseMove { x, y } => ServerInputCommand::MouseMoved { x, y },
+        Message::MouseButton { button, pressed } => {
+            ServerInputCommand::MouseButtonChanged { button, pressed }
+        }
+        Message::MouseScroll { dx, dy, phase } => ServerInputCommand::MouseScrolled {
+            dx,
+            dy,
+            phase: match phase {
+                protocol::ScrollPhase::None => PeerScrollPhase::None,
+                protocol::ScrollPhase::Began => PeerScrollPhase::Began,
+                protocol::ScrollPhase::Changed => PeerScrollPhase::Changed,
+                protocol::ScrollPhase::Ended => PeerScrollPhase::Ended,
+            },
+        },
+        Message::KeyEvent {
+            keycode,
+            pressed,
+            modifiers,
+        } => ServerInputCommand::KeyChanged {
+            keycode,
+            pressed,
+            modifiers,
+        },
+        Message::SwitchScreen { direction } => ServerInputCommand::SwitchToPeer {
+            direction: peer_direction(direction),
+        },
+        other => {
+            return Err(eyre!(
+                "Message is not a server input command: {}",
+                protocol::message_summary(&other)
+            ));
+        }
+    };
+    Ok(command)
+}
+
+async fn send_server_input_messages(
+    peer: &dyn ServerPeerLink,
+    messages: impl IntoIterator<Item = Message>,
+) -> Result<()> {
+    for message in messages {
+        peer.send_input(server_input_command(message)?).await?;
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct TypedServerInputSender {
+    peer: Arc<dyn ServerPeerLink>,
+}
+
+impl TypedServerInputSender {
+    async fn lock(&self) -> TypedServerInputGuard {
+        TypedServerInputGuard {
+            peer: self.peer.clone(),
+        }
+    }
+}
+
+struct TypedServerInputGuard {
+    peer: Arc<dyn ServerPeerLink>,
 }
 
 fn unix_millis() -> u64 {
@@ -732,58 +804,33 @@ async fn handle_server_connection(
         height: outcome.peer_screen.height,
     };
 
-    // Open clipboard stream (bidirectional) — must be before uni stream
-    // so client accept_bi() picks it up in order
-    let (mut clip_send, mut clip_recv) = connection.open_bi().await?;
-    // Send a Heartbeat as a "stream ready" marker so the client's accept_bi()
-    // actually sees this stream (QUIC may not push an empty stream).
-    let marker = Message::Heartbeat { timestamp: 0 };
-    send_message(&mut clip_send, &marker).await?;
-    info!("Clipboard stream opened");
-
-    // Open unidirectional input stream (server → client)
-    let mut input_send = connection.open_uni().await?;
-    // Send a marker so QUIC pushes the stream creation to the client
-    let input_marker = Message::Heartbeat { timestamp: 0 };
-    send_message(&mut input_send, &input_marker).await?;
-    let input_send = Arc::new(Mutex::new(input_send));
-    debug!("Input stream opened and marker sent");
+    let peer: Arc<dyn ServerPeerLink> =
+        Arc::new(QuinnServerPeerLink::open(&connection, control_send, control_recv).await?);
+    info!("Typed server channels opened");
+    let input_send = TypedServerInputSender { peer: peer.clone() };
 
     // Spawn clipboard polling task
-    let clip_send = Arc::new(Mutex::new(clip_send));
-    let clip_send_clone = clip_send.clone();
     let clipboard = Arc::new(std::sync::Mutex::new(
         crate::clipboard::sync::ClipboardSync::new(Arc::new(PlatformClipboard)),
     ));
     let clipboard_poll = clipboard.clone();
+    let clipboard_peer = peer.clone();
     tokio::spawn(async move {
         let interval = crate::clipboard::sync::ClipboardSync::poll_interval();
         loop {
             tokio::time::sleep(interval).await;
             let msg = poll_clipboard_on_worker(clipboard_poll.clone()).await;
-            if let Ok(Some(msg)) = msg {
-                let mut sender = clip_send_clone.lock().await;
-                if send_message(&mut *sender, &msg).await.is_err() {
+            if let Ok(Some(Message::ClipboardUpdate {
+                content: protocol::ClipboardContent::Text(text),
+            })) = msg
+            {
+                if clipboard_peer
+                    .send_clipboard(ServerClipboardCommand::SetPeerText(text))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
-            }
-        }
-    });
-
-    // Spawn clipboard receive task
-    let clipboard_recv = clipboard.clone();
-    tokio::spawn(async move {
-        loop {
-            match recv_message(&mut clip_recv).await {
-                Ok(Some(Message::ClipboardUpdate { content })) => {
-                    if let Err(error) =
-                        apply_clipboard_on_worker(clipboard_recv.clone(), content).await
-                    {
-                        warn!("Failed to apply clipboard update: {}", error);
-                    }
-                }
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
             }
         }
     });
@@ -889,7 +936,7 @@ async fn handle_server_connection(
 
                 let has_input = (mx, my) != prev_mouse_pos || !key_events.is_empty() || buttons != 0;
                 if has_input {
-                    send_user_activity(&mut control_send, &mut last_user_activity_sent).await;
+                    send_user_activity(peer.as_ref(), &mut last_user_activity_sent).await;
                     prev_mouse_pos = (mx, my);
                 }
 
@@ -982,7 +1029,7 @@ async fn handle_server_connection(
                 };
 
                 if !key_events.is_empty() {
-                    send_user_activity(&mut control_send, &mut last_user_activity_sent).await;
+                    send_user_activity(peer.as_ref(), &mut last_user_activity_sent).await;
                 }
 
                 match transition.poll_active_keys(key_events) {
@@ -1073,7 +1120,7 @@ async fn handle_server_connection(
                 }
             }, if use_layer_shell => {
                 use crate::input::wayland_layer_shell::{LayerShellEvent, LayerShellCommand};
-                send_user_activity(&mut control_send, &mut last_user_activity_sent).await;
+                send_user_activity(peer.as_ref(), &mut last_user_activity_sent).await;
 
                 match event {
                     LayerShellEvent::EdgeEnter { direction } => {
@@ -1207,14 +1254,13 @@ async fn handle_server_connection(
                     }
                 }
             }
-            // Branch: Control stream messages
-            msg = recv_message(&mut control_recv) => {
-                match msg {
-                    Ok(Some(Message::Heartbeat { timestamp })) => {
-                        let ack = Message::HeartbeatAck { timestamp };
-                        send_message(&mut control_send, &ack).await?;
+            // Branch: typed peer events
+            event = peer.next_event() => {
+                match event {
+                    Some(ServerTransportEvent::Control(ServerControlEvent::Heartbeat { timestamp })) => {
+                        peer.send_control(ServerControlCommand::AcknowledgeHeartbeat { timestamp }).await?;
                     }
-                    Ok(Some(Message::SwitchScreen { direction })) => {
+                    Some(ServerTransportEvent::Control(ServerControlEvent::SwitchBackRequested { direction })) => {
                         request_server_display_wake(display_control.clone());
                         pending_layer_shell_motion = (0.0, 0.0);
                         info!("Client requested switch back: {:?}", direction);
@@ -1237,19 +1283,39 @@ async fn handle_server_connection(
                             capturer.lock().unwrap().set_grab(false).ok();
                         }
                     }
-                    Ok(Some(Message::ScreenResize { screen })) => {
+                    Some(ServerTransportEvent::Control(ServerControlEvent::PeerScreenChanged(screen))) => {
                         info!("Peer screen updated: {}x{}", screen.width, screen.height);
-                        transition.update_peer_screen(screen);
+                        transition.update_peer_screen(ScreenLayout {
+                            width: screen.width,
+                            height: screen.height,
+                        });
                     }
-                    Ok(Some(other)) => {
-                        debug!("Received message: {:?}", other);
+                    Some(ServerTransportEvent::Clipboard(ServerClipboardEvent::TextChanged(text))) => {
+                        if let Err(error) = apply_clipboard_on_worker(
+                            clipboard.clone(),
+                            protocol::ClipboardContent::Text(text),
+                        ).await {
+                            warn!("Failed to apply clipboard update: {}", error);
+                        }
                     }
-                    Ok(None) => {
-                        info!("Peer {} disconnected", remote);
+                    Some(ServerTransportEvent::Closed(ServerChannel::Clipboard)) => {
+                        info!("Peer {} clipboard channel closed", remote);
+                    }
+                    Some(ServerTransportEvent::Failed(failure))
+                        if failure.channel == ServerChannel::Clipboard =>
+                    {
+                        warn!("Peer {} clipboard channel failed: {}", remote, failure.message);
+                    }
+                    Some(ServerTransportEvent::Closed(channel)) => {
+                        info!("Peer {} {:?} channel closed", remote, channel);
                         break;
                     }
-                    Err(e) => {
-                        warn!("Error reading from {}: {}", remote, e);
+                    Some(ServerTransportEvent::Failed(failure)) => {
+                        warn!("Peer {} {:?} channel failed: {}", remote, failure.channel, failure.message);
+                        break;
+                    }
+                    None => {
+                        info!("Peer {} transport closed", remote);
                         break;
                     }
                 }
@@ -1290,10 +1356,11 @@ async fn handle_server_connection(
                     info!("Screen size changed: {}x{} -> {}x{}", last_screen_w, last_screen_h, size.0, size.1);
                     last_screen_w = size.0;
                     last_screen_h = size.1;
-                    let resize_msg = Message::ScreenResize {
-                        screen: ScreenLayout { width: size.0, height: size.1 },
-                    };
-                    if let Err(e) = send_message(&mut control_send, &resize_msg).await {
+                    let resize = ServerControlCommand::LocalScreenChanged(PeerScreen {
+                        width: size.0,
+                        height: size.1,
+                    });
+                    if let Err(e) = peer.send_control(resize).await {
                         warn!("Failed to send screen resize: {}", e);
                         break;
                     }
@@ -2345,8 +2412,8 @@ async fn connect_with_retry(endpoint: &Endpoint, addr: SocketAddr) -> Result<qui
     Err(eyre!("Failed to connect after {} attempts", max_attempts))
 }
 
-async fn send_message_uni(send: &mut quinn::SendStream, msg: &Message) -> Result<()> {
-    send_message(send, msg).await
+async fn send_message_uni(send: &mut TypedServerInputGuard, msg: &Message) -> Result<()> {
+    send_server_input_messages(send.peer.as_ref(), [msg.clone()]).await
 }
 
 async fn recv_message_uni(recv: &mut quinn::RecvStream) -> Result<Option<Message>> {
@@ -2777,6 +2844,31 @@ mod lifecycle_tests {
         fn is_locked(&self) -> Result<bool> {
             self.0.map_err(|message| eyre!(message))
         }
+    }
+
+    #[test]
+    fn server_wire_input_is_routed_through_typed_commands() {
+        assert_eq!(
+            server_input_command(Message::MouseButton {
+                button: 2,
+                pressed: true,
+            })
+            .unwrap(),
+            ServerInputCommand::MouseButtonChanged {
+                button: 2,
+                pressed: true,
+            }
+        );
+        assert_eq!(
+            server_input_command(Message::SwitchScreen {
+                direction: protocol::Direction::Right,
+            })
+            .unwrap(),
+            ServerInputCommand::SwitchToPeer {
+                direction: PeerDirection::Right,
+            }
+        );
+        assert!(server_input_command(Message::WakeDisplay).is_err());
     }
 
     #[test]

@@ -183,7 +183,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T2.2.1** Build a Quinn server adapter producing the same typed peer-link abstraction.
 - [x] **T2.2.2** Separate server handshake decisions from concrete streams.
 - [x] **T2.2.3** Add server handshake scenarios for OTP, trusted certificates, absent certificates, version mismatch, malformed messages, and disconnects.
-- [ ] **T2.2.4** Move the server event loop to typed transport operations.
+- [x] **T2.2.4** Move the server event loop to typed transport operations.
 - [ ] **T2.2.5** Make all connection-owned background tasks supervised and joined during shutdown.
 - [ ] **T2.2.6** Add tests for failure/closure of each server logical channel.
 
@@ -390,4 +390,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `9e6382e` | T2.1.6 | Released local input before awaiting lock notifications. |
 | 2026-07-19 | `1c70c1d` | T2.2.1 | Added a typed Quinn server peer-link adapter. |
 | 2026-07-19 | `71ad09b` | T2.2.2 | Separated server handshake policy from Quinn streams. |
-| 2026-07-19 | this commit | T2.2.3 | Covered server OTP, certificate, version, malformed, and disconnect handshakes. |
+| 2026-07-19 | `c2388c7` | T2.2.3 | Covered server OTP, certificate, version, malformed, and disconnect handshakes. |
+| 2026-07-19 | this commit | T2.2.4 | Moved server channel events and sends onto typed transport operations. |
