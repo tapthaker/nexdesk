@@ -117,7 +117,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T1.2.3** Pass the injector factory into the client connection/session path instead of constructing the platform injector internally.
 - [x] **T1.2.4** Add a display/session-control port for wake and sleep inhibition.
 - [x] **T1.2.5** Implement fake display/session control with observation recording and blocking/error injection.
-- [ ] **T1.2.6** Replace direct client wake/inhibitor calls with the injected port.
+- [x] **T1.2.6** Replace direct client wake/inhibitor calls with the injected port.
 
 ### T1.3 — Extract trust and pairing decisions
 
@@ -349,4 +349,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `5778c6b` | T1.2.2 | Added a stateful recording injector and scripted factory. |
 | 2026-07-19 | `4a2620c` | T1.2.3 | Injected the input factory through client connection sessions. |
 | 2026-07-19 | `8c522ef` | T1.2.4 | Added display wake and sleep-inhibition platform ports. |
-| 2026-07-19 | this commit | T1.2.5 | Added scripted display control with blocking gates and observations. |
+| 2026-07-19 | `4da1a86` | T1.2.5 | Added scripted display control with blocking gates and observations. |
+| 2026-07-19 | this commit | T1.2.6 | Routed client wake and sleep inhibition through the platform port. |

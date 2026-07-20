@@ -13,10 +13,12 @@ use tracing::{debug, error, info, warn};
 
 use crate::app::{CancellationToken, RestartReason, RetryPolicy, SessionExit};
 use crate::input::inject::{InputInjector, InputInjectorFactory, PlatformInputInjectorFactory};
+use crate::input::wake::PlatformDisplaySessionControl;
 use crate::net::discovery;
 use crate::net::protocol::{self, Message, ScreenLayout, BUILD_VERSION, PROTOCOL_VERSION};
 use crate::net::tls;
 use crate::net::transition::{ClientOutput, ClientTransition, ServerOutput, ServerTransition};
+use crate::ports::DisplaySessionControl;
 use crate::status::{self, RuntimeStatus};
 
 const DEFAULT_PORT: u16 = 4242;
@@ -93,6 +95,15 @@ impl InputMessageQueue {
             }
             notified.await;
         }
+    }
+}
+
+fn layer_shell_button_to_protocol(button: u32) -> Option<u8> {
+    match button {
+        0x110 => Some(0),
+        0x111 => Some(1),
+        0x112 => Some(2),
+        _ => None,
     }
 }
 
@@ -188,8 +199,22 @@ fn inject_with_timing(
     result
 }
 
+fn lock_recover<'a, T>(
+    mutex: &'a std::sync::Mutex<T>,
+    context: &str,
+) -> std::sync::MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("Recovering from poisoned {} mutex", context);
+            poisoned.into_inner()
+        }
+    }
+}
+
 fn release_injected_inputs(
     injector: &mut dyn InputInjector,
+    display_control: &dyn DisplaySessionControl,
     injected_keys: &mut HashSet<u32>,
     injected_buttons: &mut HashSet<u8>,
 ) {
@@ -197,7 +222,7 @@ fn release_injected_inputs(
         return;
     }
 
-    request_wake_display();
+    display_control.wake_display().ok();
 
     let mut buttons: Vec<u8> = injected_buttons.iter().copied().collect();
     buttons.sort_unstable();
@@ -1055,6 +1080,7 @@ trait ClientReconnectDriver {
 struct ProductionClientDriver {
     explicit_addr: Option<String>,
     injector_factory: Arc<dyn InputInjectorFactory>,
+    display_control: Arc<dyn DisplaySessionControl>,
 }
 
 struct ConnectedClient {
@@ -1094,6 +1120,7 @@ impl ClientReconnectDriver for ProductionClientDriver {
             connected.connection,
             connected.addr,
             self.injector_factory.as_ref(),
+            self.display_control.as_ref(),
         )
         .await
     }
@@ -1197,19 +1224,27 @@ async fn connect_with_cancellation(
     addr: Option<&str>,
     cancellation: CancellationToken,
 ) -> Result<SessionExit> {
-    connect_with_dependencies(addr, cancellation, Arc::new(PlatformInputInjectorFactory)).await
+    connect_with_dependencies(
+        addr,
+        cancellation,
+        Arc::new(PlatformInputInjectorFactory),
+        Arc::new(PlatformDisplaySessionControl),
+    )
+    .await
 }
 
 async fn connect_with_dependencies(
     addr: Option<&str>,
     cancellation: CancellationToken,
     injector_factory: Arc<dyn InputInjectorFactory>,
+    display_control: Arc<dyn DisplaySessionControl>,
 ) -> Result<SessionExit> {
     let explicit_addr = explicit_connect_addr_arg(addr)?;
-    let _idle_sleep_inhibitor = crate::input::wake::inhibit_idle_system_sleep();
+    let _idle_sleep_inhibitor = display_control.inhibit_idle_sleep()?;
     let mut driver = ProductionClientDriver {
         explicit_addr,
         injector_factory,
+        display_control,
     };
     run_client_reconnect_loop(&mut driver, RetryPolicy::default(), cancellation).await
 }
@@ -1219,6 +1254,7 @@ async fn run_client_session(
     connection: quinn::Connection,
     addr: SocketAddr,
     injector_factory: &dyn InputInjectorFactory,
+    display_control: &dyn DisplaySessionControl,
 ) -> Result<SessionExit> {
     let tls_fingerprint = tls::peer_fingerprint(&connection)
         .ok_or_else(|| eyre!("Server did not present a certificate"))?;
@@ -1567,7 +1603,7 @@ async fn run_client_session(
                                 activation_inject_moves = 0;
                                 activation_superseded_moves = 0;
                                 activation_first_inject_logged = false;
-                                request_wake_display();
+                                display_control.wake_display().ok();
                             }
                             ClientOutput::InjectMove { x, y } => {
                                 if pending_mouse_move.replace((x, y)).is_some() {
@@ -1600,7 +1636,12 @@ async fn run_client_session(
                                 // Release any remote-held keys immediately on switch-back. The
                                 // server also sends cleanup releases, but those can arrive after
                                 // this transition has become inactive.
-                                release_injected_inputs(&mut *injector, &mut injected_keys, &mut injected_buttons);
+                                release_injected_inputs(
+                                    &mut *injector,
+                                    display_control,
+                                    &mut injected_keys,
+                                    &mut injected_buttons,
+                                );
                                 release_defensive_keyups(&mut *injector);
                                 info!("Edge on client: {:?} — requesting switch back", direction);
                                 let switch_msg = Message::SwitchScreen { direction };
@@ -1675,7 +1716,7 @@ async fn run_client_session(
                     }
                     Ok(Some(Message::WakeDisplay)) => {
                         debug!("Peer user active — keeping this system awake");
-                        request_wake_display();
+                        display_control.wake_display().ok();
                     }
                     Ok(Some(other)) => {
                         debug!("Control message: {:?}", other);
@@ -1753,7 +1794,12 @@ async fn run_client_session(
 
     // Release any synthetic input that may still be down if the stream ended
     // before key-up/button-up events were processed (for example during display sleep).
-    release_injected_inputs(&mut *injector, &mut injected_keys, &mut injected_buttons);
+    release_injected_inputs(
+        &mut *injector,
+        display_control,
+        &mut injected_keys,
+        &mut injected_buttons,
+    );
     release_defensive_keyups(&mut *injector);
 
     // Signal clipboard tasks to shut down
@@ -2258,12 +2304,21 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn wake_display_requests_are_coalesced_while_in_flight() {
-        let flag = std::sync::atomic::AtomicBool::new(false);
-        assert!(mark_wake_display_in_flight(&flag));
-        assert!(!mark_wake_display_in_flight(&flag));
-        flag.store(false, std::sync::atomic::Ordering::Release);
-        assert!(mark_wake_display_in_flight(&flag));
+    fn injected_input_cleanup_uses_display_control_port() {
+        let mut injector = crate::testing::RecordingInjector::new((1920, 1080));
+        let display = crate::testing::FakeDisplaySessionControl::new();
+        let mut keys = HashSet::from([30]);
+        let mut buttons = HashSet::from([0]);
+
+        release_injected_inputs(&mut injector, &display, &mut keys, &mut buttons);
+
+        assert!(keys.is_empty());
+        assert!(buttons.is_empty());
+        let observations = display.observations().snapshot();
+        assert!(observations.iter().any(|entry| matches!(
+            entry.event,
+            crate::testing::DisplayObservation::WakeRequested
+        )));
     }
 
     #[test]
