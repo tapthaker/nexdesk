@@ -124,7 +124,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T1.3.1** Introduce a focused `TrustStore` interface.
 - [x] **T1.3.2** Adapt the existing TLS/config trust functions behind the production store.
 - [x] **T1.3.3** Add an in-memory trust store supporting read/write failures.
-- [ ] **T1.3.4** Extract client handshake decision logic from Quinn stream mechanics.
+- [x] **T1.3.4** Extract client handshake decision logic from Quinn stream mechanics.
 - [ ] **T1.3.5** Add table-driven tests for trusted reconnect, OTP success/failure, fingerprint mismatch, malformed messages, and stream closure at each handshake stage.
 - [ ] **T1.3.6** Extract pairing-code input behind a prompt interface and test interactive/non-interactive behavior without real stdin.
 
@@ -353,4 +353,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `7a0f65b` | T1.2.6 | Routed client wake and sleep inhibition through the platform port. |
 | 2026-07-19 | `7795f1a` | T1.3.1 | Added an object-safe peer trust persistence port. |
 | 2026-07-19 | `055301e` | T1.3.2 | Adapted normalized config trust behind the production store. |
-| 2026-07-19 | this commit | T1.3.3 | Added observable in-memory trust with read/write failures. |
+| 2026-07-19 | `d7f9439` | T1.3.3 | Added observable in-memory trust with read/write failures. |
+| 2026-07-19 | this commit | T1.3.4 | Extracted client hello validation and trust-based pairing decisions. |

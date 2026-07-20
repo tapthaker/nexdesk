@@ -1,7 +1,11 @@
 mod cancellation;
+mod handshake;
 mod reconnect;
 mod session;
 
 pub use cancellation::CancellationToken;
+pub(crate) use handshake::{
+    client_pairing_decision, validate_client_server_hello, PairingDecision,
+};
 pub use reconnect::RetryPolicy;
 pub use session::{RestartReason, RunOutcome, SessionExit};

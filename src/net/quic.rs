@@ -11,14 +11,18 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
-use crate::app::{CancellationToken, RestartReason, RetryPolicy, SessionExit};
+use crate::app::{
+    client_pairing_decision, validate_client_server_hello, CancellationToken, PairingDecision,
+    RestartReason, RetryPolicy, SessionExit,
+};
 use crate::input::inject::{InputInjector, InputInjectorFactory, PlatformInputInjectorFactory};
 use crate::input::wake::PlatformDisplaySessionControl;
 use crate::net::discovery;
 use crate::net::protocol::{self, Message, ScreenLayout, BUILD_VERSION, PROTOCOL_VERSION};
 use crate::net::tls;
+use crate::net::tls::ConfigTrustStore;
 use crate::net::transition::{ClientOutput, ClientTransition, ServerOutput, ServerTransition};
-use crate::ports::DisplaySessionControl;
+use crate::ports::{DisplaySessionControl, TrustStore};
 use crate::status::{self, RuntimeStatus};
 
 const DEFAULT_PORT: u16 = 4242;
@@ -1081,6 +1085,7 @@ struct ProductionClientDriver {
     explicit_addr: Option<String>,
     injector_factory: Arc<dyn InputInjectorFactory>,
     display_control: Arc<dyn DisplaySessionControl>,
+    trust_store: Arc<dyn TrustStore>,
 }
 
 struct ConnectedClient {
@@ -1121,6 +1126,7 @@ impl ClientReconnectDriver for ProductionClientDriver {
             connected.addr,
             self.injector_factory.as_ref(),
             self.display_control.as_ref(),
+            self.trust_store.as_ref(),
         )
         .await
     }
@@ -1229,6 +1235,7 @@ async fn connect_with_cancellation(
         cancellation,
         Arc::new(PlatformInputInjectorFactory),
         Arc::new(PlatformDisplaySessionControl),
+        Arc::new(ConfigTrustStore),
     )
     .await
 }
@@ -1238,6 +1245,7 @@ async fn connect_with_dependencies(
     cancellation: CancellationToken,
     injector_factory: Arc<dyn InputInjectorFactory>,
     display_control: Arc<dyn DisplaySessionControl>,
+    trust_store: Arc<dyn TrustStore>,
 ) -> Result<SessionExit> {
     let explicit_addr = explicit_connect_addr_arg(addr)?;
     let _idle_sleep_inhibitor = display_control.inhibit_idle_sleep()?;
@@ -1245,6 +1253,7 @@ async fn connect_with_dependencies(
         explicit_addr,
         injector_factory,
         display_control,
+        trust_store,
     };
     run_client_reconnect_loop(&mut driver, RetryPolicy::default(), cancellation).await
 }
@@ -1255,6 +1264,7 @@ async fn run_client_session(
     addr: SocketAddr,
     injector_factory: &dyn InputInjectorFactory,
     display_control: &dyn DisplaySessionControl,
+    trust_store: &dyn TrustStore,
 ) -> Result<SessionExit> {
     let tls_fingerprint = tls::peer_fingerprint(&connection)
         .ok_or_else(|| eyre!("Server did not present a certificate"))?;
@@ -1280,6 +1290,15 @@ async fn run_client_session(
             fingerprint,
             build_version,
         }) => {
+            validate_client_server_hello(
+                version,
+                PROTOCOL_VERSION,
+                &fingerprint,
+                &tls_fingerprint,
+                screen.width,
+                screen.height,
+            )?;
+
             let server_ver = build_version.as_deref().unwrap_or("unknown");
             info!(
                 "Server: {} (proto v{}, build {}, screen: {}x{})",
@@ -1292,27 +1311,13 @@ async fn run_client_session(
                 );
             }
 
-            // Check if we already trust this server's fingerprint
-            let otp = if tls::is_fingerprint_trusted(&fingerprint) {
-                info!("Server fingerprint already trusted");
-                None
-            } else {
-                if !std::io::stdin().is_terminal() {
-                    return Err(eyre!(
-                        "Server fingerprint is not trusted and no interactive terminal is available for pairing. Run `nexdesk connect {}` from a terminal once, enter the pairing code, then restart the background service.",
-                        addr
-                    ));
+            let pairing = client_pairing_decision(trust_store.is_trusted(&fingerprint)?);
+            let otp = match pairing {
+                PairingDecision::UseTrustedIdentity => {
+                    info!("Server fingerprint already trusted");
+                    None
                 }
-                // Prompt user for pairing code
-                let code = tokio::task::spawn_blocking(|| {
-                    eprint!("Enter pairing code: ");
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input).ok();
-                    input.trim().to_string()
-                })
-                .await
-                .wrap_err("Failed to read pairing code")?;
-                Some(code)
+                PairingDecision::PromptForOtp => Some(prompt_pairing_code(addr).await?),
             };
 
             let ack = Message::HelloAck {
@@ -1329,9 +1334,8 @@ async fn run_client_session(
             // Wait for PairingResult
             match recv_message(&mut control_recv).await? {
                 Some(Message::PairingResult { success: true }) => {
-                    if otp.is_some() {
-                        // First time pairing succeeded — store fingerprint
-                        tls::trust_fingerprint(&fingerprint)?;
+                    if matches!(pairing, PairingDecision::PromptForOtp) {
+                        trust_store.trust(&fingerprint)?;
                         info!("Paired successfully. Fingerprint stored.");
                     }
                 }
