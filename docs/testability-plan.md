@@ -191,7 +191,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 - [x] **T2.3.1** Create `ServerRig` with scripted capture, peer, clipboard, lock source, status sink, clock, and task tracker.
 - [x] **T2.3.2** Add edge activation and shortcut activation scenarios.
-- [ ] **T2.3.3** Add safety escape and switch-back cleanup scenarios.
+- [x] **T2.3.3** Add safety escape and switch-back cleanup scenarios.
 - [ ] **T2.3.4** Add local-lock-during-sharing scenarios for polling and layer-shell modes.
 - [ ] **T2.3.5** Add blocked-send, input-capture failure, peer resize, and disconnect scenarios.
 - [ ] **T2.3.6** Assert every server exit releases pointer/keyboard grabs and all held remote inputs.
@@ -395,4 +395,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `a343f61` | T2.2.5 | Supervised and joined server connection tasks during shutdown. |
 | 2026-07-19 | `e61877e` | T2.2.6 | Covered closure and failure policy for every server channel. |
 | 2026-07-19 | `54950a5` | T2.3.1 | Added a deterministic server rig and scripted lock source. |
-| 2026-07-19 | this commit | T2.3.2 | Added server edge and shortcut activation scenarios. |
+| 2026-07-19 | `48b28a5` | T2.3.2 | Added server edge and shortcut activation scenarios. |
+| 2026-07-19 | this commit | T2.3.3 | Added server safety-escape and switch-back cleanup scenarios. |

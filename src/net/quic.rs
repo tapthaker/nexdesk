@@ -2986,6 +2986,122 @@ mod lifecycle_tests {
         ]);
     }
 
+    #[tokio::test]
+    async fn server_safety_escape_releases_grab_and_remote_keys() {
+        let rig = crate::testing::ServerRig::new();
+        let mut capture = rig.capture.clone();
+        let mut transition = ServerTransition::new(
+            None,
+            ScreenLayout {
+                width: 2560,
+                height: 1440,
+            },
+        );
+        transition.activate_instant(protocol::Direction::Right);
+        capture.set_grab(true).unwrap();
+        let escape_keys = [29, 56, 1]
+            .into_iter()
+            .map(|keycode| Message::KeyEvent {
+                keycode,
+                pressed: true,
+                modifiers: 0,
+            })
+            .collect();
+        let ServerOutput::ForceRelease { messages } =
+            transition.poll(100, 100, 1920, 1080, 0, escape_keys)
+        else {
+            panic!("safety escape should force release");
+        };
+        capture.set_grab(false).unwrap();
+        for _ in &messages {
+            rig.peer
+                .succeed_next_send(crate::testing::ServerSendOperation::Input);
+        }
+
+        send_server_input_messages(&rig.peer, messages)
+            .await
+            .unwrap();
+
+        assert!(!transition.is_active());
+        rig.assert_grab_history(&[
+            crate::testing::GrabChange::All(true),
+            crate::testing::GrabChange::All(false),
+        ]);
+        rig.assert_outbound_peer_messages(&[
+            crate::testing::ServerPeerObservation::InputSend(ServerInputCommand::KeyChanged {
+                keycode: 1,
+                pressed: false,
+                modifiers: 0,
+            }),
+            crate::testing::ServerPeerObservation::InputSend(ServerInputCommand::KeyChanged {
+                keycode: 29,
+                pressed: false,
+                modifiers: 0,
+            }),
+            crate::testing::ServerPeerObservation::InputSend(ServerInputCommand::KeyChanged {
+                keycode: 56,
+                pressed: false,
+                modifiers: 0,
+            }),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn server_switch_back_releases_held_keys_and_local_grab() {
+        let rig = crate::testing::ServerRig::new();
+        let mut capture = rig.capture.clone();
+        let mut transition = ServerTransition::new(
+            None,
+            ScreenLayout {
+                width: 2560,
+                height: 1440,
+            },
+        );
+        transition.activate_instant(protocol::Direction::Right);
+        capture.set_grab(true).unwrap();
+        let key_down = Message::KeyEvent {
+            keycode: 30,
+            pressed: true,
+            modifiers: 0,
+        };
+        let ServerOutput::Forward { messages } =
+            transition.poll(0, 0, 1920, 1080, 0, vec![key_down])
+        else {
+            panic!("active input should be forwarded");
+        };
+        rig.peer
+            .succeed_next_send(crate::testing::ServerSendOperation::Input);
+        send_server_input_messages(&rig.peer, messages)
+            .await
+            .unwrap();
+
+        let releases = transition.on_switch_back();
+        capture.set_grab(false).unwrap();
+        rig.peer
+            .succeed_next_send(crate::testing::ServerSendOperation::Input);
+        send_server_input_messages(&rig.peer, releases)
+            .await
+            .unwrap();
+
+        assert!(!transition.is_active());
+        rig.assert_grab_history(&[
+            crate::testing::GrabChange::All(true),
+            crate::testing::GrabChange::All(false),
+        ]);
+        rig.assert_outbound_peer_messages(&[
+            crate::testing::ServerPeerObservation::InputSend(ServerInputCommand::KeyChanged {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            }),
+            crate::testing::ServerPeerObservation::InputSend(ServerInputCommand::KeyChanged {
+                keycode: 30,
+                pressed: false,
+                modifiers: 0,
+            }),
+        ]);
+    }
+
     #[test]
     fn server_wire_input_is_routed_through_typed_commands() {
         assert_eq!(
