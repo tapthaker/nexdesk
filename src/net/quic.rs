@@ -11,10 +11,10 @@ use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use crate::app::{
-    client_pairing_decision, complete_client_pairing, execute_update, require_handshake_message,
-    validate_client_server_hello, CancellationToken, HandshakeMessage, PairingCompletion,
-    PairingDecision, RestartReason, RetryPolicy, SessionExit, UpdateExecution, UpdatePolicy,
-    UpdateSource,
+    client_channel_disposition, client_pairing_decision, complete_client_pairing, execute_update,
+    require_handshake_message, validate_client_server_hello, CancellationToken,
+    ClientChannelDisposition, HandshakeMessage, PairingCompletion, PairingDecision, RestartReason,
+    RetryPolicy, SessionExit, UpdateExecution, UpdatePolicy, UpdateSource,
 };
 use crate::input::inject::{InputInjector, InputInjectorFactory, PlatformInputInjectorFactory};
 use crate::input::wake::PlatformDisplaySessionControl;
@@ -28,10 +28,10 @@ use crate::net::tls::ConfigTrustStore;
 use crate::net::transition::{ClientOutput, ClientTransition, ServerOutput, ServerTransition};
 use crate::net::update::{ExecutableUpdateInstaller, GithubReleaseRepository};
 use crate::ports::{
-    ClientChannel, ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand,
-    ClientControlEvent, ClientInputEvent, ClientPeerLink, ClientTransportEvent,
-    DisplaySessionControl, PairingPrompt, PeerDirection, PeerScreen, PeerScrollPhase, Release,
-    ReleaseRepository, TrustStore, UpdateInstaller,
+    ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand, ClientControlEvent,
+    ClientInputEvent, ClientPeerLink, ClientTransportEvent, DisplaySessionControl, PairingPrompt,
+    PeerDirection, PeerScreen, PeerScrollPhase, Release, ReleaseRepository, TrustStore,
+    UpdateInstaller,
 };
 use crate::status::{self, RuntimeStatus};
 
@@ -1815,21 +1815,23 @@ async fn run_client_session(
                             warn!("Failed to apply clipboard update: {}", error);
                         }
                     }
-                    Some(ClientTransportEvent::Closed(ClientChannel::Clipboard)) => {
-                        info!("Clipboard stream closed by server");
-                    }
-                    Some(ClientTransportEvent::Failed(failure))
-                        if failure.channel == ClientChannel::Clipboard =>
-                    {
-                        warn!("Clipboard stream error: {}", failure.message);
-                    }
                     Some(ClientTransportEvent::Closed(channel)) => {
                         info!("Server {:?} channel closed", channel);
-                        break;
+                        if matches!(
+                            client_channel_disposition(channel),
+                            ClientChannelDisposition::Disconnect
+                        ) {
+                            break;
+                        }
                     }
                     Some(ClientTransportEvent::Failed(failure)) => {
                         warn!("{:?} channel error: {}", failure.channel, failure.message);
-                        break;
+                        if matches!(
+                            client_channel_disposition(failure.channel),
+                            ClientChannelDisposition::Disconnect
+                        ) {
+                            break;
+                        }
                     }
                     None => {
                         info!("Client peer link closed");

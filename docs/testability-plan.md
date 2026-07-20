@@ -143,7 +143,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T1.5.3** Build a Quinn client adapter that translates concrete streams into typed events.
 - [x] **T1.5.4** Build an in-memory scripted peer link with per-channel delay, blocking, closure, and failure injection.
 - [x] **T1.5.5** Move the post-handshake client loop to the typed peer link.
-- [ ] **T1.5.6** Add tests for closure and partial failure of each logical channel.
+- [x] **T1.5.6** Add tests for closure and partial failure of each logical channel.
 
 ### T1.6 — Extract client clipboard behavior
 
@@ -366,4 +366,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `8eb426e` | T1.5.2 | Centralized validated framing across QUIC and file transfer streams. |
 | 2026-07-19 | `cddbb50` | T1.5.3 | Added Quinn translation between wire streams and typed client events. |
 | 2026-07-19 | `9edc689` | T1.5.4 | Added a scripted typed peer with delay, blocking, closure, and failures. |
-| 2026-07-19 | this commit | T1.5.5 | Moved post-handshake client I/O onto the typed peer link. |
+| 2026-07-19 | `14cee51` | T1.5.5 | Moved post-handshake client I/O onto the typed peer link. |
+| 2026-07-19 | this commit | T1.5.6 | Covered closure and failure dispositions for every client channel. |
