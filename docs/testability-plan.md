@@ -172,7 +172,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 ### T2.1 — Inject server input and platform behavior
 
 - [x] **T2.1.1** Add an injectable `InputCaptureFactory` around the existing capture interface.
-- [ ] **T2.1.2** Implement a scripted capturer supporting positions, buttons, keys, screen sizes, grab history, and failures.
+- [x] **T2.1.2** Implement a scripted capturer supporting positions, buttons, keys, screen sizes, grab history, and failures.
 - [ ] **T2.1.3** Inject capture creation into the server connection path.
 - [ ] **T2.1.4** Introduce an injectable local-session lock source.
 - [ ] **T2.1.5** Route server lock checks and display wake through platform ports.
@@ -382,4 +382,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `12e2b3c` | T1.7.6 | Covered resize validation, injector errors, and control failures. |
 | 2026-07-19 | `63fa581` | T1.7.7 | Added virtual-time latency, recovery, and watchdog scenarios. |
 | 2026-07-19 | `dbf7254` | T1.7.8 | Restored client input/cursor state and joined tasks on every exit. |
-| 2026-07-19 | this commit | T2.1.1 | Added an object-safe server input capture factory. |
+| 2026-07-19 | `f2f2a05` | T2.1.1 | Added an object-safe server input capture factory. |
+| 2026-07-19 | this commit | T2.1.2 | Added scripted server input state, grabs, and failures. |
