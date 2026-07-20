@@ -147,7 +147,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 ### T1.6 — Extract client clipboard behavior
 
-- [ ] **T1.6.1** Introduce a semantic clipboard interface for text and files.
+- [x] **T1.6.1** Introduce a semantic clipboard interface for text and files.
 - [ ] **T1.6.2** Move Linux/macOS clipboard commands behind production adapters.
 - [ ] **T1.6.3** Add a memory clipboard with scripted reads/writes, blocking gates, and change history.
 - [ ] **T1.6.4** Inject clipboard behavior into `ClipboardSync` and the client session.
@@ -367,4 +367,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `cddbb50` | T1.5.3 | Added Quinn translation between wire streams and typed client events. |
 | 2026-07-19 | `9edc689` | T1.5.4 | Added a scripted typed peer with delay, blocking, closure, and failures. |
 | 2026-07-19 | `14cee51` | T1.5.5 | Moved post-handshake client I/O onto the typed peer link. |
-| 2026-07-19 | this commit | T1.5.6 | Covered closure and failure dispositions for every client channel. |
+| 2026-07-19 | `98d9ec0` | T1.5.6 | Covered closure and failure dispositions for every client channel. |
+| 2026-07-19 | this commit | T1.6.1 | Added semantic clipboard text and file access port. |
