@@ -138,7 +138,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 ### T1.5 — Introduce typed client transport events
 
-- [ ] **T1.5.1** Define typed channels/events for control, input, clipboard, transport closure, and transport failure.
+- [x] **T1.5.1** Define typed channels/events for control, input, clipboard, transport closure, and transport failure.
 - [ ] **T1.5.2** Extract message framing into one shared codec/stream module and remove duplicate framing implementations where practical.
 - [ ] **T1.5.3** Build a Quinn client adapter that translates concrete streams into typed events.
 - [ ] **T1.5.4** Build an in-memory scripted peer link with per-channel delay, blocking, closure, and failure injection.
@@ -361,4 +361,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `e14286b` | T1.4.2 | Extracted pure update eligibility policy from updater mechanics. |
 | 2026-07-19 | `ffdb47b` | T1.4.3 | Added scripted release, asset, installer, and restart fakes. |
 | 2026-07-19 | `3abd6be` | T1.4.4 | Routed client update paths through policy and injected adapters. |
-| 2026-07-19 | this commit | T1.4.5 | Covered update eligibility, failure, install, and restart scenarios. |
+| 2026-07-19 | `5c46f8c` | T1.4.5 | Covered update eligibility, failure, install, and restart scenarios. |
+| 2026-07-19 | this commit | T1.5.1 | Defined typed client transport channels, events, and commands. |
