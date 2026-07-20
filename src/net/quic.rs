@@ -641,6 +641,16 @@ fn create_server_capturer(
     Ok((capturer, screen_size))
 }
 
+fn poll_server_capture(
+    capturer: &mut dyn InputCapture,
+) -> Result<(i32, i32, u32, u32, u8, Vec<Message>)> {
+    let key_events = capturer.poll_key_events()?;
+    let (x, y) = capturer.mouse_position()?;
+    let (width, height) = capturer.screen_size()?;
+    let buttons = capturer.mouse_buttons()?;
+    Ok((x, y, width, height, buttons, key_events))
+}
+
 fn validate_listen_port(port: u16) -> Result<()> {
     if port == 0 {
         return Err(eyre!(
@@ -938,13 +948,16 @@ async fn handle_server_connection(
                 // Query input state while holding lock briefly.
                 // poll_key_events() is called first because on Wayland (evdev)
                 // it drains pending events and updates the cursor position.
-                let (mx, my, sw, sh, buttons, key_events) = {
+                let capture = {
                     let mut cap = capturer.lock().unwrap();
-                    let keys = cap.poll_key_events().unwrap_or_default();
-                    let pos = cap.mouse_position().unwrap_or((0, 0));
-                    let size = cap.screen_size().unwrap_or((1920, 1080));
-                    let btns = cap.mouse_buttons().unwrap_or(0);
-                    (pos.0, pos.1, size.0, size.1, btns, keys)
+                    poll_server_capture(&mut **cap)
+                };
+                let (mx, my, sw, sh, buttons, key_events) = match capture {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        warn!("Input capture failed: {}", error);
+                        break;
+                    }
                 };
 
                 let has_input = (mx, my) != prev_mouse_pos || !key_events.is_empty() || buttons != 0;
@@ -1032,13 +1045,21 @@ async fn handle_server_connection(
             // can consume global shortcuts and media keys before wl_keyboard sees
             // them, so use evdev while the remote screen is active.
             _ = layer_shell_key_poll_interval.tick(), if use_layer_shell && layer_shell_keyboard_grabbed && transition.is_active() => {
-                let key_events: Vec<Message> = {
+                let key_events = {
                     let mut cap = capturer.lock().unwrap();
-                    cap.poll_key_events()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|msg| matches!(msg, Message::KeyEvent { .. }))
-                        .collect()
+                    cap.poll_key_events().map(|events| {
+                        events
+                            .into_iter()
+                            .filter(|msg| matches!(msg, Message::KeyEvent { .. }))
+                            .collect::<Vec<_>>()
+                    })
+                };
+                let key_events = match key_events {
+                    Ok(events) => events,
+                    Err(error) => {
+                        warn!("Input key capture failed: {}", error);
+                        break;
+                    }
                 };
 
                 if !key_events.is_empty() {
@@ -1360,7 +1381,14 @@ async fn handle_server_connection(
                 }
             }
             _ = screen_check.tick() => {
-                let size = capturer.lock().unwrap().screen_size().unwrap_or((last_screen_w, last_screen_h));
+                let size = capturer.lock().unwrap().screen_size();
+                let size = match size {
+                    Ok(size) => size,
+                    Err(error) => {
+                        warn!("Screen capture failed: {}", error);
+                        break;
+                    }
+                };
                 if size.0 != last_screen_w || size.1 != last_screen_h {
                     info!("Screen size changed: {}x{} -> {}x{}", last_screen_w, last_screen_h, size.0, size.1);
                     last_screen_w = size.0;
@@ -3162,6 +3190,134 @@ mod lifecycle_tests {
                 },
             )]);
         }
+    }
+
+    #[tokio::test]
+    async fn blocked_server_send_does_not_delay_local_release() {
+        let rig = crate::testing::ServerRig::new();
+        let mut capture = rig.capture.clone();
+        capture.set_grab(true).unwrap();
+        let gate = rig
+            .peer
+            .block_next_send(crate::testing::ServerSendOperation::Input);
+        let peer = rig.peer.clone();
+        let mut release_capture = rig.capture.clone();
+        let task = tokio::spawn(async move {
+            notify_after_local_input_release(
+                move || release_capture.set_grab(false).unwrap(),
+                send_server_input_messages(
+                    &peer,
+                    [Message::KeyEvent {
+                        keycode: 30,
+                        pressed: false,
+                        modifiers: 0,
+                    }],
+                ),
+            )
+            .await
+        });
+        gate.wait_until_entered().await;
+
+        rig.assert_grab_history(&[
+            crate::testing::GrabChange::All(true),
+            crate::testing::GrabChange::All(false),
+        ]);
+        assert!(!task.is_finished());
+
+        gate.release();
+        task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn input_capture_failure_is_observable_and_triggers_cleanup() {
+        let rig = crate::testing::ServerRig::new();
+        let mut capture = rig.capture.clone();
+        capture.set_grab(true).unwrap();
+        capture.push_key_events(Vec::new());
+        capture.fail_next(
+            crate::testing::CaptureOperation::MousePosition,
+            "capture device disappeared",
+        );
+
+        let error = poll_server_capture(&mut capture).unwrap_err();
+        capture.set_grab(false).unwrap();
+
+        assert!(error.to_string().contains("capture device disappeared"));
+        rig.assert_grab_history(&[
+            crate::testing::GrabChange::All(true),
+            crate::testing::GrabChange::All(false),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn peer_resize_updates_server_transition_geometry() {
+        let rig = crate::testing::ServerRig::new();
+        rig.peer.push_event(ServerTransportEvent::Control(
+            ServerControlEvent::PeerScreenChanged(PeerScreen {
+                width: 1600,
+                height: 900,
+            }),
+        ));
+        let mut transition = ServerTransition::new(
+            None,
+            ScreenLayout {
+                width: 2560,
+                height: 1440,
+            },
+        );
+
+        let event = rig.peer.next_event().await.unwrap();
+        let ServerTransportEvent::Control(ServerControlEvent::PeerScreenChanged(screen)) = event
+        else {
+            panic!("expected peer resize");
+        };
+        transition.update_peer_screen(ScreenLayout {
+            width: screen.width,
+            height: screen.height,
+        });
+
+        assert!(matches!(
+            transition
+                .activate_instant(protocol::Direction::Down)
+                .as_slice(),
+            [
+                Message::SwitchScreen {
+                    direction: protocol::Direction::Down,
+                },
+                Message::MouseMove { x: 800, y: 20 },
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn server_disconnect_releases_active_local_grab() {
+        let rig = crate::testing::ServerRig::new();
+        let mut capture = rig.capture.clone();
+        let mut transition = ServerTransition::new(
+            None,
+            ScreenLayout {
+                width: 2560,
+                height: 1440,
+            },
+        );
+        transition.activate_instant(protocol::Direction::Right);
+        capture.set_grab(true).unwrap();
+        rig.peer
+            .push_channel_close(crate::ports::ServerChannel::Control);
+
+        let event = rig.peer.next_event().await.unwrap();
+        assert_eq!(
+            server_channel_disposition(event.channel()),
+            ServerChannelDisposition::Disconnect
+        );
+        transition.deactivate();
+        capture.set_grab(false).unwrap();
+
+        assert!(!transition.is_active());
+        rig.assert_grab_history(&[
+            crate::testing::GrabChange::All(true),
+            crate::testing::GrabChange::All(false),
+        ]);
     }
 
     #[test]

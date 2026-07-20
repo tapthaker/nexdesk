@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use color_eyre::eyre::{eyre, Result};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::ports::{
     ServerChannel, ServerClipboardCommand, ServerControlCommand, ServerInputCommand,
@@ -31,11 +31,19 @@ pub enum ServerPeerObservation {
     Shutdown,
 }
 
+enum SendAction {
+    Complete(std::result::Result<(), String>),
+    Block {
+        entered: Arc<SendGateEntered>,
+        completion: oneshot::Receiver<std::result::Result<(), String>>,
+    },
+}
+
 #[derive(Default)]
 struct SendScripts {
-    control: VecDeque<std::result::Result<(), String>>,
-    input: VecDeque<std::result::Result<(), String>>,
-    clipboard: VecDeque<std::result::Result<(), String>>,
+    control: VecDeque<SendAction>,
+    input: VecDeque<SendAction>,
+    clipboard: VecDeque<SendAction>,
 }
 
 struct SharedState {
@@ -90,11 +98,30 @@ impl ScriptedServerPeerLink {
     }
 
     pub fn succeed_next_send(&self, operation: ServerSendOperation) {
-        self.push_send(operation, Ok(()));
+        self.push_send(operation, SendAction::Complete(Ok(())));
     }
 
     pub fn fail_next_send(&self, operation: ServerSendOperation, message: impl Into<String>) {
-        self.push_send(operation, Err(message.into()));
+        self.push_send(operation, SendAction::Complete(Err(message.into())));
+    }
+
+    pub fn block_next_send(&self, operation: ServerSendOperation) -> BlockingServerSend {
+        let entered = Arc::new(SendGateEntered {
+            value: AtomicBool::new(false),
+            changed: Notify::new(),
+        });
+        let (completion, completed) = oneshot::channel();
+        self.push_send(
+            operation,
+            SendAction::Block {
+                entered: entered.clone(),
+                completion: completed,
+            },
+        );
+        BlockingServerSend {
+            entered,
+            completion: Mutex::new(Some(completion)),
+        }
     }
 
     pub fn pending_events(&self) -> usize {
@@ -109,17 +136,17 @@ impl ScriptedServerPeerLink {
         self.state.observations.clone()
     }
 
-    fn push_send(&self, operation: ServerSendOperation, result: std::result::Result<(), String>) {
+    fn push_send(&self, operation: ServerSendOperation, action: SendAction) {
         let mut sends = lock_recover(&self.state.sends);
         match operation {
-            ServerSendOperation::Control => sends.control.push_back(result),
-            ServerSendOperation::Input => sends.input.push_back(result),
-            ServerSendOperation::Clipboard => sends.clipboard.push_back(result),
+            ServerSendOperation::Control => sends.control.push_back(action),
+            ServerSendOperation::Input => sends.input.push_back(action),
+            ServerSendOperation::Clipboard => sends.clipboard.push_back(action),
         }
     }
 
-    fn take_send(&self, operation: ServerSendOperation) -> Result<()> {
-        let result = {
+    fn take_send(&self, operation: ServerSendOperation) -> SendAction {
+        let action = {
             let mut sends = lock_recover(&self.state.sends);
             match operation {
                 ServerSendOperation::Control => sends.control.pop_front(),
@@ -127,28 +154,40 @@ impl ScriptedServerPeerLink {
                 ServerSendOperation::Clipboard => sends.clipboard.pop_front(),
             }
         };
-        match result {
-            Some(Ok(())) => Ok(()),
-            Some(Err(message)) => {
-                self.state
-                    .observations
-                    .record(ServerPeerObservation::SendFailed {
-                        operation,
-                        message: message.clone(),
-                    });
-                Err(eyre!(message))
+        action.unwrap_or_else(|| {
+            SendAction::Complete(Err(format!(
+                "unexpected {operation:?} send: no scripted action"
+            )))
+        })
+    }
+
+    async fn complete_send(
+        &self,
+        operation: ServerSendOperation,
+        action: SendAction,
+    ) -> Result<()> {
+        let result = match action {
+            SendAction::Complete(result) => result,
+            SendAction::Block {
+                entered,
+                completion,
+            } => {
+                entered.value.store(true, Ordering::SeqCst);
+                entered.changed.notify_waiters();
+                completion
+                    .await
+                    .unwrap_or_else(|_| Err("blocking server send controller dropped".to_string()))
             }
-            None => {
-                let message = format!("unexpected {operation:?} send: no scripted action");
-                self.state
-                    .observations
-                    .record(ServerPeerObservation::SendFailed {
-                        operation,
-                        message: message.clone(),
-                    });
-                Err(eyre!(message))
-            }
-        }
+        };
+        result.map_err(|message| {
+            self.state
+                .observations
+                .record(ServerPeerObservation::SendFailed {
+                    operation,
+                    message: message.clone(),
+                });
+            eyre!(message)
+        })
     }
 }
 
@@ -176,24 +215,30 @@ impl ServerPeerLink for ScriptedServerPeerLink {
         self.state
             .observations
             .record(ServerPeerObservation::ControlSend(command));
-        let result = self.take_send(ServerSendOperation::Control);
-        Box::pin(async move { result })
+        let action = self.take_send(ServerSendOperation::Control);
+        Box::pin(async move {
+            self.complete_send(ServerSendOperation::Control, action)
+                .await
+        })
     }
 
     fn send_input(&self, command: ServerInputCommand) -> TransportFuture<'_, Result<()>> {
         self.state
             .observations
             .record(ServerPeerObservation::InputSend(command));
-        let result = self.take_send(ServerSendOperation::Input);
-        Box::pin(async move { result })
+        let action = self.take_send(ServerSendOperation::Input);
+        Box::pin(async move { self.complete_send(ServerSendOperation::Input, action).await })
     }
 
     fn send_clipboard(&self, command: ServerClipboardCommand) -> TransportFuture<'_, Result<()>> {
         self.state
             .observations
             .record(ServerPeerObservation::ClipboardSend(command));
-        let result = self.take_send(ServerSendOperation::Clipboard);
-        Box::pin(async move { result })
+        let action = self.take_send(ServerSendOperation::Clipboard);
+        Box::pin(async move {
+            self.complete_send(ServerSendOperation::Clipboard, action)
+                .await
+        })
     }
 
     fn shutdown(&self) -> TransportFuture<'_, ()> {
@@ -203,6 +248,44 @@ impl ServerPeerLink for ScriptedServerPeerLink {
                 .observations
                 .record(ServerPeerObservation::Shutdown);
         })
+    }
+}
+
+struct SendGateEntered {
+    value: AtomicBool,
+    changed: Notify,
+}
+
+pub struct BlockingServerSend {
+    entered: Arc<SendGateEntered>,
+    completion: Mutex<Option<oneshot::Sender<std::result::Result<(), String>>>>,
+}
+
+impl BlockingServerSend {
+    pub async fn wait_until_entered(&self) {
+        while !self.entered.value.load(Ordering::SeqCst) {
+            self.entered.changed.notified().await;
+        }
+    }
+
+    pub fn release(&self) {
+        self.complete(Ok(()));
+    }
+
+    pub fn fail(&self, message: impl Into<String>) {
+        self.complete(Err(message.into()));
+    }
+
+    fn complete(&self, outcome: std::result::Result<(), String>) {
+        if let Some(completion) = lock_recover(&self.completion).take() {
+            let _ = completion.send(outcome);
+        }
+    }
+}
+
+impl Drop for BlockingServerSend {
+    fn drop(&mut self) {
+        self.complete(Err("blocking server send controller dropped".to_string()));
     }
 }
 

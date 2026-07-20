@@ -42,7 +42,7 @@ pub use scripted_peer_link::{
     BlockingPeerEvent, PeerLinkObservation, PeerSendOperation, ScriptedPeerLink,
 };
 pub use scripted_server_peer_link::{
-    ScriptedServerPeerLink, ServerPeerObservation, ServerSendOperation,
+    BlockingServerSend, ScriptedServerPeerLink, ServerPeerObservation, ServerSendOperation,
 };
 pub use scripted_session_lock::{ScriptedSessionLockSource, SessionLockObservation};
 pub use server_rig::{ServerRig, DEFAULT_SERVER_SCREEN};
