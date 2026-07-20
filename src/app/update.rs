@@ -131,6 +131,12 @@ pub fn is_release_version(version: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::testing::ObservationLog;
+    use crate::testing::{
+        AssetStreamStep, FakeUpdateInstaller, RestartRecorder, ScriptedReleaseRepository,
+        UpdateObservation,
+    };
+
     use super::*;
 
     fn release(version: &str) -> Release {
@@ -176,6 +182,163 @@ mod tests {
         for (version, source, expected) in cases {
             assert_eq!(policy.evaluate(release(version), source), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn rejected_update_scenarios_do_not_touch_download_or_install() {
+        let cases = [
+            (
+                "v1.2.4",
+                UpdateSource::UntrustedPeer,
+                UpdateRejection::UntrustedSource,
+            ),
+            (
+                "v1.2.4-dirty",
+                UpdateSource::TrustedPeer,
+                UpdateRejection::InvalidReleaseVersion,
+            ),
+            (
+                "v1.2.3",
+                UpdateSource::TrustedPeer,
+                UpdateRejection::NotNewer,
+            ),
+            (
+                "v1.2.2",
+                UpdateSource::TrustedPeer,
+                UpdateRejection::NotNewer,
+            ),
+        ];
+
+        for (version, source, expected) in cases {
+            let repository = ScriptedReleaseRepository::new();
+            let installer = FakeUpdateInstaller::new();
+            let outcome = execute_update(
+                &UpdatePolicy::new("v1.2.3"),
+                release(version),
+                source,
+                &repository,
+                &installer,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(outcome, UpdateExecution::Ignored(expected));
+            assert!(repository.observations().is_empty());
+            assert!(installer.observations().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn download_and_install_failures_never_request_restart() {
+        let policy = UpdatePolicy::new("v1.2.3");
+
+        let repository = ScriptedReleaseRepository::new();
+        let installer = FakeUpdateInstaller::new();
+        repository.fail_next_asset("v1.2.4", "download unavailable");
+        installer.succeed_next();
+        assert_eq!(
+            execute_update(
+                &policy,
+                release("v1.2.4"),
+                UpdateSource::TrustedRepository,
+                &repository,
+                &installer,
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "download unavailable"
+        );
+        assert_eq!(installer.remaining_actions(), 1);
+        assert!(installer.installed_updates().is_empty());
+
+        let repository = ScriptedReleaseRepository::new();
+        let installer = FakeUpdateInstaller::new();
+        repository.push_asset(
+            "v1.2.4",
+            None,
+            [
+                AssetStreamStep::bytes(b"partial"),
+                AssetStreamStep::fail("download interrupted"),
+            ],
+        );
+        installer.succeed_next();
+        assert!(execute_update(
+            &policy,
+            release("v1.2.4"),
+            UpdateSource::TrustedRepository,
+            &repository,
+            &installer,
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("download interrupted"));
+        assert!(installer.installed_updates().is_empty());
+
+        let repository = ScriptedReleaseRepository::new();
+        let installer = FakeUpdateInstaller::new();
+        repository.push_asset("v1.2.4", Some(3), [AssetStreamStep::bytes(b"bin")]);
+        installer.fail_next("installation denied");
+        assert_eq!(
+            execute_update(
+                &policy,
+                release("v1.2.4"),
+                UpdateSource::TrustedRepository,
+                &repository,
+                &installer,
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "installation denied"
+        );
+        assert!(installer.installed_updates().is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_install_returns_and_records_restart_intent() {
+        let log = ObservationLog::new();
+        let repository = ScriptedReleaseRepository::with_log(log.clone());
+        let installer = FakeUpdateInstaller::with_log(log.clone());
+        let restarts = RestartRecorder::with_log(log.clone());
+        repository.push_asset("v1.2.4", Some(3), [AssetStreamStep::bytes(b"bin")]);
+        installer.succeed_next();
+
+        let outcome = execute_update(
+            &UpdatePolicy::new("v1.2.3"),
+            release("v1.2.4"),
+            UpdateSource::TrustedPeer,
+            &repository,
+            &installer,
+        )
+        .await
+        .unwrap();
+        let UpdateExecution::RestartRequested(reason) = outcome else {
+            panic!("successful update did not request restart");
+        };
+        restarts.record(reason.clone());
+
+        assert_eq!(
+            reason,
+            RestartReason::UpdateInstalled {
+                version: "v1.2.4".to_string(),
+            }
+        );
+        assert_eq!(restarts.reasons(), vec![reason]);
+        let events = log
+            .snapshot()
+            .into_iter()
+            .map(|entry| entry.event)
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            events.last(),
+            Some(UpdateObservation::RestartRequested { .. })
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            UpdateObservation::Installed { version, .. } if version == "v1.2.4"
+        )));
     }
 
     #[test]
