@@ -384,6 +384,13 @@ fn system_time_millis_u64(time: std::time::SystemTime) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn validated_peer_screen(screen: PeerScreen) -> Option<ScreenLayout> {
+    (screen.width > 0 && screen.height > 0).then_some(ScreenLayout {
+        width: screen.width,
+        height: screen.height,
+    })
+}
+
 fn protocol_direction(direction: PeerDirection) -> protocol::Direction {
     match direction {
         PeerDirection::Left => protocol::Direction::Left,
@@ -1861,11 +1868,7 @@ async fn run_client_session(
                     Some(ClientTransportEvent::Control(
                         ClientControlEvent::PeerScreenChanged(screen),
                     )) => {
-                        let wire_screen = ScreenLayout {
-                            width: screen.width,
-                            height: screen.height,
-                        };
-                        if wire_screen.width > 0 && wire_screen.height > 0 {
+                        if let Some(wire_screen) = validated_peer_screen(screen) {
                             info!("Server screen changed: {}x{}", screen.width, screen.height);
                             server_screen = wire_screen;
                         } else {
@@ -2663,6 +2666,101 @@ mod lifecycle_tests {
                 .unwrap(),
             UpdateExecution::Ignored(crate::app::UpdateRejection::NotNewer)
         );
+    }
+
+    #[tokio::test]
+    async fn local_screen_resize_is_sent_to_the_peer() {
+        let rig = crate::testing::ClientRig::new();
+        rig.injector.set_screen_size((2560, 1440));
+        let injector = rig.injector_factory.create().unwrap();
+        let (width, height) = injector.screen_size().unwrap();
+        rig.peer.succeed_next_control_send();
+
+        rig.peer
+            .send_control(ClientControlCommand::LocalScreenChanged(PeerScreen {
+                width,
+                height,
+            }))
+            .await
+            .unwrap();
+
+        rig.assert_outbound_peer_messages(&[crate::testing::PeerLinkObservation::ControlSend(
+            ClientControlCommand::LocalScreenChanged(PeerScreen {
+                width: 2560,
+                height: 1440,
+            }),
+        )]);
+    }
+
+    #[test]
+    fn invalid_peer_screen_resize_is_rejected() {
+        assert!(validated_peer_screen(PeerScreen {
+            width: 0,
+            height: 1080,
+        })
+        .is_none());
+        assert!(validated_peer_screen(PeerScreen {
+            width: 1920,
+            height: 0,
+        })
+        .is_none());
+        assert_eq!(
+            validated_peer_screen(PeerScreen {
+                width: 1920,
+                height: 1080,
+            })
+            .unwrap()
+            .width,
+            1920
+        );
+    }
+
+    #[test]
+    fn injector_failure_does_not_record_unapplied_input() {
+        let rig = crate::testing::ClientRig::new();
+        rig.injector.fail_next(
+            crate::testing::InjectorOperation::Inject,
+            "display disappeared",
+        );
+        let mut injector = rig.injector_factory.create().unwrap();
+
+        let error = injector
+            .inject(&Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("display disappeared"));
+        rig.assert_pressed_inputs(&[], &[]);
+    }
+
+    #[tokio::test]
+    async fn control_stream_failure_is_observable_during_resize() {
+        let rig = crate::testing::ClientRig::new();
+        rig.peer
+            .fail_next_control_send("control stream unavailable");
+
+        let error = rig
+            .peer
+            .send_control(ClientControlCommand::LocalScreenChanged(PeerScreen {
+                width: 2560,
+                height: 1440,
+            }))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("control stream unavailable"));
+        assert!(rig.peer.observations().snapshot().iter().any(|entry| {
+            matches!(
+                &entry.event,
+                crate::testing::PeerLinkObservation::SendFailed {
+                    operation: crate::testing::PeerSendOperation::Control,
+                    ..
+                }
+            )
+        }));
     }
 
     #[test]

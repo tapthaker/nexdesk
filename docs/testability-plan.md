@@ -161,7 +161,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T1.7.3** Add assertions for pressed inputs, cursor state, status history, outbound peer messages, and task completion.
 - [x] **T1.7.4** Add disconnect-while-key-held and disconnect-while-button-held scenarios.
 - [x] **T1.7.5** Add switch-back/key-up race and duplicate-release scenarios.
-- [ ] **T1.7.6** Add screen resize, invalid screen, injector failure, and control-stream failure scenarios.
+- [x] **T1.7.6** Add screen resize, invalid screen, injector failure, and control-stream failure scenarios.
 - [ ] **T1.7.7** Add heartbeat latency, delayed acknowledgement, watchdog recovery, and watchdog restart scenarios using virtual time.
 - [ ] **T1.7.8** Add assertions that every client exit restores input and cursor state and terminates all tasks.
 
@@ -378,4 +378,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `06e62d7` | T1.7.2 | Added client rig settling, shutdown, and virtual-time controls. |
 | 2026-07-19 | `75294b7` | T1.7.3 | Added client state, status, peer-message, and task assertions. |
 | 2026-07-19 | `d64834b` | T1.7.4 | Covered disconnect cleanup with held keys and mouse buttons. |
-| 2026-07-19 | this commit | T1.7.5 | Covered late key-up races and duplicate release suppression. |
+| 2026-07-19 | `2d05d75` | T1.7.5 | Covered late key-up races and duplicate release suppression. |
+| 2026-07-19 | this commit | T1.7.6 | Covered resize validation, injector errors, and control failures. |
