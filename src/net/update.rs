@@ -1,6 +1,20 @@
 use color_eyre::eyre::{eyre, Result};
 use tracing::{info, warn};
 
+use crate::app::MAX_RELEASE_VERSION_BYTES;
+pub use crate::app::{is_newer, is_release_version};
+
+const MAX_UPDATE_SIZE: u64 = 100 * 1024 * 1024;
+const MAX_RELEASE_API_RESPONSE_SIZE: u64 = 64 * 1024;
+const MAX_RELEASE_TAG_BYTES: usize = MAX_RELEASE_VERSION_BYTES;
+const UPDATE_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn checked_downloaded_size(current: u64, chunk_len: usize) -> Result<u64> {
+    current
+        .checked_add(chunk_len as u64)
+        .ok_or_else(|| eyre!("Downloaded binary size overflow"))
+}
+
 /// Returns the platform slug used in GitHub release asset names.
 fn platform_slug() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -11,41 +25,22 @@ fn platform_slug() -> Option<&'static str> {
     }
 }
 
-/// Parse a version string like "v0.1.2" into (major, minor, patch).
-fn parse_semver(version: &str) -> Option<(u32, u32, u32)> {
-    let v = version.strip_prefix('v')?;
-    // Take only the semver part before any suffix like "-dirty" or "-3-gabcdef"
-    let v = v.split('-').next()?;
-    let parts: Vec<&str> = v.split('.').collect();
-    if parts.len() != 3 {
-        return None;
+fn validate_release_tag_text(version: &str) -> Result<()> {
+    if version.len() > MAX_RELEASE_TAG_BYTES {
+        return Err(eyre!(
+            "Release tag too large: {} bytes (max {})",
+            version.len(),
+            MAX_RELEASE_TAG_BYTES
+        ));
     }
-    Some((
-        parts[0].parse().ok()?,
-        parts[1].parse().ok()?,
-        parts[2].parse().ok()?,
-    ))
+    if version.chars().any(char::is_control) {
+        return Err(eyre!("Release tag contains control characters"));
+    }
+    Ok(())
 }
 
-/// Returns true if `a` is a newer version than `b`.
-pub fn is_newer(a: &str, b: &str) -> bool {
-    match (parse_semver(a), parse_semver(b)) {
-        (Some(va), Some(vb)) => va > vb,
-        _ => false,
-    }
-}
-
-/// Returns true only for clean semver release tags (e.g. `v0.1.2`).
-/// Rejects dirty builds (`v0.1.2-dirty`) and dev builds (`v0.1.2-3-gabcdef`).
-pub fn is_release_version(version: &str) -> bool {
-    if !version.starts_with('v') {
-        return false;
-    }
-    if version.contains("-dirty") || version.contains("-g") {
-        return false;
-    }
-    // Must be v followed by semver digits and dots only
-    version[1..].chars().all(|c| c.is_ascii_digit() || c == '.')
+fn safe_release_tag_for_error(version: &str) -> String {
+    crate::status::terminal_safe(version, MAX_RELEASE_TAG_BYTES)
 }
 
 /// Downloads the target version binary from GitHub releases and replaces the
@@ -202,30 +197,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_release_version() {
-        assert!(is_release_version("v0.1.2"));
-        assert!(is_release_version("v1.0.0"));
-        assert!(is_release_version("v10.20.30"));
+    fn downloaded_size_accounting_rejects_overflow() {
+        assert_eq!(checked_downloaded_size(10, 5).unwrap(), 15);
+        assert!(checked_downloaded_size(u64::MAX, 1).is_err());
+    }
 
-        assert!(!is_release_version("v0.1.2-dirty"));
-        assert!(!is_release_version("v0.1.2-3-gabcdef"));
-        assert!(!is_release_version("v0.1.2-dirty-3-gabcdef"));
-        assert!(!is_release_version("0.1.2")); // no 'v' prefix
-        assert!(!is_release_version("unknown"));
-        assert!(!is_release_version(""));
+    #[tokio::test]
+    async fn update_temp_file_is_open_private_and_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut file, path) = create_update_temp_file(dir.path()).unwrap();
+        file.write_all(b"abc").await.unwrap();
+        file.sync_all().await.unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[test]
-    fn test_is_newer() {
-        assert!(is_newer("v0.1.10", "v0.1.9"));
-        assert!(is_newer("v0.2.0", "v0.1.9"));
-        assert!(is_newer("v1.0.0", "v0.99.99"));
+    fn release_tag_text_is_bounded_and_control_free() {
+        validate_release_tag_text("v1.2.3").unwrap();
+        assert!(validate_release_tag_text("v1.2.3\n").is_err());
+        assert!(validate_release_tag_text(&"v".repeat(MAX_RELEASE_TAG_BYTES + 1)).is_err());
+        let safe = safe_release_tag_for_error(&format!("{}\x1b[31m", "v".repeat(128)));
+        assert!(!safe.contains('\u{1b}'));
+        assert_eq!(safe.len(), MAX_RELEASE_TAG_BYTES);
+    }
 
-        assert!(!is_newer("v0.1.9", "v0.1.10"));
-        assert!(!is_newer("v0.1.9", "v0.1.9"));
-
-        // Handles dirty/dev versions by comparing base semver
-        assert!(is_newer("v0.1.10", "v0.1.9-dirty"));
-        assert!(!is_newer("v0.1.9", "v0.1.10-dirty"));
+    #[test]
+    fn release_api_response_limit_is_small() {
+        assert_eq!(MAX_RELEASE_API_RESPONSE_SIZE, 64 * 1024);
     }
 }

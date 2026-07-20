@@ -2,6 +2,7 @@ mod cancellation;
 mod handshake;
 mod reconnect;
 mod session;
+mod update;
 
 pub use cancellation::CancellationToken;
 pub(crate) use handshake::{
@@ -10,3 +11,7 @@ pub(crate) use handshake::{
 };
 pub use reconnect::RetryPolicy;
 pub use session::{RestartReason, RunOutcome, SessionExit};
+pub use update::{
+    is_newer, is_release_version, UpdateDecision, UpdatePolicy, UpdateRejection, UpdateSource,
+    MAX_RELEASE_VERSION_BYTES,
+};

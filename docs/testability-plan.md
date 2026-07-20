@@ -131,7 +131,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 ### T1.4 — Extract updater behavior
 
 - [x] **T1.4.1** Introduce semantic `ReleaseRepository` and `UpdateInstaller` interfaces rather than a generic HTTP mock.
-- [ ] **T1.4.2** Separate update policy from download/install mechanics.
+- [x] **T1.4.2** Separate update policy from download/install mechanics.
 - [ ] **T1.4.3** Add fakes for release lookup, asset streaming, installation, and restart observation.
 - [ ] **T1.4.4** Route client protocol-mismatch and post-handshake updates through update policy.
 - [ ] **T1.4.5** Add scenarios for trusted/untrusted sources, dirty versions, downgrade/equal versions, download failure, install failure, and successful restart request.
@@ -357,4 +357,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `5d35bbc` | T1.3.4 | Extracted client hello validation and trust-based pairing decisions. |
 | 2026-07-19 | `578461a` | T1.3.5 | Added table-driven client handshake and closure coverage. |
 | 2026-07-19 | `ca18904` | T1.3.6 | Injected pairing prompts and tested terminal modes without stdio. |
-| 2026-07-19 | this commit | T1.4.1 | Added semantic release lookup, asset streaming, and installation ports. |
+| 2026-07-19 | `fe49332` | T1.4.1 | Added semantic release lookup, asset streaming, and installation ports. |
+| 2026-07-19 | this commit | T1.4.2 | Extracted pure update eligibility policy from updater mechanics. |
