@@ -329,6 +329,123 @@ mod tests {
     }
 
     #[test]
+    fn peer_update_is_applied_without_echoing_it_back() {
+        let clipboard = Arc::new(crate::testing::MemoryClipboard::new());
+        let mut sync = ClipboardSync::new(clipboard.clone());
+        let content = ClipboardContent::Text("from peer".to_string());
+
+        sync.apply_update(&content).unwrap();
+
+        assert!(sync.poll_change().unwrap().is_none());
+        assert_eq!(
+            clipboard.changes(),
+            vec![crate::testing::ClipboardChange::Text(
+                "from peer".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn oversized_local_and_peer_text_are_rejected() {
+        let oversized = "a".repeat(MAX_CLIPBOARD_TEXT_BYTES + 1);
+        let clipboard = Arc::new(crate::testing::MemoryClipboard::new());
+        clipboard.set_text(Some(oversized.clone()));
+        let mut sync = ClipboardSync::new(clipboard.clone());
+
+        assert!(sync.poll_change().unwrap().is_none());
+        let error = sync
+            .apply_update(&ClipboardContent::Text(oversized))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("too large"));
+        assert!(clipboard.changes().is_empty());
+    }
+
+    #[test]
+    fn clipboard_read_and_write_failures_have_defined_behavior() {
+        let clipboard = Arc::new(crate::testing::MemoryClipboard::new());
+        clipboard.fail_next(
+            crate::testing::ClipboardOperation::ReadText,
+            "read unavailable",
+        );
+        let mut sync = ClipboardSync::new(clipboard.clone());
+
+        // A temporarily unavailable local clipboard is not a session error.
+        assert!(sync.poll_change().unwrap().is_none());
+
+        clipboard.fail_next(
+            crate::testing::ClipboardOperation::WriteText,
+            "write unavailable",
+        );
+        let error = sync
+            .apply_update(&ClipboardContent::Text("peer text".to_string()))
+            .unwrap_err();
+        assert!(error.to_string().contains("write unavailable"));
+        assert!(clipboard.changes().is_empty());
+    }
+
+    #[test]
+    fn blocked_clipboard_read_waits_for_release() {
+        let clipboard = Arc::new(crate::testing::MemoryClipboard::new());
+        clipboard.set_text(Some("eventual text".to_string()));
+        let gate = clipboard.block_next(crate::testing::ClipboardOperation::ReadText);
+        let worker_clipboard = clipboard.clone();
+        let worker = std::thread::spawn(move || {
+            let mut sync = ClipboardSync::new(worker_clipboard);
+            sync.poll_change()
+        });
+
+        assert!(gate.wait_until_entered(Duration::from_secs(1)));
+        assert!(!worker.is_finished());
+        gate.release();
+        assert!(matches!(
+            worker.join().unwrap().unwrap(),
+            Some(Message::ClipboardUpdate {
+                content: ClipboardContent::Text(text),
+            }) if text == "eventual text"
+        ));
+    }
+
+    #[test]
+    fn blocked_clipboard_write_waits_for_release() {
+        let clipboard = Arc::new(crate::testing::MemoryClipboard::new());
+        let gate = clipboard.block_next(crate::testing::ClipboardOperation::WriteText);
+        let worker_clipboard = clipboard.clone();
+        let worker = std::thread::spawn(move || {
+            let mut sync = ClipboardSync::new(worker_clipboard);
+            sync.apply_update(&ClipboardContent::Text("peer text".to_string()))
+        });
+
+        assert!(gate.wait_until_entered(Duration::from_secs(1)));
+        assert!(!worker.is_finished());
+        gate.release();
+        worker.join().unwrap().unwrap();
+        assert_eq!(
+            clipboard.changes(),
+            vec![crate::testing::ClipboardChange::Text(
+                "peer text".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn blocked_clipboard_read_can_be_cancelled_for_shutdown() {
+        let clipboard = Arc::new(crate::testing::MemoryClipboard::new());
+        let gate = clipboard.block_next(crate::testing::ClipboardOperation::ReadText);
+        let worker = std::thread::spawn(move || {
+            let mut sync = ClipboardSync::new(clipboard);
+            sync.poll_change()
+        });
+
+        assert!(gate.wait_until_entered(Duration::from_secs(1)));
+        drop(gate);
+
+        // ClipboardSync treats cancellation like any unavailable local read,
+        // allowing its owner to join the worker during shutdown.
+        assert!(worker.join().unwrap().unwrap().is_none());
+    }
+
+    #[test]
     fn clipboard_size_limit_accepts_boundary() {
         let text = "a".repeat(MAX_CLIPBOARD_TEXT_BYTES);
         assert!(clipboard_text_size_ok(&text));
