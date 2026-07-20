@@ -3,6 +3,7 @@ use std::sync::Arc;
 use color_eyre::eyre::Result;
 use quinn::{Connection, RecvStream, SendStream};
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinSet;
 
 use crate::net::framing;
 use crate::net::protocol::{self, ClipboardContent, Direction, Message, ScrollPhase};
@@ -21,6 +22,7 @@ pub(crate) struct QuinnServerPeerLink {
     input_send: Arc<Mutex<SendStream>>,
     clipboard_send: Arc<Mutex<SendStream>>,
     events: Mutex<mpsc::Receiver<ServerTransportEvent>>,
+    tasks: Mutex<Option<JoinSet<()>>>,
 }
 
 impl QuinnServerPeerLink {
@@ -36,13 +38,16 @@ impl QuinnServerPeerLink {
         framing::send_message(&mut input_send, &Message::Heartbeat { timestamp: 0 }).await?;
 
         let (event_send, events) = mpsc::channel(EVENT_BUFFER);
+        let mut tasks = JoinSet::new();
         spawn_reader(
+            &mut tasks,
             control_recv,
             ServerChannel::Control,
             event_send.clone(),
             map_control_message,
         );
         spawn_reader(
+            &mut tasks,
             clipboard_recv,
             ServerChannel::Clipboard,
             event_send,
@@ -54,6 +59,7 @@ impl QuinnServerPeerLink {
             input_send: Arc::new(Mutex::new(input_send)),
             clipboard_send: Arc::new(Mutex::new(clipboard_send)),
             events: Mutex::new(events),
+            tasks: Mutex::new(Some(tasks)),
         })
     }
 }
@@ -89,15 +95,25 @@ impl ServerPeerLink for QuinnServerPeerLink {
             framing::send_message(&mut *sender.lock().await, &message).await
         })
     }
+
+    fn shutdown(&self) -> TransportFuture<'_, ()> {
+        Box::pin(async move {
+            if let Some(mut tasks) = self.tasks.lock().await.take() {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+            }
+        })
+    }
 }
 
 fn spawn_reader(
+    tasks: &mut JoinSet<()>,
     mut recv: RecvStream,
     channel: ServerChannel,
     sender: mpsc::Sender<ServerTransportEvent>,
     map: fn(Message) -> std::result::Result<ServerTransportEvent, String>,
 ) {
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         loop {
             let event = match framing::recv_message(&mut recv).await {
                 Ok(Some(message)) => match map(message) {

@@ -382,6 +382,11 @@ fn restore_client_input_state(
     }
 }
 
+async fn terminate_server_tasks(tasks: &mut tokio::task::JoinSet<()>) {
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
 async fn terminate_client_tasks(tasks: Vec<tokio::task::JoinHandle<()>>) {
     for task in &tasks {
         task.abort();
@@ -808,6 +813,7 @@ async fn handle_server_connection(
         Arc::new(QuinnServerPeerLink::open(&connection, control_send, control_recv).await?);
     info!("Typed server channels opened");
     let input_send = TypedServerInputSender { peer: peer.clone() };
+    let mut connection_tasks = tokio::task::JoinSet::new();
 
     // Spawn clipboard polling task
     let clipboard = Arc::new(std::sync::Mutex::new(
@@ -815,7 +821,7 @@ async fn handle_server_connection(
     ));
     let clipboard_poll = clipboard.clone();
     let clipboard_peer = peer.clone();
-    tokio::spawn(async move {
+    connection_tasks.spawn(async move {
         let interval = crate::clipboard::sync::ClipboardSync::poll_interval();
         loop {
             tokio::time::sleep(interval).await;
@@ -873,11 +879,13 @@ async fn handle_server_connection(
 
     // Spawn file transfer acceptor (receives files from client via new bi-streams)
     let ft_conn = connection.clone();
-    tokio::spawn(async move {
+    connection_tasks.spawn(async move {
+        let mut transfers = tokio::task::JoinSet::new();
         loop {
-            match ft_conn.accept_bi().await {
+            tokio::select! {
+                result = ft_conn.accept_bi() => match result {
                 Ok((send, recv)) => {
-                    tokio::spawn(async move {
+                    transfers.spawn(async move {
                         match crate::filetransfer::recv::receive_files(send, recv).await {
                             Ok(paths) if !paths.is_empty() => {
                                 info!("Received {} file(s) from client", paths.len());
@@ -893,8 +901,12 @@ async fn handle_server_connection(
                     });
                 }
                 Err(_) => break,
+                },
+                Some(_) = transfers.join_next(), if !transfers.is_empty() => {}
             }
         }
+        transfers.abort_all();
+        while transfers.join_next().await.is_some() {}
     });
 
     info!("Server ready. Move mouse to screen edge to start sharing.");
@@ -960,7 +972,7 @@ async fn handle_server_connection(
                         }
                         // Check clipboard for files and transfer them
                         let ft_conn = connection.clone();
-                        tokio::spawn(async move {
+                        connection_tasks.spawn(async move {
                             let files = tokio::task::spawn_blocking(|| {
                                 PlatformClipboard.read_files().ok()
                             }).await.ok().flatten();
@@ -1142,7 +1154,7 @@ async fn handle_server_connection(
                         }
                         // Check clipboard for files and transfer them
                         let ft_conn = connection.clone();
-                        tokio::spawn(async move {
+                        connection_tasks.spawn(async move {
                             let files = tokio::task::spawn_blocking(|| {
                                 PlatformClipboard.read_files().ok()
                             }).await.ok().flatten();
@@ -1385,6 +1397,8 @@ async fn handle_server_connection(
         capturer.lock().unwrap().set_grab(false).ok();
     }
 
+    terminate_server_tasks(&mut connection_tasks).await;
+    peer.shutdown().await;
     Ok(())
 }
 
@@ -2787,6 +2801,25 @@ mod lifecycle_tests {
             poll.await.unwrap().unwrap(),
             Some(Message::ClipboardUpdate { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn server_task_shutdown_aborts_and_joins_owned_tasks() {
+        let tracker = crate::testing::TaskTracker::new();
+        let tracked = tracker.clone();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            tracked
+                .run("server background", std::future::pending::<()>())
+                .await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!tracker.is_idle());
+
+        terminate_server_tasks(&mut tasks).await;
+
+        tracker.ensure_idle().unwrap();
+        assert!(tasks.is_empty());
     }
 
     #[tokio::test]

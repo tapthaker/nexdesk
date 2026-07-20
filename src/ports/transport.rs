@@ -214,6 +214,8 @@ pub trait ServerPeerLink: Send + Sync {
     fn send_input(&self, command: ServerInputCommand) -> TransportFuture<'_, Result<()>>;
 
     fn send_clipboard(&self, command: ServerClipboardCommand) -> TransportFuture<'_, Result<()>>;
+
+    fn shutdown(&self) -> TransportFuture<'_, ()>;
 }
 
 #[cfg(test)]
@@ -259,6 +261,10 @@ mod tests {
             _command: ServerClipboardCommand,
         ) -> TransportFuture<'_, Result<()>> {
             Box::pin(async { Ok(()) })
+        }
+
+        fn shutdown(&self) -> TransportFuture<'_, ()> {
+            Box::pin(async {})
         }
     }
 
