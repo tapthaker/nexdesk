@@ -563,7 +563,7 @@ async fn handle_server_connection(
     let clip_send = Arc::new(Mutex::new(clip_send));
     let clip_send_clone = clip_send.clone();
     let clipboard = Arc::new(std::sync::Mutex::new(
-        crate::clipboard::sync::ClipboardSync::new(),
+        crate::clipboard::sync::ClipboardSync::new(Arc::new(PlatformClipboard)),
     ));
     let clipboard_poll = clipboard.clone();
     tokio::spawn(async move {
@@ -1155,6 +1155,7 @@ struct ProductionClientDriver {
     pairing_prompt: Arc<dyn PairingPrompt>,
     release_repository: Arc<dyn ReleaseRepository>,
     update_installer: Arc<dyn UpdateInstaller>,
+    clipboard: Arc<dyn Clipboard>,
 }
 
 struct ConnectedClient {
@@ -1199,6 +1200,7 @@ impl ClientReconnectDriver for ProductionClientDriver {
             self.pairing_prompt.as_ref(),
             self.release_repository.as_ref(),
             self.update_installer.as_ref(),
+            self.clipboard.clone(),
         )
         .await
     }
@@ -1311,6 +1313,7 @@ async fn connect_with_cancellation(
         Arc::new(TerminalPairingPrompt::new()),
         Arc::new(GithubReleaseRepository),
         Arc::new(ExecutableUpdateInstaller),
+        Arc::new(PlatformClipboard),
     )
     .await
 }
@@ -1324,6 +1327,7 @@ async fn connect_with_dependencies(
     pairing_prompt: Arc<dyn PairingPrompt>,
     release_repository: Arc<dyn ReleaseRepository>,
     update_installer: Arc<dyn UpdateInstaller>,
+    clipboard: Arc<dyn Clipboard>,
 ) -> Result<SessionExit> {
     let explicit_addr = explicit_connect_addr_arg(addr)?;
     let _idle_sleep_inhibitor = display_control.inhibit_idle_sleep()?;
@@ -1335,6 +1339,7 @@ async fn connect_with_dependencies(
         pairing_prompt,
         release_repository,
         update_installer,
+        clipboard,
     };
     run_client_reconnect_loop(&mut driver, RetryPolicy::default(), cancellation).await
 }
@@ -1349,6 +1354,7 @@ async fn run_client_session(
     pairing_prompt: &dyn PairingPrompt,
     release_repository: &dyn ReleaseRepository,
     update_installer: &dyn UpdateInstaller,
+    clipboard_port: Arc<dyn Clipboard>,
 ) -> Result<SessionExit> {
     let tls_fingerprint = tls::peer_fingerprint(&connection)
         .ok_or_else(|| eyre!("Server did not present a certificate"))?;
@@ -1497,10 +1503,10 @@ async fn run_client_session(
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
     // Spawn clipboard polling task (client → server)
-    let clipboard = Arc::new(std::sync::Mutex::new(
-        crate::clipboard::sync::ClipboardSync::new(),
+    let clipboard_sync = Arc::new(std::sync::Mutex::new(
+        crate::clipboard::sync::ClipboardSync::new(clipboard_port.clone()),
     ));
-    let clipboard_poll = clipboard.clone();
+    let clipboard_poll = clipboard_sync.clone();
     let clipboard_peer = peer.clone();
     let mut shutdown_rx1 = shutdown_tx.subscribe();
     tokio::spawn(async move {
@@ -1533,6 +1539,7 @@ async fn run_client_session(
 
     // Spawn file transfer acceptor (receives files from server via new bi-streams)
     let ft_conn = connection.clone();
+    let receive_clipboard = clipboard_port.clone();
     let mut shutdown_rx3 = shutdown_tx.subscribe();
     tokio::spawn(async move {
         loop {
@@ -1540,12 +1547,13 @@ async fn run_client_session(
                 result = ft_conn.accept_bi() => {
                     match result {
                         Ok((send, recv)) => {
+                            let receive_clipboard = receive_clipboard.clone();
                             tokio::spawn(async move {
                                 match crate::filetransfer::recv::receive_files(send, recv).await {
                                     Ok(paths) if !paths.is_empty() => {
                                         info!("Received {} file(s) from server", paths.len());
                                         tokio::task::spawn_blocking(move || {
-                                            PlatformClipboard.write_files(&paths).ok();
+                                            receive_clipboard.write_files(&paths).ok();
                                         }).await.ok();
                                     }
                                     Ok(_) => {}
@@ -1730,9 +1738,10 @@ async fn run_client_session(
                                 .ok();
                                 // Check clipboard for files and transfer them
                                 let ft_conn = connection.clone();
+                                let send_clipboard = clipboard_port.clone();
                                 tokio::spawn(async move {
-                                    let files = tokio::task::spawn_blocking(|| {
-                                        PlatformClipboard.read_files().ok()
+                                    let files = tokio::task::spawn_blocking(move || {
+                                        send_clipboard.read_files().ok()
                                     }).await.ok().flatten();
                                     if let Some(files) = files.filter(|files| !files.is_empty()) {
                                         info!("Transferring {} clipboard file(s) to server", files.len());
@@ -1816,7 +1825,7 @@ async fn run_client_session(
                     }
                     Some(ClientTransportEvent::Clipboard(ClientClipboardEvent::TextChanged(text))) => {
                         let content = protocol::ClipboardContent::Text(text);
-                        let mut clipboard = lock_recover(&clipboard, "clipboard");
+                        let mut clipboard = lock_recover(&clipboard_sync, "clipboard");
                         if let Err(error) = clipboard.apply_update(&content) {
                             warn!("Failed to apply clipboard update: {}", error);
                         }

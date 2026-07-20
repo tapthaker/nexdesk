@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use color_eyre::eyre::{eyre, Result};
@@ -13,18 +14,22 @@ fn clipboard_text_size_ok(text: &str) -> bool {
 
 /// Monitors the local clipboard for changes and produces protocol messages.
 pub struct ClipboardSync {
+    clipboard: Arc<dyn Clipboard>,
     last_hash: Option<Vec<u8>>,
 }
 
 impl ClipboardSync {
-    pub fn new() -> Self {
+    pub fn new(clipboard: Arc<dyn Clipboard>) -> Self {
         info!("Clipboard sync initialized");
-        Self { last_hash: None }
+        Self {
+            clipboard,
+            last_hash: None,
+        }
     }
 
     /// Check if the clipboard has changed. Returns a message if it has.
     pub fn poll_change(&mut self) -> Result<Option<Message>> {
-        let text = match super::PlatformClipboard.read_text() {
+        let text = match self.clipboard.read_text() {
             Ok(Some(text)) => text,
             Ok(None) => return Ok(None),
             Err(e) => {
@@ -67,7 +72,7 @@ impl ClipboardSync {
                         MAX_CLIPBOARD_TEXT_BYTES
                     ));
                 }
-                super::PlatformClipboard.write_text(text)?;
+                self.clipboard.write_text(text)?;
                 // Update hash so we don't echo it back
                 let hash = digest::digest(&digest::SHA256, text.as_bytes());
                 self.last_hash = Some(hash.as_ref().to_vec());
@@ -305,6 +310,23 @@ pub(super) fn write_clipboard(text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn injected_clipboard_supplies_local_changes() {
+        let clipboard = Arc::new(crate::testing::MemoryClipboard::new());
+        clipboard.set_text(Some("injected".to_string()));
+        let mut sync = ClipboardSync::new(clipboard.clone());
+
+        assert!(matches!(
+            sync.poll_change().unwrap(),
+            Some(Message::ClipboardUpdate {
+                content: ClipboardContent::Text(text),
+            }) if text == "injected"
+        ));
+        assert!(clipboard.observations().snapshot().iter().any(|entry| {
+            matches!(entry.event, crate::testing::ClipboardObservation::ReadText)
+        }));
+    }
 
     #[test]
     fn clipboard_size_limit_accepts_boundary() {

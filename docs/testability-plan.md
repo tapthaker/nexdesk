@@ -150,7 +150,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T1.6.1** Introduce a semantic clipboard interface for text and files.
 - [x] **T1.6.2** Move Linux/macOS clipboard commands behind production adapters.
 - [x] **T1.6.3** Add a memory clipboard with scripted reads/writes, blocking gates, and change history.
-- [ ] **T1.6.4** Inject clipboard behavior into `ClipboardSync` and the client session.
+- [x] **T1.6.4** Inject clipboard behavior into `ClipboardSync` and the client session.
 - [ ] **T1.6.5** Add tests for no-echo behavior, oversized data, read/write failure, blocked clipboard operations, and shutdown.
 - [ ] **T1.6.6** Ensure blocking clipboard work cannot block the async session loop and prove it with a scenario test.
 
@@ -370,4 +370,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `98d9ec0` | T1.5.6 | Covered closure and failure dispositions for every client channel. |
 | 2026-07-19 | `74ba5a8` | T1.6.1 | Added semantic clipboard text and file access port. |
 | 2026-07-19 | `681635d` | T1.6.2 | Routed Linux/macOS text and file commands through a production adapter. |
-| 2026-07-19 | this commit | T1.6.3 | Added stateful clipboard scripting, blocking gates, and history. |
+| 2026-07-19 | `31e4aca` | T1.6.3 | Added stateful clipboard scripting, blocking gates, and history. |
+| 2026-07-19 | this commit | T1.6.4 | Injected clipboard access into sync logic and the client session. |
