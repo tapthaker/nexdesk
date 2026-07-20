@@ -230,6 +230,14 @@ fn request_server_display_wake(display_control: Arc<dyn DisplaySessionControl>) 
     });
 }
 
+async fn notify_after_local_input_release<T>(
+    release: impl FnOnce(),
+    notification: impl std::future::Future<Output = T>,
+) -> T {
+    release();
+    notification.await
+}
+
 fn server_session_is_locked(lock_source: &dyn LocalSessionLockSource) -> bool {
     match lock_source.is_locked() {
         Ok(locked) => locked,
@@ -1251,23 +1259,30 @@ async fn handle_server_connection(
                 if server_session_is_locked(lock_source) {
                     warn!("Local session locked while sharing — releasing remote control so Linux can be unlocked locally");
                     let messages = transition.deactivate_for_shortcut();
-                    if !messages.is_empty() {
-                        let mut sender = input_send.lock().await;
-                        for msg in messages {
-                            send_message_uni(&mut sender, &msg).await.ok();
-                        }
-                    }
-                    if use_layer_shell {
-                        #[cfg(target_os = "linux")]
-                        if let Some(ref tx) = capture_tx {
-                            use crate::input::wayland_layer_shell::LayerShellCommand;
-                            tx.send(LayerShellCommand::Release).ok();
-                        }
-                        capturer.lock().unwrap().set_keyboard_grab(false).ok();
-                        layer_shell_keyboard_grabbed = false;
-                    } else {
-                        capturer.lock().unwrap().set_grab(false).ok();
-                    }
+                    notify_after_local_input_release(
+                        || {
+                            if use_layer_shell {
+                                #[cfg(target_os = "linux")]
+                                if let Some(ref tx) = capture_tx {
+                                    use crate::input::wayland_layer_shell::LayerShellCommand;
+                                    tx.send(LayerShellCommand::Release).ok();
+                                }
+                                capturer.lock().unwrap().set_keyboard_grab(false).ok();
+                                layer_shell_keyboard_grabbed = false;
+                            } else {
+                                capturer.lock().unwrap().set_grab(false).ok();
+                            }
+                        },
+                        async {
+                            if !messages.is_empty() {
+                                let mut sender = input_send.lock().await;
+                                for msg in messages {
+                                    send_message_uni(&mut sender, &msg).await.ok();
+                                }
+                            }
+                        },
+                    )
+                    .await;
                 }
             }
             _ = screen_check.tick() => {
@@ -2772,6 +2787,40 @@ mod lifecycle_tests {
         assert!(!server_session_is_locked(&FixedLockSource(Err(
             "query unavailable"
         ))));
+    }
+
+    #[tokio::test]
+    async fn local_input_release_precedes_blocking_network_notification() {
+        let capturer = crate::testing::ScriptedCapturer::new();
+        let mut active_capture = capturer.clone();
+        active_capture.set_grab(true).unwrap();
+        let release_capture = capturer.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (unblock_tx, unblock_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(notify_after_local_input_release(
+            move || {
+                let mut capture = release_capture;
+                capture.set_grab(false).unwrap();
+            },
+            async move {
+                entered_tx.send(()).unwrap();
+                let _ = unblock_rx.await;
+            },
+        ));
+        entered_rx.await.unwrap();
+
+        assert_eq!(
+            capturer.grab_history(),
+            vec![
+                crate::testing::GrabChange::All(true),
+                crate::testing::GrabChange::All(false),
+            ]
+        );
+        assert!(!task.is_finished());
+
+        unblock_tx.send(()).unwrap();
+        task.await.unwrap();
     }
 
     #[test]
