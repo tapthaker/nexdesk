@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
-use crate::app::{RestartReason, RetryPolicy, SessionExit};
+use crate::app::{CancellationToken, RestartReason, RetryPolicy, SessionExit};
 use crate::input::inject::InputInjector;
 use crate::net::discovery;
 use crate::net::protocol::{self, Message, ScreenLayout, BUILD_VERSION, PROTOCOL_VERSION};
@@ -1037,77 +1037,173 @@ async fn handle_server_connection(
     Ok(())
 }
 
-/// Connect to a QUIC server as a client (receives and injects input).
-/// If `addr` is None, discovers the server via mDNS.
-/// Automatically reconnects according to the configured retry policy.
-pub async fn connect(addr: Option<&str>) -> Result<SessionExit> {
-    let resolved_addr = match addr {
-        Some(a) => Some(resolve_addr(a)?),
-        None => None,
-    };
+fn explicit_connect_addr_arg(addr: Option<&str>) -> Result<Option<String>> {
+    addr.map(normalize_connect_addr_input)
+        .transpose()
+        .map(|addr| addr.map(str::to_string))
+}
 
-    let endpoint = make_client_endpoint()?;
-    let retry_policy = RetryPolicy::default();
+trait ClientReconnectDriver {
+    type Connected;
+
+    async fn resolve_target(&mut self) -> Result<SocketAddr>;
+    async fn connect_target(&mut self, addr: SocketAddr) -> Result<Self::Connected>;
+    async fn run_session(&mut self, connected: Self::Connected) -> Result<SessionExit>;
+    fn record_disconnected(&mut self, _addr: SocketAddr) {}
+}
+
+struct ProductionClientDriver {
+    explicit_addr: Option<String>,
+}
+
+struct ConnectedClient {
+    _endpoint: Endpoint,
+    connection: quinn::Connection,
+    addr: SocketAddr,
+}
+
+impl ClientReconnectDriver for ProductionClientDriver {
+    type Connected = ConnectedClient;
+
+    async fn resolve_target(&mut self) -> Result<SocketAddr> {
+        match self.explicit_addr.clone() {
+            Some(addr) => tokio::task::spawn_blocking(move || resolve_addr(&addr))
+                .await
+                .wrap_err("Address resolution task failed")?,
+            None => discovery::discover_one(Duration::from_secs(10)).await,
+        }
+    }
+
+    async fn connect_target(&mut self, addr: SocketAddr) -> Result<Self::Connected> {
+        info!("Connecting to nexdesk server at {}", addr);
+        let endpoint = make_client_endpoint()?;
+        let mut runtime = RuntimeStatus::new("client", "connecting");
+        runtime.peer_addr = Some(addr.to_string());
+        status::write_status(runtime).ok();
+        let connection = connect_with_retry(&endpoint, addr).await?;
+        Ok(ConnectedClient {
+            _endpoint: endpoint,
+            connection,
+            addr,
+        })
+    }
+
+    async fn run_session(&mut self, connected: Self::Connected) -> Result<SessionExit> {
+        run_client_session(connected.connection, connected.addr).await
+    }
+
+    fn record_disconnected(&mut self, addr: SocketAddr) {
+        let mut runtime = RuntimeStatus::new("client", "disconnected");
+        runtime.peer_addr = Some(addr.to_string());
+        status::write_status(runtime).ok();
+    }
+}
+
+async fn wait_for_retry(cancellation: &CancellationToken, delay: Duration) -> bool {
+    tokio::select! {
+        _ = cancellation.cancelled() => false,
+        _ = time::sleep(delay) => true,
+    }
+}
+
+async fn run_client_reconnect_loop<D: ClientReconnectDriver>(
+    driver: &mut D,
+    retry_policy: RetryPolicy,
+    cancellation: CancellationToken,
+) -> Result<SessionExit> {
     let mut retry_attempt = 0u32;
 
     loop {
-        let target_addr = match resolved_addr {
-            Some(a) => a,
-            None => match discovery::discover_one(Duration::from_secs(10)).await {
-                Ok(a) => a,
-                Err(e) => {
+        let target_addr = tokio::select! {
+            _ = cancellation.cancelled() => return Ok(SessionExit::Cancelled),
+            result = driver.resolve_target() => match result {
+                Ok(addr) => addr,
+                Err(error) => {
                     let delay = retry_policy.delay_for_attempt(retry_attempt);
                     retry_attempt = retry_attempt.saturating_add(1);
-                    warn!("Discovery failed: {}. Retrying in {:?}...", e, delay);
-                    time::sleep(delay).await;
+                    warn!("Target resolution failed: {}. Retrying in {:?}...", error, delay);
+                    if !wait_for_retry(&cancellation, delay).await {
+                        return Ok(SessionExit::Cancelled);
+                    }
                     continue;
                 }
             },
         };
 
-        info!("Connecting to nexdesk server at {}", target_addr);
-        let mut runtime = RuntimeStatus::new("client", "connecting");
-        runtime.peer_addr = Some(target_addr.to_string());
-        status::write_status(runtime).ok();
-        let ep = endpoint.clone();
-        let handle = tokio::spawn(async move { connect_once(&ep, target_addr).await });
-        let retry_delay = match handle.await {
-            Ok(Ok(SessionExit::RestartRequested(reason))) => {
+        let connected = tokio::select! {
+            _ = cancellation.cancelled() => return Ok(SessionExit::Cancelled),
+            result = driver.connect_target(target_addr) => match result {
+                Ok(connected) => connected,
+                Err(error) => {
+                    driver.record_disconnected(target_addr);
+                    let delay = retry_policy.delay_for_attempt(retry_attempt);
+                    retry_attempt = retry_attempt.saturating_add(1);
+                    warn!("Connection failed: {}. Retrying in {:?}...", error, delay);
+                    if !wait_for_retry(&cancellation, delay).await {
+                        return Ok(SessionExit::Cancelled);
+                    }
+                    continue;
+                }
+            },
+        };
+
+        let session_exit = tokio::select! {
+            _ = cancellation.cancelled() => return Ok(SessionExit::Cancelled),
+            result = driver.run_session(connected) => result,
+        };
+        driver.record_disconnected(target_addr);
+
+        let retry_delay = match session_exit {
+            Ok(SessionExit::Cancelled) => return Ok(SessionExit::Cancelled),
+            Ok(SessionExit::RestartRequested(reason)) => {
                 return Ok(SessionExit::RestartRequested(reason));
             }
-            Ok(Ok(SessionExit::Fatal(error))) => return Err(error),
-            Ok(Ok(SessionExit::RetryAfter(delay))) => delay,
-            Ok(Ok(SessionExit::Disconnected)) => {
+            Ok(SessionExit::Fatal(error)) => return Err(error),
+            Ok(SessionExit::RetryAfter(delay)) => delay,
+            Ok(SessionExit::Disconnected) => {
                 info!("Connection closed cleanly");
                 retry_attempt = 0;
                 retry_policy.delay_for_attempt(retry_attempt)
             }
-            Ok(Err(e)) => {
-                warn!("Connection error: {}", e);
-                let delay = retry_policy.delay_for_attempt(retry_attempt);
-                retry_attempt = retry_attempt.saturating_add(1);
-                delay
-            }
-            Err(join_err) => {
-                error!("Connection panicked: {}", join_err);
+            Err(error) => {
+                warn!("Connection error: {}", error);
                 let delay = retry_policy.delay_for_attempt(retry_attempt);
                 retry_attempt = retry_attempt.saturating_add(1);
                 delay
             }
         };
-        let mut runtime = RuntimeStatus::new("client", "disconnected");
-        runtime.peer_addr = Some(target_addr.to_string());
-        status::write_status(runtime).ok();
 
         info!("Reconnecting in {:?}...", retry_delay);
-        time::sleep(retry_delay).await;
+        if !wait_for_retry(&cancellation, retry_delay).await {
+            return Ok(SessionExit::Cancelled);
+        }
     }
 }
 
-/// Perform a single client connection to the server, handling handshake with
-/// OTP pairing and then running the input/clipboard loop until disconnection.
-async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<SessionExit> {
-    let connection = connect_with_retry(endpoint, addr).await?;
+/// Connect to a QUIC server as a client (receives and injects input).
+/// If `addr` is None, discovers the server via mDNS.
+/// Automatically reconnects according to the configured retry policy.
+pub async fn connect(addr: Option<&str>) -> Result<SessionExit> {
+    connect_with_cancellation(addr, CancellationToken::new()).await
+}
+
+async fn connect_with_cancellation(
+    addr: Option<&str>,
+    cancellation: CancellationToken,
+) -> Result<SessionExit> {
+    let explicit_addr = explicit_connect_addr_arg(addr)?;
+    let _idle_sleep_inhibitor = crate::input::wake::inhibit_idle_system_sleep();
+    let mut driver = ProductionClientDriver { explicit_addr };
+    run_client_reconnect_loop(&mut driver, RetryPolicy::default(), cancellation).await
+}
+
+/// Handle one established client connection, including handshake and session loops.
+async fn run_client_session(
+    connection: quinn::Connection,
+    addr: SocketAddr,
+) -> Result<SessionExit> {
+    let tls_fingerprint = tls::peer_fingerprint(&connection)
+        .ok_or_else(|| eyre!("Server did not present a certificate"))?;
 
     info!("Connected to {}", addr);
     let mut runtime = RuntimeStatus::new("client", "connected");
@@ -1997,6 +2093,259 @@ mod input_coalescing_tests {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Clone, Copy)]
+    enum BlockingStage {
+        Resolution,
+        Connection,
+        Session,
+        Backoff,
+    }
+
+    #[derive(Default)]
+    struct ReconnectCalls {
+        resolutions: AtomicUsize,
+        connections: AtomicUsize,
+        sessions: AtomicUsize,
+    }
+
+    struct BlockingReconnectDriver {
+        stage: BlockingStage,
+        calls: Arc<ReconnectCalls>,
+    }
+
+    impl ClientReconnectDriver for BlockingReconnectDriver {
+        type Connected = ();
+
+        async fn resolve_target(&mut self) -> Result<SocketAddr> {
+            self.calls.resolutions.fetch_add(1, Ordering::SeqCst);
+            match self.stage {
+                BlockingStage::Resolution => std::future::pending().await,
+                BlockingStage::Backoff => Err(eyre!("scripted resolution failure")),
+                _ => Ok(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    DEFAULT_PORT,
+                )),
+            }
+        }
+
+        async fn connect_target(&mut self, _addr: SocketAddr) -> Result<Self::Connected> {
+            self.calls.connections.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.stage, BlockingStage::Connection) {
+                std::future::pending().await
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn run_session(&mut self, _connected: Self::Connected) -> Result<SessionExit> {
+            self.calls.sessions.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.stage, BlockingStage::Session) {
+                std::future::pending().await
+            } else {
+                Ok(SessionExit::Disconnected)
+            }
+        }
+    }
+
+    async fn wait_for_call(counter: &AtomicUsize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while counter.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reconnect stage should be entered");
+    }
+
+    async fn cancel_at_stage(stage: BlockingStage) -> Arc<ReconnectCalls> {
+        let calls = Arc::new(ReconnectCalls::default());
+        let mut driver = BlockingReconnectDriver {
+            stage,
+            calls: calls.clone(),
+        };
+        let cancellation = CancellationToken::new();
+        let loop_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            run_client_reconnect_loop(
+                &mut driver,
+                RetryPolicy::fixed(Duration::from_secs(60 * 60)),
+                loop_cancellation,
+            )
+            .await
+        });
+
+        match stage {
+            BlockingStage::Resolution | BlockingStage::Backoff => {
+                wait_for_call(&calls.resolutions).await
+            }
+            BlockingStage::Connection => wait_for_call(&calls.connections).await,
+            BlockingStage::Session => wait_for_call(&calls.sessions).await,
+        }
+        if matches!(stage, BlockingStage::Backoff) {
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(calls.resolutions.load(Ordering::SeqCst), 1);
+        }
+
+        cancellation.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancelled reconnect loop should finish")
+            .expect("reconnect task should not panic")
+            .expect("reconnect loop should not fail");
+        assert!(matches!(outcome, SessionExit::Cancelled));
+        calls
+    }
+
+    #[tokio::test]
+    async fn reconnect_loop_cancels_during_resolution() {
+        let calls = cancel_at_stage(BlockingStage::Resolution).await;
+        assert_eq!(calls.connections.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn reconnect_loop_cancels_during_connection() {
+        let calls = cancel_at_stage(BlockingStage::Connection).await;
+        assert_eq!(calls.connections.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.sessions.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn reconnect_loop_cancels_during_session() {
+        let calls = cancel_at_stage(BlockingStage::Session).await;
+        assert_eq!(calls.sessions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reconnect_loop_cancels_during_backoff() {
+        let calls = cancel_at_stage(BlockingStage::Backoff).await;
+        assert_eq!(calls.resolutions.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.connections.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn listen_port_rejects_zero() {
+        assert!(validate_listen_port(0).is_err());
+        assert!(validate_listen_port(DEFAULT_PORT).is_ok());
+    }
+
+    #[test]
+    fn file_transfer_concurrency_limit_is_small() {
+        assert_eq!(MAX_CONCURRENT_FILE_TRANSFERS, 2);
+    }
+
+    #[test]
+    fn wake_display_requests_are_coalesced_while_in_flight() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(mark_wake_display_in_flight(&flag));
+        assert!(!mark_wake_display_in_flight(&flag));
+        flag.store(false, std::sync::atomic::Ordering::Release);
+        assert!(mark_wake_display_in_flight(&flag));
+    }
+
+    #[test]
+    fn runtime_mutex_helper_locks_normal_state() {
+        let mutex = std::sync::Mutex::new(1u32);
+        *lock_recover(&mutex, "test") = 2;
+        assert_eq!(*lock_recover(&mutex, "test"), 2);
+    }
+
+    #[test]
+    fn pairing_prompt_is_flushed_and_user_visible() {
+        let mut output = Vec::new();
+        write_pairing_prompt(&mut output).unwrap();
+        assert_eq!(output, b"Enter pairing code: ");
+    }
+
+    #[test]
+    fn invalid_pairing_codes_are_rejected_before_send() {
+        assert_eq!(normalize_pairing_input(" 123456\n").unwrap(), "123456");
+        assert!(normalize_pairing_input("\n").is_err());
+        assert!(normalize_pairing_input("12345").is_err());
+        assert!(normalize_pairing_input("1234567").is_err());
+        assert!(normalize_pairing_input("12a456").is_err());
+    }
+
+    #[test]
+    fn local_peer_hostname_metadata_is_protocol_safe() {
+        assert_eq!(sanitize_peer_hostname("host\nname"), "host�name");
+        assert_eq!(sanitize_peer_hostname(""), "nexdesk");
+        assert_eq!(
+            sanitize_peer_hostname(&"h".repeat(protocol::MAX_PEER_NAME_BYTES + 1)).len(),
+            protocol::MAX_PEER_NAME_BYTES
+        );
+    }
+
+    #[test]
+    fn system_time_millis_saturates_to_protocol_timestamp_range() {
+        assert_eq!(
+            system_time_millis_u64(std::time::UNIX_EPOCH - Duration::from_millis(1)),
+            0
+        );
+        assert_eq!(
+            system_time_millis_u64(std::time::UNIX_EPOCH + Duration::from_millis(42)),
+            42
+        );
+        assert_eq!(
+            system_time_millis_u64(
+                std::time::UNIX_EPOCH + Duration::from_millis(u64::MAX) + Duration::from_millis(1)
+            ),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn layer_shell_button_mapping_rejects_unsupported_buttons() {
+        assert_eq!(layer_shell_button_to_protocol(0x110), Some(0));
+        assert_eq!(layer_shell_button_to_protocol(0x111), Some(1));
+        assert_eq!(layer_shell_button_to_protocol(0x112), Some(2));
+        assert_eq!(layer_shell_button_to_protocol(0x113), None);
+        assert_eq!(layer_shell_button_to_protocol(256), None);
+    }
+
+    #[test]
+    fn layer_shell_key_mapping_matches_protocol_range() {
+        assert_eq!(
+            layer_shell_key_to_protocol(protocol::MAX_KEYCODE),
+            Some(protocol::MAX_KEYCODE)
+        );
+        assert_eq!(layer_shell_key_to_protocol(protocol::MAX_KEYCODE + 1), None);
+    }
+
+    #[test]
+    fn layer_shell_float_inputs_are_normalized_to_protocol_safe_values() {
+        assert_eq!(layer_shell_motion_delta(f64::NAN), 0);
+        assert_eq!(layer_shell_motion_delta(f64::INFINITY), 0);
+        assert_eq!(layer_shell_motion_delta(i32::MAX as f64 * 2.0), i32::MAX);
+        assert_eq!(layer_shell_scroll_delta(f64::NAN), 0.0);
+        assert_eq!(
+            layer_shell_scroll_delta(protocol::MAX_SCROLL_DELTA * 2.0),
+            protocol::MAX_SCROLL_DELTA
+        );
+    }
+
+    #[test]
+    fn nonzero_screen_layout_rejects_zero_dimensions() {
+        assert!(nonzero_screen_layout(0, 1080).is_none());
+        assert!(nonzero_screen_layout(1920, 0).is_none());
+        assert_eq!(nonzero_screen_layout(1920, 1080).unwrap().width, 1920);
+    }
+
+    #[cfg(test)]
+    fn should_retry_resolution(explicit_addr: Option<&str>) -> bool {
+        explicit_addr.is_some()
+    }
+
+    #[test]
+    fn explicit_connect_addresses_are_resolved_each_loop() {
+        assert!(should_retry_resolution(Some("example.local")));
+        assert!(!should_retry_resolution(None));
+    }
 
     #[test]
     fn client_update_restart_requires_a_newer_clean_release_and_success() {

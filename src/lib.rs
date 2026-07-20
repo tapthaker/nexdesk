@@ -52,7 +52,7 @@ fn direction_from_config_edge_or_error(edge: &str) -> Result<net::protocol::Dire
 
 fn run_outcome_from_session_exit(exit: SessionExit) -> Result<RunOutcome> {
     match exit {
-        SessionExit::Disconnected => Ok(RunOutcome::Completed),
+        SessionExit::Cancelled | SessionExit::Disconnected => Ok(RunOutcome::Completed),
         SessionExit::RestartRequested(reason) => Ok(RunOutcome::RestartRequested(reason)),
         SessionExit::Fatal(error) => Err(error),
         SessionExit::RetryAfter(delay) => Err(eyre!(

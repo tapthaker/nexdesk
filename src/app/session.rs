@@ -22,6 +22,7 @@ pub enum RunOutcome {
 /// The binary or service composition root decides how to apply that intent.
 #[derive(Debug)]
 pub enum SessionExit {
+    Cancelled,
     Disconnected,
     RetryAfter(Duration),
     RestartRequested(RestartReason),
