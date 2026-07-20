@@ -7,6 +7,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tracing::info;
 
 use crate::config::NexdeskConfig;
+use crate::ports::TrustStore;
 
 /// Generate a self-signed certificate and return (cert_der, key_der).
 pub fn generate_self_signed() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
@@ -66,27 +67,48 @@ pub fn show_fingerprint() -> Result<()> {
     Ok(())
 }
 
-/// Trust a peer fingerprint by adding it to the config.
-pub fn trust_fingerprint(fp: &str) -> Result<()> {
+fn is_fingerprint_trusted_in_config(fp: &str) -> Result<bool> {
+    let config = NexdeskConfig::load()?;
+    Ok(config.trusted_fingerprints.contains(&fp.to_uppercase()))
+}
+
+fn trust_fingerprint_in_config(fp: &str) -> Result<bool> {
     let mut config = NexdeskConfig::load()?;
     let normalized = fp.to_uppercase();
     if config.trusted_fingerprints.contains(&normalized) {
-        println!("Fingerprint already trusted.");
+        return Ok(false);
+    }
+    config.trusted_fingerprints.push(normalized);
+    config.save()?;
+    Ok(true)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConfigTrustStore;
+
+impl TrustStore for ConfigTrustStore {
+    fn is_trusted(&self, fingerprint: &str) -> Result<bool> {
+        is_fingerprint_trusted_in_config(fingerprint)
+    }
+
+    fn trust(&self, fingerprint: &str) -> Result<()> {
+        trust_fingerprint_in_config(fingerprint).map(|_| ())
+    }
+}
+
+/// Trust a peer fingerprint by adding it to the config.
+pub fn trust_fingerprint(fp: &str) -> Result<()> {
+    if trust_fingerprint_in_config(fp)? {
+        println!("Trusted fingerprint: {}", fp.to_uppercase());
     } else {
-        config.trusted_fingerprints.push(normalized.clone());
-        config.save()?;
-        println!("Trusted fingerprint: {}", normalized);
+        println!("Fingerprint already trusted.");
     }
     Ok(())
 }
 
 /// Check if a fingerprint is trusted.
 pub fn is_fingerprint_trusted(fp: &str) -> bool {
-    if let Ok(config) = NexdeskConfig::load() {
-        config.trusted_fingerprints.contains(&fp.to_uppercase())
-    } else {
-        false
-    }
+    ConfigTrustStore.is_trusted(fp).unwrap_or(false)
 }
 
 /// Build a quinn server config with our self-signed cert.
