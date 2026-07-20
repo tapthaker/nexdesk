@@ -1,5 +1,6 @@
 mod fake_display_control;
 mod fake_update;
+mod memory_clipboard;
 mod memory_trust_store;
 mod observation;
 mod recording_injector;
@@ -12,6 +13,10 @@ pub use fake_display_control::{
 pub use fake_update::{
     AssetStreamStep, FakeUpdateInstaller, InstalledUpdate, RestartRecorder,
     ScriptedReleaseRepository, UpdateObservation, UpdateOperation,
+};
+pub use memory_clipboard::{
+    BlockingClipboardCall, ClipboardChange, ClipboardObservation, ClipboardOperation,
+    MemoryClipboard,
 };
 pub use memory_trust_store::{MemoryTrustStore, TrustObservation, TrustOperation};
 pub use observation::{Observation, ObservationLog};
