@@ -17,6 +17,7 @@ use crate::app::{
     RetryPolicy, SessionExit, UpdateExecution, UpdatePolicy, UpdateSource,
 };
 use crate::clipboard::PlatformClipboard;
+use crate::input::capture::{InputCapture, InputCaptureFactory, PlatformInputCaptureFactory};
 use crate::input::inject::{InputInjector, InputInjectorFactory, PlatformInputInjectorFactory};
 use crate::input::wake::PlatformDisplaySessionControl;
 use crate::net::discovery;
@@ -532,6 +533,14 @@ fn client_shutdown_exit(restart_for_latency: bool) -> SessionExit {
     }
 }
 
+fn create_server_capturer(
+    capture_factory: &dyn InputCaptureFactory,
+) -> Result<(Box<dyn InputCapture>, (u32, u32))> {
+    let capturer = capture_factory.create()?;
+    let screen_size = capturer.screen_size()?;
+    Ok((capturer, screen_size))
+}
+
 fn validate_listen_port(port: u16) -> Result<()> {
     if port == 0 {
         return Err(eyre!(
@@ -543,6 +552,14 @@ fn validate_listen_port(port: u16) -> Result<()> {
 
 /// Run a QUIC server that captures local mouse and sends events to clients.
 pub async fn serve(port: u16, trigger_edge: Option<crate::net::protocol::Direction>) -> Result<()> {
+    serve_with_capture_factory(port, trigger_edge, Arc::new(PlatformInputCaptureFactory)).await
+}
+
+async fn serve_with_capture_factory(
+    port: u16,
+    trigger_edge: Option<crate::net::protocol::Direction>,
+    capture_factory: Arc<dyn InputCaptureFactory>,
+) -> Result<()> {
     let server_config = tls::server_config()?;
     let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
     let endpoint = Endpoint::server(server_config, addr)?;
@@ -580,8 +597,12 @@ pub async fn serve(port: u16, trigger_edge: Option<crate::net::protocol::Directi
         let edge = trigger_edge;
         let otp = otp.clone();
         let fp = server_fingerprint.clone();
+        let capture_factory = capture_factory.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_server_connection(connection, edge, &otp, &fp).await {
+            if let Err(e) =
+                handle_server_connection(connection, edge, &otp, &fp, capture_factory.as_ref())
+                    .await
+            {
                 error!("Connection from {} error: {}", remote, e);
             }
         });
@@ -595,12 +616,12 @@ async fn handle_server_connection(
     trigger_edge: Option<crate::net::protocol::Direction>,
     server_otp: &str,
     server_fingerprint: &str,
+    capture_factory: &dyn InputCaptureFactory,
 ) -> Result<()> {
     let remote = connection.remote_address();
 
     // Create input capturer
-    let capturer = crate::input::capture::create_capturer()?;
-    let (screen_w, screen_h) = capturer.screen_size()?;
+    let (capturer, (screen_w, screen_h)) = create_server_capturer(capture_factory)?;
 
     // Open control stream (bidirectional) — handshake
     let (mut control_send, mut control_recv) = connection.open_bi().await?;
@@ -2701,6 +2722,29 @@ mod lifecycle_tests {
                 (_, exit) => panic!("unexpected client exit: {exit:?}"),
             }
         }
+    }
+
+    #[test]
+    fn server_capture_creation_uses_injected_factory() {
+        let capturer = crate::testing::ScriptedCapturer::new();
+        capturer.push_screen_size(3440, 1440);
+        let factory = crate::testing::ScriptedCaptureFactory::new(capturer.clone());
+
+        let (_, screen_size) = create_server_capturer(&factory).unwrap();
+
+        assert_eq!(screen_size, (3440, 1440));
+        assert_eq!(
+            capturer
+                .observations()
+                .snapshot()
+                .into_iter()
+                .map(|entry| entry.event)
+                .collect::<Vec<_>>(),
+            vec![
+                crate::testing::CaptureObservation::Created,
+                crate::testing::CaptureObservation::ScreenSize(3440, 1440),
+            ]
+        );
     }
 
     #[test]
