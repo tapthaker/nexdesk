@@ -11,6 +11,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
+use crate::app::{RestartReason, SessionExit};
 use crate::input::inject::InputInjector;
 use crate::net::discovery;
 use crate::net::protocol::{self, Message, ScreenLayout, BUILD_VERSION, PROTOCOL_VERSION};
@@ -285,13 +286,13 @@ fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn restart_current_process() -> Result<()> {
-    // Do not use exec(). macOS IOPM assertions are process-scoped and exec keeps
-    // the same PID alive, so assertions created by the old image can leak across
-    // self-updates/watchdog restarts. Exit cleanly and let LaunchAgent/systemd
-    // restart the service with a fresh process.
-    info!("Exiting for service-manager restart");
-    std::process::exit(0);
+fn validate_listen_port(port: u16) -> Result<()> {
+    if port == 0 {
+        return Err(eyre!(
+            "Cannot serve on port 0 because peers and mDNS need a stable UDP port"
+        ));
+    }
+    Ok(())
 }
 
 /// Run a QUIC server that captures local mouse and sends events to clients.
@@ -1014,7 +1015,7 @@ async fn handle_server_connection(
 /// Connect to a QUIC server as a client (receives and injects input).
 /// If `addr` is None, discovers the server via mDNS.
 /// Automatically reconnects with exponential backoff on disconnection.
-pub async fn connect(addr: Option<&str>) -> Result<()> {
+pub async fn connect(addr: Option<&str>) -> Result<SessionExit> {
     let resolved_addr = match addr {
         Some(a) => Some(resolve_addr(a)?),
         None => None,
@@ -1041,23 +1042,37 @@ pub async fn connect(addr: Option<&str>) -> Result<()> {
         status::write_status(runtime).ok();
         let ep = endpoint.clone();
         let handle = tokio::spawn(async move { connect_once(&ep, target_addr).await });
-        match handle.await {
-            Ok(Ok(())) => info!("Connection closed cleanly"),
-            Ok(Err(e)) => warn!("Connection error: {}", e),
-            Err(join_err) => error!("Connection panicked: {}", join_err),
-        }
+        let retry_delay = match handle.await {
+            Ok(Ok(SessionExit::RestartRequested(reason))) => {
+                return Ok(SessionExit::RestartRequested(reason));
+            }
+            Ok(Ok(SessionExit::Fatal(error))) => return Err(error),
+            Ok(Ok(SessionExit::RetryAfter(delay))) => delay,
+            Ok(Ok(SessionExit::Disconnected)) => {
+                info!("Connection closed cleanly");
+                Duration::from_secs(2)
+            }
+            Ok(Err(e)) => {
+                warn!("Connection error: {}", e);
+                Duration::from_secs(2)
+            }
+            Err(join_err) => {
+                error!("Connection panicked: {}", join_err);
+                Duration::from_secs(2)
+            }
+        };
         let mut runtime = RuntimeStatus::new("client", "disconnected");
         runtime.peer_addr = Some(target_addr.to_string());
         status::write_status(runtime).ok();
 
-        info!("Reconnecting in 2s...");
-        time::sleep(Duration::from_secs(2)).await;
+        info!("Reconnecting in {:?}...", retry_delay);
+        time::sleep(retry_delay).await;
     }
 }
 
 /// Perform a single client connection to the server, handling handshake with
 /// OTP pairing and then running the input/clipboard loop until disconnection.
-async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
+async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<SessionExit> {
     let connection = connect_with_retry(endpoint, addr).await?;
 
     info!("Connected to {}", addr);
@@ -1159,26 +1174,29 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     };
 
     // Auto-update only if server has a strictly newer clean release version
-    if server_build_version != BUILD_VERSION {
-        if crate::net::update::is_release_version(&server_build_version)
-            && crate::net::update::is_newer(&server_build_version, BUILD_VERSION)
-        {
-            info!(
-                "Server has newer version {}, attempting self-update...",
-                server_build_version
-            );
-            match crate::net::update::self_update(&server_build_version).await {
-                Ok(()) => {
-                    info!("Updated to {}. Restarting...", server_build_version);
-                    connection.close(0u32.into(), b"updating");
-                    return restart_current_process();
-                }
-                Err(e) => {
-                    warn!(
-                        "Self-update failed: {}. Continuing with current version.",
-                        e
-                    );
-                }
+    if server_build_version != BUILD_VERSION
+        && crate::net::update::is_release_version(&server_build_version)
+        && crate::net::update::is_newer(&server_build_version, BUILD_VERSION)
+    {
+        info!(
+            "Server has newer version {}, attempting self-update...",
+            server_build_version
+        );
+        match crate::net::update::self_update(&server_build_version).await {
+            Ok(()) => {
+                info!("Updated to {}. Restarting...", server_build_version);
+                connection.close(0u32.into(), b"updating");
+                return Ok(SessionExit::RestartRequested(
+                    RestartReason::UpdateInstalled {
+                        version: server_build_version,
+                    },
+                ));
+            }
+            Err(e) => {
+                warn!(
+                    "Self-update failed: {}. Continuing with current version.",
+                    e
+                );
             }
         }
     }
@@ -1605,13 +1623,15 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<()> {
     connection.close(0u32.into(), b"disconnected");
 
     if restart_for_latency {
-        return restart_current_process();
+        return Ok(SessionExit::RestartRequested(
+            RestartReason::LatencyWatchdog,
+        ));
     }
 
     // Suppress unused variable warning
     let _ = server_screen;
 
-    Ok(())
+    Ok(SessionExit::Disconnected)
 }
 
 /// Ping a peer to measure QUIC RTT.

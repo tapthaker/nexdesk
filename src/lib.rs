@@ -13,8 +13,9 @@ pub mod testing;
 
 use std::io::{IsTerminal, Write};
 
+use app::{RunOutcome, SessionExit};
 use cli::{Cli, Command, DaemonCommand};
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{eyre, Result};
 
 fn direction_from_cli_edge(edge: cli::Edge) -> net::protocol::Direction {
     match edge {
@@ -49,8 +50,20 @@ fn direction_from_config_edge_or_error(edge: &str) -> Result<net::protocol::Dire
     })
 }
 
+fn run_outcome_from_session_exit(exit: SessionExit) -> Result<RunOutcome> {
+    match exit {
+        SessionExit::Disconnected => Ok(RunOutcome::Completed),
+        SessionExit::RestartRequested(reason) => Ok(RunOutcome::RestartRequested(reason)),
+        SessionExit::Fatal(error) => Err(error),
+        SessionExit::RetryAfter(delay) => Err(eyre!(
+            "Client reconnect loop returned an unhandled retry delay: {:?}",
+            delay
+        )),
+    }
+}
+
 /// Dispatch a parsed command using the production Nexdesk adapters.
-pub async fn run(cli: Cli) -> Result<()> {
+pub async fn run(cli: Cli) -> Result<RunOutcome> {
     match cli.command {
         Command::Advertise { port } => {
             net::discovery::advertise(port).await?;
@@ -94,7 +107,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Command::Connect { addr } => {
             input::ensure_accessibility()?;
-            net::quic::connect(addr.as_deref()).await?;
+            return run_outcome_from_session_exit(net::quic::connect(addr.as_deref()).await?);
         }
         Command::Fingerprint => {
             net::tls::show_fingerprint()?;
@@ -140,12 +153,31 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(RunOutcome::Completed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_session_exit_reaches_the_composition_root() {
+        let outcome = run_outcome_from_session_exit(SessionExit::RestartRequested(
+            app::RestartReason::LatencyWatchdog,
+        ))
+        .unwrap();
+        assert_eq!(
+            outcome,
+            RunOutcome::RestartRequested(app::RestartReason::LatencyWatchdog)
+        );
+    }
+
+    #[test]
+    fn fatal_session_exit_remains_an_application_error() {
+        let error =
+            run_outcome_from_session_exit(SessionExit::fatal(eyre!("session failed"))).unwrap_err();
+        assert_eq!(error.to_string(), "session failed");
+    }
 
     #[test]
     fn parses_configured_switch_edges() {

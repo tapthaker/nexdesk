@@ -2,7 +2,10 @@ use std::io::IsTerminal;
 
 use clap::Parser;
 use color_eyre::eyre::Result;
-use nexdesk::cli::{Cli, Command};
+use nexdesk::{
+    app::RunOutcome,
+    cli::{Cli, Command},
+};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -25,5 +28,15 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    nexdesk::run(cli).await
+    match nexdesk::run(cli).await? {
+        RunOutcome::Completed => Ok(()),
+        RunOutcome::RestartRequested(reason) => {
+            // Do not use exec(). macOS IOPM assertions are process-scoped and
+            // exec keeps the same PID alive, so old assertions can leak across
+            // self-updates and watchdog restarts. Exit and let the configured
+            // service manager start a fresh process.
+            tracing::info!(?reason, "Exiting for service-manager restart");
+            std::process::exit(0);
+        }
+    }
 }

@@ -9,6 +9,13 @@ pub enum RestartReason {
     LatencyWatchdog,
 }
 
+/// Outcome from dispatching one top-level Nexdesk command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunOutcome {
+    Completed,
+    RestartRequested(RestartReason),
+}
+
 /// Terminal outcome from one client or server session attempt.
 ///
 /// Application code returns lifecycle intent instead of exiting the process.
@@ -44,12 +51,20 @@ mod tests {
 
     #[test]
     fn restart_outcome_carries_a_typed_reason() {
-        let outcome = SessionExit::RestartRequested(RestartReason::UpdateInstalled {
+        let reason = RestartReason::UpdateInstalled {
             version: "v1.2.3".to_string(),
-        });
+        };
+        let session_outcome = SessionExit::RestartRequested(reason.clone());
+        let run_outcome = RunOutcome::RestartRequested(reason);
+
         assert!(matches!(
-            outcome,
+            session_outcome,
             SessionExit::RestartRequested(RestartReason::UpdateInstalled { version })
+                if version == "v1.2.3"
+        ));
+        assert!(matches!(
+            run_outcome,
+            RunOutcome::RestartRequested(RestartReason::UpdateInstalled { version })
                 if version == "v1.2.3"
         ));
     }
