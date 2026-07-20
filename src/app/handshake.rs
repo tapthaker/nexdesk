@@ -249,6 +249,99 @@ mod tests {
     }
 
     #[test]
+    fn server_handshake_scenarios_cover_otp_trust_and_version_mismatch() {
+        let cases = [
+            (Some("123456"), Some("v2"), ServerPairingMethod::Otp, false),
+            (
+                None,
+                Some("v2"),
+                ServerPairingMethod::TrustedCertificate,
+                false,
+            ),
+            (
+                None,
+                Some("v1"),
+                ServerPairingMethod::TrustedCertificate,
+                true,
+            ),
+        ];
+
+        for (otp, peer_build, pairing_method, version_mismatch) in cases {
+            let decision = decide_server_handshake(
+                "123456",
+                "v2",
+                HandshakeMessage::Expected(ServerHelloAck {
+                    accepted: true,
+                    otp: otp.map(str::to_string),
+                    screen: None,
+                    build_version: peer_build.map(str::to_string),
+                }),
+            );
+            let outcome = decision.into_result().unwrap();
+            assert_eq!(outcome.pairing_method, pairing_method);
+            assert_eq!(outcome.version_mismatch, version_mismatch);
+            assert_eq!(
+                outcome.peer_screen,
+                PeerScreen {
+                    width: 1920,
+                    height: 1080,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn server_handshake_scenarios_cover_invalid_malformed_and_disconnects() {
+        let cases = [
+            (
+                HandshakeMessage::Expected(ServerHelloAck {
+                    accepted: true,
+                    otp: Some("000000".to_string()),
+                    screen: None,
+                    build_version: None,
+                }),
+                Some(false),
+                "Invalid pairing code",
+            ),
+            (
+                HandshakeMessage::Unexpected("Heartbeat".to_string()),
+                None,
+                "Expected HelloAck, got: Heartbeat",
+            ),
+            (
+                HandshakeMessage::StreamClosed,
+                None,
+                "Expected HelloAck, got: end of stream",
+            ),
+        ];
+
+        for (response, pairing_result, reason) in cases {
+            assert_eq!(
+                decide_server_handshake("123456", "v2", response),
+                ServerHandshakeDecision::Reject {
+                    pairing_result,
+                    reason: reason.to_string(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn absent_server_certificate_is_rejected_before_handshake() {
+        assert_eq!(
+            require_server_certificate_fingerprint(Some("trusted-fingerprint".to_string()))
+                .unwrap(),
+            "trusted-fingerprint"
+        );
+        assert_eq!(
+            require_server_certificate_fingerprint(None)
+                .unwrap_err()
+                .to_string(),
+            "Server certificate is absent"
+        );
+    }
+
+    #[test]
     fn valid_hello_selects_pairing_from_persisted_trust() {
         validate_client_server_hello(6, 6, FINGERPRINT, FINGERPRINT, 1920, 1080).unwrap();
         assert_eq!(
