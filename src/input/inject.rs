@@ -14,8 +14,26 @@ pub trait InputInjector: Send {
     fn screen_size(&self) -> Result<(u32, u32)>;
 }
 
+/// Factory boundary for creating an input injector for one client session.
+pub trait InputInjectorFactory: Send + Sync {
+    fn create(&self) -> Result<Box<dyn InputInjector>>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlatformInputInjectorFactory;
+
+impl InputInjectorFactory for PlatformInputInjectorFactory {
+    fn create(&self) -> Result<Box<dyn InputInjector>> {
+        create_platform_injector()
+    }
+}
+
 /// Create a platform-appropriate input injector.
 pub fn create_injector() -> Result<Box<dyn InputInjector>> {
+    PlatformInputInjectorFactory.create()
+}
+
+fn create_platform_injector() -> Result<Box<dyn InputInjector>> {
     #[cfg(target_os = "linux")]
     {
         if std::env::var("DISPLAY").is_ok() {
@@ -40,5 +58,41 @@ pub fn create_injector() -> Result<Box<dyn InputInjector>> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(color_eyre::eyre::eyre!("Unsupported platform"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct StubInjector;
+
+    impl InputInjector for StubInjector {
+        fn inject(&mut self, _event: &Message) -> Result<()> {
+            Ok(())
+        }
+
+        fn move_mouse(&mut self, _x: i32, _y: i32) -> Result<()> {
+            Ok(())
+        }
+
+        fn screen_size(&self) -> Result<(u32, u32)> {
+            Ok((1920, 1080))
+        }
+    }
+
+    struct StubFactory;
+
+    impl InputInjectorFactory for StubFactory {
+        fn create(&self) -> Result<Box<dyn InputInjector>> {
+            Ok(Box::new(StubInjector))
+        }
+    }
+
+    #[test]
+    fn injector_factory_is_object_safe_and_creates_trait_objects() {
+        let factory: &dyn InputInjectorFactory = &StubFactory;
+        let injector = factory.create().unwrap();
+        assert_eq!(injector.screen_size().unwrap(), (1920, 1080));
     }
 }

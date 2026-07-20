@@ -112,7 +112,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 ### T1.2 — Inject client platform behavior
 
-- [ ] **T1.2.1** Add an injectable `InputInjectorFactory` while retaining the existing `InputInjector` interface.
+- [x] **T1.2.1** Add an injectable `InputInjectorFactory` while retaining the existing `InputInjector` interface.
 - [ ] **T1.2.2** Implement a recording injector that tracks moves, events, cursor visibility, screen size, pressed keys/buttons, and scripted failures.
 - [ ] **T1.2.3** Pass the injector factory into the client connection/session path instead of constructing the platform injector internally.
 - [ ] **T1.2.4** Add a display/session-control port for wake and sleep inhibition.
@@ -344,4 +344,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `8e4651a` | T1.1.2 | Propagated client restart intent to the binary composition root. |
 | 2026-07-19 | `6bcd135` | T1.1.3 | Covered update and latency restart decision paths. |
 | 2026-07-19 | `dcb0bf9` | T1.1.4 | Moved reconnect delay calculation into a pure policy. |
-| 2026-07-19 | this commit | T1.1.5 | Added staged reconnect cancellation and deterministic coverage. |
+| 2026-07-19 | `0f286b1` | T1.1.5 | Added staged reconnect cancellation and deterministic coverage. |
+| 2026-07-19 | this commit | T1.2.1 | Added an object-safe input injector factory boundary. |
