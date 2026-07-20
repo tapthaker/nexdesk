@@ -12,10 +12,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::app::{
     client_channel_disposition, client_pairing_decision, complete_client_pairing,
-    decide_server_handshake, execute_update, require_handshake_message,
+    decide_server_handshake, execute_update, require_handshake_message, server_channel_disposition,
     validate_client_server_hello, CancellationToken, ClientChannelDisposition, HandshakeMessage,
-    PairingCompletion, PairingDecision, RestartReason, RetryPolicy, ServerHandshakeDecision,
-    ServerHelloAck, ServerPairingMethod, SessionExit, UpdateExecution, UpdatePolicy, UpdateSource,
+    PairingCompletion, PairingDecision, RestartReason, RetryPolicy, ServerChannelDisposition,
+    ServerHandshakeDecision, ServerHelloAck, ServerPairingMethod, SessionExit, UpdateExecution,
+    UpdatePolicy, UpdateSource,
 };
 use crate::clipboard::PlatformClipboard;
 use crate::input::capture::{InputCapture, InputCaptureFactory, PlatformInputCaptureFactory};
@@ -35,9 +36,9 @@ use crate::ports::{
     ClientChannel, ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand,
     ClientControlEvent, ClientInputEvent, ClientPeerLink, ClientTransportEvent, Clipboard,
     DisplaySessionControl, LocalSessionLockSource, PairingPrompt, PeerDirection, PeerScreen,
-    PeerScrollPhase, Release, ReleaseRepository, ServerChannel, ServerClipboardCommand,
-    ServerClipboardEvent, ServerControlCommand, ServerControlEvent, ServerInputCommand,
-    ServerPeerLink, ServerTransportEvent, StatusSink, TrustStore, UpdateInstaller,
+    PeerScrollPhase, Release, ReleaseRepository, ServerClipboardCommand, ServerClipboardEvent,
+    ServerControlCommand, ServerControlEvent, ServerInputCommand, ServerPeerLink,
+    ServerTransportEvent, StatusSink, TrustStore, UpdateInstaller,
 };
 use crate::status::{self, FileStatusSink, RuntimeStatus};
 
@@ -1310,21 +1311,17 @@ async fn handle_server_connection(
                             warn!("Failed to apply clipboard update: {}", error);
                         }
                     }
-                    Some(ServerTransportEvent::Closed(ServerChannel::Clipboard)) => {
-                        info!("Peer {} clipboard channel closed", remote);
-                    }
-                    Some(ServerTransportEvent::Failed(failure))
-                        if failure.channel == ServerChannel::Clipboard =>
-                    {
-                        warn!("Peer {} clipboard channel failed: {}", remote, failure.message);
-                    }
                     Some(ServerTransportEvent::Closed(channel)) => {
                         info!("Peer {} {:?} channel closed", remote, channel);
-                        break;
+                        if server_channel_disposition(channel) == ServerChannelDisposition::Disconnect {
+                            break;
+                        }
                     }
                     Some(ServerTransportEvent::Failed(failure)) => {
                         warn!("Peer {} {:?} channel failed: {}", remote, failure.channel, failure.message);
-                        break;
+                        if server_channel_disposition(failure.channel) == ServerChannelDisposition::Disconnect {
+                            break;
+                        }
                     }
                     None => {
                         info!("Peer {} transport closed", remote);

@@ -9,6 +9,7 @@ mod recording_status;
 mod scripted_capturer;
 mod scripted_pairing_prompt;
 mod scripted_peer_link;
+mod scripted_server_peer_link;
 mod task_tracker;
 
 pub use client_rig::{ClientRig, DEFAULT_CLIENT_PEER_FINGERPRINT, DEFAULT_CLIENT_SCREEN};
@@ -36,5 +37,8 @@ pub use scripted_capturer::{
 pub use scripted_pairing_prompt::{PairingPromptObservation, ScriptedPairingPrompt};
 pub use scripted_peer_link::{
     BlockingPeerEvent, PeerLinkObservation, PeerSendOperation, ScriptedPeerLink,
+};
+pub use scripted_server_peer_link::{
+    ScriptedServerPeerLink, ServerPeerObservation, ServerSendOperation,
 };
 pub use task_tracker::{RunningTask, RunningTasksError, TaskGuard, TaskTracker};

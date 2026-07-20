@@ -2,6 +2,7 @@ mod cancellation;
 mod client_transport;
 mod handshake;
 mod reconnect;
+mod server_transport;
 mod session;
 mod update;
 
@@ -14,6 +15,7 @@ pub(crate) use handshake::{
     ServerHandshakeDecision, ServerHandshakeOutcome, ServerHelloAck, ServerPairingMethod,
 };
 pub use reconnect::RetryPolicy;
+pub use server_transport::{server_channel_disposition, ServerChannelDisposition};
 pub use session::{RestartReason, RunOutcome, SessionExit};
 pub use update::{
     execute_update, is_newer, is_release_version, UpdateDecision, UpdateExecution, UpdatePolicy,
