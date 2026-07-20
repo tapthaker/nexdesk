@@ -7,6 +7,7 @@ mod daemon;
 mod filetransfer;
 mod input;
 mod net;
+pub mod ports;
 mod setup;
 mod status;
 pub mod testing;
