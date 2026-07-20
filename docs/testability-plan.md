@@ -175,7 +175,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T2.1.2** Implement a scripted capturer supporting positions, buttons, keys, screen sizes, grab history, and failures.
 - [x] **T2.1.3** Inject capture creation into the server connection path.
 - [x] **T2.1.4** Introduce an injectable local-session lock source.
-- [ ] **T2.1.5** Route server lock checks and display wake through platform ports.
+- [x] **T2.1.5** Route server lock checks and display wake through platform ports.
 - [ ] **T2.1.6** Add tests proving local input release happens before potentially blocking network notification.
 
 ### T2.2 — Move server sessions onto typed transport
@@ -385,4 +385,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `f2f2a05` | T2.1.1 | Added an object-safe server input capture factory. |
 | 2026-07-19 | `2599383` | T2.1.2 | Added scripted server input state, grabs, and failures. |
 | 2026-07-19 | `9b90b79` | T2.1.3 | Injected capture creation through the server connection path. |
-| 2026-07-19 | this commit | T2.1.4 | Added an injectable local graphical-session lock source. |
+| 2026-07-19 | `6f06fa3` | T2.1.4 | Added an injectable local graphical-session lock source. |
+| 2026-07-19 | this commit | T2.1.5 | Routed server lock checks and display wake through platform ports. |

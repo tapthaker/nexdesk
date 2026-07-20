@@ -32,8 +32,8 @@ use crate::net::update::{ExecutableUpdateInstaller, GithubReleaseRepository};
 use crate::ports::{
     ClientChannel, ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand,
     ClientControlEvent, ClientInputEvent, ClientPeerLink, ClientTransportEvent, Clipboard,
-    DisplaySessionControl, PairingPrompt, PeerDirection, PeerScreen, PeerScrollPhase, Release,
-    ReleaseRepository, StatusSink, TrustStore, UpdateInstaller,
+    DisplaySessionControl, LocalSessionLockSource, PairingPrompt, PeerDirection, PeerScreen,
+    PeerScrollPhase, Release, ReleaseRepository, StatusSink, TrustStore, UpdateInstaller,
 };
 use crate::status::{self, FileStatusSink, RuntimeStatus};
 
@@ -222,9 +222,22 @@ fn inject_late_release(
     Ok(true)
 }
 
-fn request_wake_display() {
-    #[cfg(target_os = "linux")]
-    std::thread::spawn(crate::input::wake::wake_display);
+fn request_server_display_wake(display_control: Arc<dyn DisplaySessionControl>) {
+    std::thread::spawn(move || {
+        if let Err(error) = display_control.wake_display() {
+            warn!("Failed to wake server display: {}", error);
+        }
+    });
+}
+
+fn server_session_is_locked(lock_source: &dyn LocalSessionLockSource) -> bool {
+    match lock_source.is_locked() {
+        Ok(locked) => locked,
+        Err(error) => {
+            warn!("Failed to query local session lock state: {}", error);
+            false
+        }
+    }
 }
 
 fn inject_with_timing(
@@ -552,13 +565,22 @@ fn validate_listen_port(port: u16) -> Result<()> {
 
 /// Run a QUIC server that captures local mouse and sends events to clients.
 pub async fn serve(port: u16, trigger_edge: Option<crate::net::protocol::Direction>) -> Result<()> {
-    serve_with_capture_factory(port, trigger_edge, Arc::new(PlatformInputCaptureFactory)).await
+    serve_with_dependencies(
+        port,
+        trigger_edge,
+        Arc::new(PlatformInputCaptureFactory),
+        Arc::new(crate::input::session::PlatformLocalSessionLockSource),
+        Arc::new(PlatformDisplaySessionControl),
+    )
+    .await
 }
 
-async fn serve_with_capture_factory(
+async fn serve_with_dependencies(
     port: u16,
     trigger_edge: Option<crate::net::protocol::Direction>,
     capture_factory: Arc<dyn InputCaptureFactory>,
+    lock_source: Arc<dyn LocalSessionLockSource>,
+    display_control: Arc<dyn DisplaySessionControl>,
 ) -> Result<()> {
     let server_config = tls::server_config()?;
     let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
@@ -598,10 +620,19 @@ async fn serve_with_capture_factory(
         let otp = otp.clone();
         let fp = server_fingerprint.clone();
         let capture_factory = capture_factory.clone();
+        let lock_source = lock_source.clone();
+        let display_control = display_control.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_server_connection(connection, edge, &otp, &fp, capture_factory.as_ref())
-                    .await
+            if let Err(e) = handle_server_connection(
+                connection,
+                edge,
+                &otp,
+                &fp,
+                capture_factory.as_ref(),
+                lock_source.as_ref(),
+                display_control,
+            )
+            .await
             {
                 error!("Connection from {} error: {}", remote, e);
             }
@@ -617,6 +648,8 @@ async fn handle_server_connection(
     server_otp: &str,
     server_fingerprint: &str,
     capture_factory: &dyn InputCaptureFactory,
+    lock_source: &dyn LocalSessionLockSource,
+    display_control: Arc<dyn DisplaySessionControl>,
 ) -> Result<()> {
     let remote = connection.remote_address();
 
@@ -1175,7 +1208,7 @@ async fn handle_server_connection(
                         send_message(&mut control_send, &ack).await?;
                     }
                     Ok(Some(Message::SwitchScreen { direction })) => {
-                        request_wake_display();
+                        request_server_display_wake(display_control.clone());
                         pending_layer_shell_motion = (0.0, 0.0);
                         info!("Client requested switch back: {:?}", direction);
                         let messages = transition.on_switch_back();
@@ -1215,7 +1248,7 @@ async fn handle_server_connection(
                 }
             }
             _ = local_lock_check.tick(), if transition.is_active() => {
-                if crate::input::session::is_session_locked() {
+                if server_session_is_locked(lock_source) {
                     warn!("Local session locked while sharing — releasing remote control so Linux can be unlocked locally");
                     let messages = transition.deactivate_for_shortcut();
                     if !messages.is_empty() {
@@ -2722,6 +2755,39 @@ mod lifecycle_tests {
                 (_, exit) => panic!("unexpected client exit: {exit:?}"),
             }
         }
+    }
+
+    struct FixedLockSource(std::result::Result<bool, &'static str>);
+
+    impl crate::ports::LocalSessionLockSource for FixedLockSource {
+        fn is_locked(&self) -> Result<bool> {
+            self.0.map_err(|message| eyre!(message))
+        }
+    }
+
+    #[test]
+    fn server_lock_checks_use_injected_source_and_fail_open() {
+        assert!(server_session_is_locked(&FixedLockSource(Ok(true))));
+        assert!(!server_session_is_locked(&FixedLockSource(Ok(false))));
+        assert!(!server_session_is_locked(&FixedLockSource(Err(
+            "query unavailable"
+        ))));
+    }
+
+    #[test]
+    fn server_display_wake_uses_injected_port() {
+        let display = crate::testing::FakeDisplaySessionControl::new();
+        let gate = display.block_next(crate::testing::DisplayOperation::WakeDisplay);
+
+        request_server_display_wake(Arc::new(display.clone()));
+
+        assert!(gate.wait_until_entered(Duration::from_secs(1)));
+        assert!(display
+            .observations()
+            .snapshot()
+            .iter()
+            .any(|entry| { entry.event == crate::testing::DisplayObservation::WakeRequested }));
+        gate.release();
     }
 
     #[test]
