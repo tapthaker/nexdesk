@@ -190,6 +190,37 @@ fn track_injected_input(
     }
 }
 
+fn inject_late_release(
+    injector: &mut dyn InputInjector,
+    message: &Message,
+    injected_keys: &mut HashSet<u32>,
+    injected_buttons: &mut HashSet<u8>,
+) -> Result<bool> {
+    let release = match message {
+        Message::KeyEvent {
+            keycode,
+            pressed: false,
+            ..
+        } if injected_keys.contains(keycode) => Message::KeyEvent {
+            keycode: *keycode,
+            pressed: false,
+            modifiers: 0,
+        },
+        Message::MouseButton {
+            button,
+            pressed: false,
+        } if injected_buttons.contains(button) => Message::MouseButton {
+            button: *button,
+            pressed: false,
+        },
+        _ => return Ok(false),
+    };
+
+    injector.inject(&release)?;
+    track_injected_input(&release, injected_keys, injected_buttons);
+    Ok(true)
+}
+
 fn request_wake_display() {
     #[cfg(target_os = "linux")]
     std::thread::spawn(crate::input::wake::wake_display);
@@ -1695,28 +1726,13 @@ async fn run_client_session(
                                 // A switch-back can deactivate the client before cleanup
                                 // releases arrive. Still inject releases for inputs we
                                 // previously pressed, or the client OS can be left sticky.
-                                match original_message {
-                                    Message::KeyEvent { keycode, pressed: false, .. }
-                                        if injected_keys.contains(&keycode) =>
-                                    {
-                                        let release = Message::KeyEvent { keycode, pressed: false, modifiers: 0 };
-                                        if let Err(e) = injector.inject(&release) {
-                                            warn!("Inject key release error: {}", e);
-                                        } else {
-                                            injected_keys.remove(&keycode);
-                                        }
-                                    }
-                                    Message::MouseButton { button, pressed: false }
-                                        if injected_buttons.contains(&button) =>
-                                    {
-                                        let release = Message::MouseButton { button, pressed: false };
-                                        if let Err(e) = injector.inject(&release) {
-                                            warn!("Inject mouse button release error: {}", e);
-                                        } else {
-                                            injected_buttons.remove(&button);
-                                        }
-                                    }
-                                    _ => {}
+                                if let Err(error) = inject_late_release(
+                                    &mut *injector,
+                                    &original_message,
+                                    &mut injected_keys,
+                                    &mut injected_buttons,
+                                ) {
+                                    warn!("Inject late input release error: {}", error);
                                 }
                             }
                             ClientOutput::Activate => {
@@ -2455,6 +2471,77 @@ mod lifecycle_tests {
 
         rig.assert_pressed_inputs(&[], &[]);
         assert!(buttons.is_empty());
+    }
+
+    #[test]
+    fn switch_back_then_late_key_up_does_not_inject_a_duplicate_release() {
+        let rig = crate::testing::ClientRig::new();
+        let mut injector = rig.injector_factory.create().unwrap();
+        injector
+            .inject(&Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            })
+            .unwrap();
+        let mut keys = HashSet::from([30]);
+        let mut buttons = HashSet::new();
+
+        // Switch-back performs eager cleanup before the server's key-up can arrive.
+        release_injected_inputs(&mut *injector, &rig.display, &mut keys, &mut buttons);
+        let injected = inject_late_release(
+            &mut *injector,
+            &Message::KeyEvent {
+                keycode: 30,
+                pressed: false,
+                modifiers: 0,
+            },
+            &mut keys,
+            &mut buttons,
+        )
+        .unwrap();
+
+        assert!(!injected);
+        let releases = rig
+            .injector
+            .injected()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    crate::testing::RecordedInput::KeyEvent {
+                        keycode: 30,
+                        pressed: false,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(releases, 1);
+    }
+
+    #[test]
+    fn duplicate_key_release_is_injected_only_once() {
+        let rig = crate::testing::ClientRig::new();
+        let mut injector = rig.injector_factory.create().unwrap();
+        injector
+            .inject(&Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            })
+            .unwrap();
+        let mut keys = HashSet::from([30]);
+        let mut buttons = HashSet::new();
+        let release = Message::KeyEvent {
+            keycode: 30,
+            pressed: false,
+            modifiers: 0,
+        };
+
+        assert!(inject_late_release(&mut *injector, &release, &mut keys, &mut buttons,).unwrap());
+        assert!(!inject_late_release(&mut *injector, &release, &mut keys, &mut buttons,).unwrap());
+        rig.assert_pressed_inputs(&[], &[]);
     }
 
     #[test]
