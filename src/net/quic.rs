@@ -1,13 +1,13 @@
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use quinn::{Endpoint, RecvStream, SendStream};
 use rand::Rng;
 use tokio::sync::{Mutex, Notify};
-use tokio::time;
+use tokio::time::{self, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::app::{
@@ -454,6 +454,52 @@ async fn attempt_client_update(
         installer,
     )
     .await
+}
+
+#[derive(Debug, Default)]
+struct ClientLatencyWatchdog {
+    pending: Option<(u64, Instant)>,
+    strikes: u8,
+}
+
+impl ClientLatencyWatchdog {
+    fn record_ping(&mut self, timestamp: u64, now: Instant) {
+        self.pending = Some((timestamp, now));
+    }
+
+    fn acknowledge(&mut self, timestamp: u64, now: Instant) -> Option<Duration> {
+        let (pending_timestamp, sent_at) = self.pending?;
+        if timestamp != pending_timestamp {
+            return None;
+        }
+        let rtt = now.saturating_duration_since(sent_at);
+        self.pending = None;
+        if rtt > CLIENT_LATENCY_RESTART_THRESHOLD {
+            self.strikes = self.strikes.saturating_add(1);
+        } else {
+            self.strikes = 0;
+        }
+        Some(rtt)
+    }
+
+    fn expire_pending(&mut self, now: Instant) -> Option<Duration> {
+        let (_, sent_at) = self.pending?;
+        let elapsed = now.saturating_duration_since(sent_at);
+        if elapsed <= CLIENT_LATENCY_RESTART_THRESHOLD {
+            return None;
+        }
+        self.strikes = self.strikes.saturating_add(1);
+        self.pending = None;
+        Some(elapsed)
+    }
+
+    fn needs_ping(&self) -> bool {
+        self.pending.is_none()
+    }
+
+    fn should_restart(&self) -> bool {
+        self.strikes >= CLIENT_LATENCY_RESTART_STRIKES
+    }
 }
 
 fn client_shutdown_exit(restart_for_latency: bool) -> SessionExit {
@@ -1691,8 +1737,7 @@ async fn run_client_session(
     let mut latency_check = time::interval(CLIENT_LATENCY_CHECK_INTERVAL);
     let mut pointer_injection_interval = time::interval(POINTER_FRAME_INTERVAL);
     pointer_injection_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    let mut pending_latency_ping: Option<(u64, Instant)> = None;
-    let mut latency_strikes: u8 = 0;
+    let mut latency_watchdog = ClientLatencyWatchdog::default();
     let mut restart_for_latency = false;
     let mut injected_keys: HashSet<u32> = HashSet::new();
     let mut injected_buttons: HashSet<u8> = HashSet::new();
@@ -1847,21 +1892,14 @@ async fn run_client_session(
                     Some(ClientTransportEvent::Control(
                         ClientControlEvent::HeartbeatAcknowledged { timestamp },
                     )) => {
-                        if let Some((pending_timestamp, sent_at)) = pending_latency_ping {
-                            if timestamp == pending_timestamp {
-                                let rtt = sent_at.elapsed();
-                                pending_latency_ping = None;
-                                if rtt > CLIENT_LATENCY_RESTART_THRESHOLD {
-                                    latency_strikes = latency_strikes.saturating_add(1);
-                                    warn!(
-                                        "Client latency watchdog: RTT {:.0}ms (strike {}/{})",
-                                        rtt.as_secs_f64() * 1000.0,
-                                        latency_strikes,
-                                        CLIENT_LATENCY_RESTART_STRIKES
-                                    );
-                                } else {
-                                    latency_strikes = 0;
-                                }
+                        if let Some(rtt) = latency_watchdog.acknowledge(timestamp, Instant::now()) {
+                            if rtt > CLIENT_LATENCY_RESTART_THRESHOLD {
+                                warn!(
+                                    "Client latency watchdog: RTT {:.0}ms (strike {}/{})",
+                                    rtt.as_secs_f64() * 1000.0,
+                                    latency_watchdog.strikes,
+                                    CLIENT_LATENCY_RESTART_STRIKES
+                                );
                             }
                         }
                     }
@@ -1926,26 +1964,22 @@ async fn run_client_session(
                     activation_started = None;
                 }
 
-                if let Some((_, sent_at)) = pending_latency_ping {
-                    if sent_at.elapsed() > CLIENT_LATENCY_RESTART_THRESHOLD {
-                        latency_strikes = latency_strikes.saturating_add(1);
-                        warn!(
-                            "Client latency watchdog: heartbeat pending for {:.0}ms (strike {}/{})",
-                            sent_at.elapsed().as_secs_f64() * 1000.0,
-                            latency_strikes,
-                            CLIENT_LATENCY_RESTART_STRIKES
-                        );
-                        pending_latency_ping = None;
-                    }
+                if let Some(elapsed) = latency_watchdog.expire_pending(Instant::now()) {
+                    warn!(
+                        "Client latency watchdog: heartbeat pending for {:.0}ms (strike {}/{})",
+                        elapsed.as_secs_f64() * 1000.0,
+                        latency_watchdog.strikes,
+                        CLIENT_LATENCY_RESTART_STRIKES
+                    );
                 }
 
-                if latency_strikes >= CLIENT_LATENCY_RESTART_STRIKES {
+                if latency_watchdog.should_restart() {
                     warn!("Client latency watchdog: sustained lag detected; restarting client process");
                     restart_for_latency = true;
                     break;
                 }
 
-                if pending_latency_ping.is_none() {
+                if latency_watchdog.needs_ping() {
                     let timestamp = unix_millis();
                     if let Err(error) = peer
                         .send_control(ClientControlCommand::Heartbeat { timestamp })
@@ -1954,7 +1988,7 @@ async fn run_client_session(
                         warn!("Client latency watchdog failed to send heartbeat: {}", error);
                         break;
                     }
-                    pending_latency_ping = Some((timestamp, Instant::now()));
+                    latency_watchdog.record_ping(timestamp, Instant::now());
                 }
             }
             _ = screen_check.tick() => {
@@ -2761,6 +2795,67 @@ mod lifecycle_tests {
                 }
             )
         }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_latency_below_threshold_is_healthy() {
+        let rig = crate::testing::ClientRig::new();
+        let mut watchdog = ClientLatencyWatchdog::default();
+        watchdog.record_ping(1, Instant::now());
+
+        rig.advance_time(Duration::from_secs(2)).await;
+        let rtt = watchdog.acknowledge(1, Instant::now()).unwrap();
+
+        assert_eq!(rtt, Duration::from_secs(2));
+        assert_eq!(watchdog.strikes, 0);
+        assert!(!watchdog.should_restart());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_heartbeat_acknowledgement_adds_a_strike() {
+        let rig = crate::testing::ClientRig::new();
+        let mut watchdog = ClientLatencyWatchdog::default();
+        watchdog.record_ping(1, Instant::now());
+
+        rig.advance_time(Duration::from_secs(4)).await;
+        watchdog.acknowledge(1, Instant::now()).unwrap();
+
+        assert_eq!(watchdog.strikes, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn healthy_acknowledgement_recovers_after_latency() {
+        let rig = crate::testing::ClientRig::new();
+        let mut watchdog = ClientLatencyWatchdog::default();
+        watchdog.record_ping(1, Instant::now());
+        rig.advance_time(Duration::from_secs(4)).await;
+        watchdog.acknowledge(1, Instant::now()).unwrap();
+        assert_eq!(watchdog.strikes, 1);
+
+        watchdog.record_ping(2, Instant::now());
+        rig.advance_time(Duration::from_secs(1)).await;
+        watchdog.acknowledge(2, Instant::now()).unwrap();
+
+        assert_eq!(watchdog.strikes, 0);
+        assert!(!watchdog.should_restart());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_heartbeat_timeouts_trip_watchdog_restart() {
+        let rig = crate::testing::ClientRig::new();
+        let mut watchdog = ClientLatencyWatchdog::default();
+
+        for timestamp in 0..CLIENT_LATENCY_RESTART_STRIKES as u64 {
+            watchdog.record_ping(timestamp, Instant::now());
+            rig.advance_time(Duration::from_secs(4)).await;
+            assert!(watchdog.expire_pending(Instant::now()).is_some());
+        }
+
+        assert!(watchdog.should_restart());
+        assert!(matches!(
+            client_shutdown_exit(watchdog.should_restart()),
+            SessionExit::RestartRequested(RestartReason::LatencyWatchdog)
+        ));
     }
 
     #[test]
