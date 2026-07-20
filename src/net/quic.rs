@@ -22,12 +22,16 @@ use crate::net::discovery;
 use crate::net::framing::{recv_message, send_message};
 use crate::net::pairing::{self, TerminalPairingPrompt};
 use crate::net::protocol::{self, Message, ScreenLayout, BUILD_VERSION, PROTOCOL_VERSION};
+use crate::net::quinn_client::QuinnClientPeerLink;
 use crate::net::tls;
 use crate::net::tls::ConfigTrustStore;
 use crate::net::transition::{ClientOutput, ClientTransition, ServerOutput, ServerTransition};
 use crate::net::update::{ExecutableUpdateInstaller, GithubReleaseRepository};
 use crate::ports::{
-    DisplaySessionControl, PairingPrompt, Release, ReleaseRepository, TrustStore, UpdateInstaller,
+    ClientChannel, ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand,
+    ClientControlEvent, ClientInputEvent, ClientPeerLink, ClientTransportEvent,
+    DisplaySessionControl, PairingPrompt, PeerDirection, PeerScreen, PeerScrollPhase, Release,
+    ReleaseRepository, TrustStore, UpdateInstaller,
 };
 use crate::status::{self, RuntimeStatus};
 
@@ -323,6 +327,56 @@ fn system_time_millis_u64(time: std::time::SystemTime) -> u64 {
         return 0;
     };
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn protocol_direction(direction: PeerDirection) -> protocol::Direction {
+    match direction {
+        PeerDirection::Left => protocol::Direction::Left,
+        PeerDirection::Right => protocol::Direction::Right,
+        PeerDirection::Up => protocol::Direction::Up,
+        PeerDirection::Down => protocol::Direction::Down,
+    }
+}
+
+fn peer_direction(direction: protocol::Direction) -> PeerDirection {
+    match direction {
+        protocol::Direction::Left => PeerDirection::Left,
+        protocol::Direction::Right => PeerDirection::Right,
+        protocol::Direction::Up => PeerDirection::Up,
+        protocol::Direction::Down => PeerDirection::Down,
+    }
+}
+
+fn protocol_input_message(event: ClientInputEvent) -> Message {
+    match event {
+        ClientInputEvent::MouseMoved { x, y } => Message::MouseMove { x, y },
+        ClientInputEvent::MouseButtonChanged { button, pressed } => {
+            Message::MouseButton { button, pressed }
+        }
+        ClientInputEvent::MouseScrolled { dx, dy, phase } => Message::MouseScroll {
+            dx,
+            dy,
+            phase: match phase {
+                PeerScrollPhase::None => protocol::ScrollPhase::None,
+                PeerScrollPhase::Began => protocol::ScrollPhase::Began,
+                PeerScrollPhase::Changed => protocol::ScrollPhase::Changed,
+                PeerScrollPhase::Ended => protocol::ScrollPhase::Ended,
+            },
+        },
+        ClientInputEvent::KeyChanged {
+            keycode,
+            pressed,
+            modifiers,
+        } => Message::KeyEvent {
+            keycode,
+            pressed,
+            modifiers,
+        },
+        ClientInputEvent::SwitchToClient { direction } => Message::SwitchScreen {
+            direction: protocol_direction(direction),
+        },
+        ClientInputEvent::ReleaseClient => Message::ReleaseScreen,
+    }
 }
 
 async fn attempt_client_update(
@@ -1435,27 +1489,19 @@ async fn run_client_session(
     }
 
     let mut transition = ClientTransition::new(my_w, my_h);
+    let peer: Arc<dyn ClientPeerLink> =
+        Arc::new(QuinnClientPeerLink::open(&connection, control_send, control_recv).await?);
+    info!("Typed control, input, and clipboard channels accepted");
 
     // Shutdown signal for background tasks
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
-    // Accept clipboard stream (bidirectional, second bi-stream from server)
-    let (clip_send, mut clip_recv) =
-        tokio::time::timeout(Duration::from_secs(10), connection.accept_bi())
-            .await
-            .wrap_err("Timeout waiting for clipboard stream from server")?
-            .wrap_err("Failed to accept clipboard stream")?;
-    // Read and discard the stream-ready marker
-    let _marker = recv_message(&mut clip_recv).await?;
-    info!("Clipboard stream accepted");
-
     // Spawn clipboard polling task (client → server)
-    let clip_send = Arc::new(Mutex::new(clip_send));
-    let clip_send_clone = clip_send.clone();
     let clipboard = Arc::new(std::sync::Mutex::new(
         crate::clipboard::sync::ClipboardSync::new(),
     ));
     let clipboard_poll = clipboard.clone();
+    let clipboard_peer = peer.clone();
     let mut shutdown_rx1 = shutdown_tx.subscribe();
     tokio::spawn(async move {
         let interval = crate::clipboard::sync::ClipboardSync::poll_interval();
@@ -1466,48 +1512,19 @@ async fn run_client_session(
                         let mut clipboard = clipboard_poll.lock().unwrap();
                         clipboard.poll_change()
                     };
-                    if let Ok(Some(msg)) = msg {
-                        let mut sender = clip_send_clone.lock().await;
-                        if send_message(&mut *sender, &msg).await.is_err() {
+                    if let Ok(Some(Message::ClipboardUpdate {
+                        content: protocol::ClipboardContent::Text(text),
+                    })) = msg {
+                        if clipboard_peer
+                            .send_clipboard(ClientClipboardCommand::SetPeerText(text))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
                 }
                 _ = shutdown_rx1.changed() => {
-                    break;
-                }
-            }
-        }
-    });
-
-    // Spawn clipboard receive task (server → client)
-    let clipboard_recv = clipboard.clone();
-    let mut shutdown_rx2 = shutdown_tx.subscribe();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                result = recv_message(&mut clip_recv) => {
-                    match result {
-                        Ok(Some(Message::ClipboardUpdate { content })) => {
-                            let mut clipboard = clipboard_recv.lock().unwrap();
-                            if let Err(e) = clipboard.apply_update(&content) {
-                                warn!("Failed to apply clipboard update: {}", e);
-                            }
-                        }
-                        Ok(Some(other)) => {
-                            debug!("Unexpected message on clipboard stream: {:?}", other);
-                        }
-                        Ok(None) => {
-                            info!("Clipboard stream closed by server");
-                            break;
-                        }
-                        Err(e) => {
-                            warn!("Clipboard stream error: {}", e);
-                            break;
-                        }
-                    }
-                }
-                _ = shutdown_rx2.changed() => {
                     break;
                 }
             }
@@ -1550,30 +1567,29 @@ async fn run_client_session(
 
     info!("Client ready. Waiting for server to share mouse...");
 
-    // Accept the unidirectional input stream from the server
-    let mut input_recv = tokio::time::timeout(Duration::from_secs(10), connection.accept_uni())
-        .await
-        .wrap_err("Timeout waiting for input stream from server")?
-        .wrap_err("Failed to accept input stream")?;
-    // Read and discard the stream-ready marker
-    let _marker = recv_message_uni(&mut input_recv).await?;
-    debug!("Input stream accepted");
-
-    // Keep draining QUIC even while CoreGraphics is busy. Relative movement
-    // still updates logical state in order, but only the newest absolute
-    // position is retained for the next injection frame.
+    // Drain typed input events independently so slow OS injection cannot stop
+    // QUIC reads or replay stale pointer frames.
     let input_queue = InputMessageQueue::default();
     let input_reader_queue = input_queue.clone();
+    let (peer_event_send, mut peer_events) = tokio::sync::mpsc::channel(64);
+    let peer_reader = peer.clone();
     tokio::spawn(async move {
         loop {
-            match recv_message_uni(&mut input_recv).await {
-                Ok(Some(message)) => input_reader_queue.push(message),
-                Ok(None) => {
+            match peer_reader.next_event().await {
+                Some(ClientTransportEvent::Input(event)) => input_reader_queue.push(protocol_input_message(event)),
+                Some(ClientTransportEvent::Closed(ClientChannel::Input)) => {
                     input_reader_queue.close();
                     break;
                 }
-                Err(e) => {
-                    input_reader_queue.fail(e.to_string());
+                Some(ClientTransportEvent::Failed(failure)) if failure.channel == ClientChannel::Input => {
+                    input_reader_queue.fail(failure.message);
+                    break;
+                }
+                Some(event) => {
+                    if peer_event_send.send(event).await.is_err() { break; }
+                }
+                None => {
+                    input_reader_queue.close();
                     break;
                 }
             }
@@ -1701,8 +1717,11 @@ async fn run_client_session(
                                 );
                                 release_defensive_keyups(&mut *injector);
                                 info!("Edge on client: {:?} — requesting switch back", direction);
-                                let switch_msg = Message::SwitchScreen { direction };
-                                send_message(&mut control_send, &switch_msg).await.ok();
+                                peer.send_control(ClientControlCommand::RequestSwitchBack {
+                                    direction: peer_direction(direction),
+                                })
+                                .await
+                                .ok();
                                 // Check clipboard for files and transfer them
                                 let ft_conn = connection.clone();
                                 tokio::spawn(async move {
@@ -1739,16 +1758,20 @@ async fn run_client_session(
                     "pointer frame",
                 );
             }
-            msg = recv_message(&mut control_recv) => {
-                match msg {
-                    Ok(Some(Message::Heartbeat { timestamp })) => {
-                        let ack = Message::HeartbeatAck { timestamp };
-                        if let Err(e) = send_message(&mut control_send, &ack).await {
-                            warn!("Failed to send heartbeat ack: {}", e);
+            event = peer_events.recv() => {
+                match event {
+                    Some(ClientTransportEvent::Control(ClientControlEvent::Heartbeat { timestamp })) => {
+                        if let Err(error) = peer
+                            .send_control(ClientControlCommand::AcknowledgeHeartbeat { timestamp })
+                            .await
+                        {
+                            warn!("Failed to send heartbeat ack: {}", error);
                             break;
                         }
                     }
-                    Ok(Some(Message::HeartbeatAck { timestamp })) => {
+                    Some(ClientTransportEvent::Control(
+                        ClientControlEvent::HeartbeatAcknowledged { timestamp },
+                    )) => {
                         if let Some((pending_timestamp, sent_at)) = pending_latency_ping {
                             if timestamp == pending_timestamp {
                                 let rtt = sent_at.elapsed();
@@ -1767,23 +1790,49 @@ async fn run_client_session(
                             }
                         }
                     }
-                    Ok(Some(Message::ScreenResize { screen })) => {
-                        info!("Server screen changed: {}x{}", screen.width, screen.height);
-                        server_screen = screen;
+                    Some(ClientTransportEvent::Control(
+                        ClientControlEvent::PeerScreenChanged(screen),
+                    )) => {
+                        let wire_screen = ScreenLayout {
+                            width: screen.width,
+                            height: screen.height,
+                        };
+                        if validate_screen_layout(&wire_screen, "server resize").is_ok() {
+                            info!("Server screen changed: {}x{}", screen.width, screen.height);
+                            server_screen = wire_screen;
+                        } else {
+                            warn!("Ignoring invalid server screen resize: {}x{}", screen.width, screen.height);
+                        }
                     }
-                    Ok(Some(Message::WakeDisplay)) => {
+                    Some(ClientTransportEvent::Control(ClientControlEvent::WakeDisplay)) => {
                         debug!("Peer user active — keeping this system awake");
                         display_control.wake_display().ok();
                     }
-                    Ok(Some(other)) => {
-                        debug!("Control message: {:?}", other);
+                    Some(ClientTransportEvent::Clipboard(ClientClipboardEvent::TextChanged(text))) => {
+                        let content = protocol::ClipboardContent::Text(text);
+                        let mut clipboard = lock_recover(&clipboard, "clipboard");
+                        if let Err(error) = clipboard.apply_update(&content) {
+                            warn!("Failed to apply clipboard update: {}", error);
+                        }
                     }
-                    Ok(None) => {
-                        info!("Server disconnected");
+                    Some(ClientTransportEvent::Closed(ClientChannel::Clipboard)) => {
+                        info!("Clipboard stream closed by server");
+                    }
+                    Some(ClientTransportEvent::Failed(failure))
+                        if failure.channel == ClientChannel::Clipboard =>
+                    {
+                        warn!("Clipboard stream error: {}", failure.message);
+                    }
+                    Some(ClientTransportEvent::Closed(channel)) => {
+                        info!("Server {:?} channel closed", channel);
                         break;
                     }
-                    Err(e) => {
-                        warn!("Control stream error: {}", e);
+                    Some(ClientTransportEvent::Failed(failure)) => {
+                        warn!("{:?} channel error: {}", failure.channel, failure.message);
+                        break;
+                    }
+                    None => {
+                        info!("Client peer link closed");
                         break;
                     }
                 }
@@ -1822,8 +1871,11 @@ async fn run_client_session(
 
                 if pending_latency_ping.is_none() {
                     let timestamp = unix_millis();
-                    if let Err(e) = send_message(&mut control_send, &Message::Heartbeat { timestamp }).await {
-                        warn!("Client latency watchdog failed to send heartbeat: {}", e);
+                    if let Err(error) = peer
+                        .send_control(ClientControlCommand::Heartbeat { timestamp })
+                        .await
+                    {
+                        warn!("Client latency watchdog failed to send heartbeat: {}", error);
                         break;
                     }
                     pending_latency_ping = Some((timestamp, Instant::now()));
@@ -1836,11 +1888,14 @@ async fn run_client_session(
                         last_screen_w = w;
                         last_screen_h = h;
                         transition.update_screen_size(w, h);
-                        let resize_msg = Message::ScreenResize {
-                            screen: ScreenLayout { width: w, height: h },
-                        };
-                        if let Err(e) = send_message(&mut control_send, &resize_msg).await {
-                            warn!("Failed to send screen resize: {}", e);
+                        if let Err(error) = peer
+                            .send_control(ClientControlCommand::LocalScreenChanged(PeerScreen {
+                                width: w,
+                                height: h,
+                            }))
+                            .await
+                        {
+                            warn!("Failed to send screen resize: {}", error);
                             break;
                         }
                     }

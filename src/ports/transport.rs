@@ -127,7 +127,7 @@ impl ClientTransportEvent {
 
 /// Post-handshake client transport boundary.
 pub trait ClientPeerLink: Send + Sync {
-    fn next_event(&mut self) -> TransportFuture<'_, Option<ClientTransportEvent>>;
+    fn next_event(&self) -> TransportFuture<'_, Option<ClientTransportEvent>>;
 
     fn send_control(&self, command: ClientControlCommand) -> TransportFuture<'_, Result<()>>;
 
@@ -141,7 +141,7 @@ mod tests {
     struct ClosedLink;
 
     impl ClientPeerLink for ClosedLink {
-        fn next_event(&mut self) -> TransportFuture<'_, Option<ClientTransportEvent>> {
+        fn next_event(&self) -> TransportFuture<'_, Option<ClientTransportEvent>> {
             Box::pin(async { None })
         }
 

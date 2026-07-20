@@ -207,7 +207,7 @@ impl Default for ScriptedPeerLink {
 }
 
 impl ClientPeerLink for ScriptedPeerLink {
-    fn next_event(&mut self) -> TransportFuture<'_, Option<ClientTransportEvent>> {
+    fn next_event(&self) -> TransportFuture<'_, Option<ClientTransportEvent>> {
         Box::pin(async move {
             let event = self.receiver.lock().await.recv().await;
             if let Some(event) = &event {
@@ -290,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn closure_and_failure_are_injected_as_typed_channel_events() {
-        let mut peer = ScriptedPeerLink::new();
+        let peer = ScriptedPeerLink::new();
         peer.push_channel_close(ClientChannel::Input);
         peer.push_channel_failure(ClientChannel::Clipboard, "clipboard reset");
 
@@ -310,7 +310,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn per_channel_delays_do_not_block_ready_channels() {
-        let mut peer = ScriptedPeerLink::new();
+        let peer = ScriptedPeerLink::new();
         peer.push_delayed_event(
             Duration::from_secs(10),
             ClientTransportEvent::Clipboard(ClientClipboardEvent::TextChanged("later".to_string())),
@@ -342,7 +342,7 @@ mod tests {
         let gate = peer.block_event(ClientTransportEvent::Input(ClientInputEvent::ReleaseClient));
         gate.wait_until_entered().await;
 
-        let mut receiver = peer.clone();
+        let receiver = peer.clone();
         let waiting = tokio::spawn(async move { receiver.next_event().await });
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());

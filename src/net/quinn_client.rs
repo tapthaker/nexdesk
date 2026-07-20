@@ -21,7 +21,7 @@ const EVENT_BUFFER: usize = 64;
 pub(crate) struct QuinnClientPeerLink {
     control_send: Arc<Mutex<SendStream>>,
     clipboard_send: Arc<Mutex<SendStream>>,
-    events: mpsc::Receiver<ClientTransportEvent>,
+    events: Mutex<mpsc::Receiver<ClientTransportEvent>>,
 }
 
 impl QuinnClientPeerLink {
@@ -70,14 +70,14 @@ impl QuinnClientPeerLink {
         Ok(Self {
             control_send: Arc::new(Mutex::new(control_send)),
             clipboard_send: Arc::new(Mutex::new(clipboard_send)),
-            events,
+            events: Mutex::new(events),
         })
     }
 }
 
 impl ClientPeerLink for QuinnClientPeerLink {
-    fn next_event(&mut self) -> TransportFuture<'_, Option<ClientTransportEvent>> {
-        Box::pin(self.events.recv())
+    fn next_event(&self) -> TransportFuture<'_, Option<ClientTransportEvent>> {
+        Box::pin(async move { self.events.lock().await.recv().await })
     }
 
     fn send_control(&self, command: ClientControlCommand) -> TransportFuture<'_, Result<()>> {
