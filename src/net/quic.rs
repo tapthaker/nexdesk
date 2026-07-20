@@ -227,6 +227,29 @@ fn lock_recover<'a, T>(
     }
 }
 
+type SharedClipboardSync = Arc<std::sync::Mutex<crate::clipboard::sync::ClipboardSync>>;
+
+async fn poll_clipboard_on_worker(clipboard: SharedClipboardSync) -> Result<Option<Message>> {
+    tokio::task::spawn_blocking(move || {
+        let mut clipboard = lock_recover(&clipboard, "clipboard");
+        clipboard.poll_change()
+    })
+    .await
+    .wrap_err("Clipboard polling worker failed")?
+}
+
+async fn apply_clipboard_on_worker(
+    clipboard: SharedClipboardSync,
+    content: protocol::ClipboardContent,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut clipboard = lock_recover(&clipboard, "clipboard");
+        clipboard.apply_update(&content)
+    })
+    .await
+    .wrap_err("Clipboard update worker failed")?
+}
+
 fn release_injected_inputs(
     injector: &mut dyn InputInjector,
     display_control: &dyn DisplaySessionControl,
@@ -570,10 +593,7 @@ async fn handle_server_connection(
         let interval = crate::clipboard::sync::ClipboardSync::poll_interval();
         loop {
             tokio::time::sleep(interval).await;
-            let msg = {
-                let mut clipboard = lock_recover(&clipboard_poll, "clipboard");
-                clipboard.poll_change()
-            };
+            let msg = poll_clipboard_on_worker(clipboard_poll.clone()).await;
             if let Ok(Some(msg)) = msg {
                 let mut sender = clip_send_clone.lock().await;
                 if send_message(&mut *sender, &msg).await.is_err() {
@@ -589,8 +609,11 @@ async fn handle_server_connection(
         loop {
             match recv_message(&mut clip_recv).await {
                 Ok(Some(Message::ClipboardUpdate { content })) => {
-                    let mut clipboard = clipboard_recv.lock().unwrap();
-                    clipboard.apply_update(&content).ok();
+                    if let Err(error) =
+                        apply_clipboard_on_worker(clipboard_recv.clone(), content).await
+                    {
+                        warn!("Failed to apply clipboard update: {}", error);
+                    }
                 }
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => break,
@@ -1502,11 +1525,14 @@ async fn run_client_session(
     // Shutdown signal for background tasks
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
-    // Spawn clipboard polling task (client → server)
+    // Serialize local polling and peer writes through one clipboard task. The
+    // OS calls run on blocking workers, while the session loop only enqueues
+    // updates and remains responsive.
     let clipboard_sync = Arc::new(std::sync::Mutex::new(
         crate::clipboard::sync::ClipboardSync::new(clipboard_port.clone()),
     ));
-    let clipboard_poll = clipboard_sync.clone();
+    let (clipboard_update_tx, mut clipboard_updates) = tokio::sync::mpsc::unbounded_channel();
+    let clipboard_worker = clipboard_sync.clone();
     let clipboard_peer = peer.clone();
     let mut shutdown_rx1 = shutdown_tx.subscribe();
     tokio::spawn(async move {
@@ -1514,10 +1540,7 @@ async fn run_client_session(
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {
-                    let msg = {
-                        let mut clipboard = clipboard_poll.lock().unwrap();
-                        clipboard.poll_change()
-                    };
+                    let msg = poll_clipboard_on_worker(clipboard_worker.clone()).await;
                     if let Ok(Some(Message::ClipboardUpdate {
                         content: protocol::ClipboardContent::Text(text),
                     })) = msg {
@@ -1528,6 +1551,14 @@ async fn run_client_session(
                         {
                             break;
                         }
+                    }
+                }
+                Some(content) = clipboard_updates.recv() => {
+                    if let Err(error) = apply_clipboard_on_worker(
+                        clipboard_worker.clone(),
+                        content,
+                    ).await {
+                        warn!("Failed to apply clipboard update: {}", error);
                     }
                 }
                 _ = shutdown_rx1.changed() => {
@@ -1825,9 +1856,8 @@ async fn run_client_session(
                     }
                     Some(ClientTransportEvent::Clipboard(ClientClipboardEvent::TextChanged(text))) => {
                         let content = protocol::ClipboardContent::Text(text);
-                        let mut clipboard = lock_recover(&clipboard_sync, "clipboard");
-                        if let Err(error) = clipboard.apply_update(&content) {
-                            warn!("Failed to apply clipboard update: {}", error);
+                        if clipboard_update_tx.send(content).is_err() {
+                            warn!("Clipboard worker stopped before peer update was applied");
                         }
                     }
                     Some(ClientTransportEvent::Closed(channel)) => {
@@ -2398,6 +2428,32 @@ mod lifecycle_tests {
             entry.event,
             crate::testing::DisplayObservation::WakeRequested
         )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_clipboard_work_does_not_stall_async_session_progress() {
+        let clipboard = Arc::new(crate::testing::MemoryClipboard::new());
+        clipboard.set_text(Some("ready".to_string()));
+        let gate = clipboard.block_next(crate::testing::ClipboardOperation::ReadText);
+        let sync = Arc::new(std::sync::Mutex::new(
+            crate::clipboard::sync::ClipboardSync::new(clipboard),
+        ));
+
+        let poll = tokio::spawn(poll_clipboard_on_worker(sync));
+        tokio::task::yield_now().await;
+        assert!(gate.wait_until_entered(Duration::from_secs(1)));
+
+        // This marker represents unrelated session-loop work. On a
+        // current-thread runtime it can only run while the clipboard call is
+        // blocked if that call was moved to a blocking worker.
+        let marker = tokio::spawn(async { "session progressed" });
+        assert_eq!(marker.await.unwrap(), "session progressed");
+
+        gate.release();
+        assert!(matches!(
+            poll.await.unwrap().unwrap(),
+            Some(Message::ClipboardUpdate { .. })
+        ));
     }
 
     #[test]
