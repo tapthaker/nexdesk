@@ -286,6 +286,31 @@ fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
+fn should_attempt_client_update(server_build: &str) -> bool {
+    server_build != BUILD_VERSION
+        && crate::net::update::is_release_version(server_build)
+        && crate::net::update::is_newer(server_build, BUILD_VERSION)
+}
+
+fn update_restart_reason<E>(
+    server_build: &str,
+    update_result: &std::result::Result<(), E>,
+) -> Option<RestartReason> {
+    update_result
+        .is_ok()
+        .then(|| RestartReason::UpdateInstalled {
+            version: server_build.to_string(),
+        })
+}
+
+fn client_shutdown_exit(restart_for_latency: bool) -> SessionExit {
+    if restart_for_latency {
+        SessionExit::RestartRequested(RestartReason::LatencyWatchdog)
+    } else {
+        SessionExit::Disconnected
+    }
+}
+
 fn validate_listen_port(port: u16) -> Result<()> {
     if port == 0 {
         return Err(eyre!(
@@ -1174,30 +1199,22 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<SessionEx
     };
 
     // Auto-update only if server has a strictly newer clean release version
-    if server_build_version != BUILD_VERSION
-        && crate::net::update::is_release_version(&server_build_version)
-        && crate::net::update::is_newer(&server_build_version, BUILD_VERSION)
-    {
+    if should_attempt_client_update(&server_build_version) {
         info!(
             "Server has newer version {}, attempting self-update...",
             server_build_version
         );
-        match crate::net::update::self_update(&server_build_version).await {
-            Ok(()) => {
-                info!("Updated to {}. Restarting...", server_build_version);
-                connection.close(0u32.into(), b"updating");
-                return Ok(SessionExit::RestartRequested(
-                    RestartReason::UpdateInstalled {
-                        version: server_build_version,
-                    },
-                ));
-            }
-            Err(e) => {
-                warn!(
-                    "Self-update failed: {}. Continuing with current version.",
-                    e
-                );
-            }
+        let update_result = crate::net::update::self_update(&server_build_version).await;
+        if let Some(reason) = update_restart_reason(&server_build_version, &update_result) {
+            info!("Updated to {}. Restarting...", server_build_version);
+            connection.close(0u32.into(), b"updating");
+            return Ok(SessionExit::RestartRequested(reason));
+        }
+        if let Err(e) = update_result {
+            warn!(
+                "Self-update failed: {}. Continuing with current version.",
+                e
+            );
         }
     }
 
@@ -1622,16 +1639,10 @@ async fn connect_once(endpoint: &Endpoint, addr: SocketAddr) -> Result<SessionEx
     // Gracefully close the connection
     connection.close(0u32.into(), b"disconnected");
 
-    if restart_for_latency {
-        return Ok(SessionExit::RestartRequested(
-            RestartReason::LatencyWatchdog,
-        ));
-    }
-
     // Suppress unused variable warning
     let _ = server_screen;
 
-    Ok(SessionExit::Disconnected)
+    Ok(client_shutdown_exit(restart_for_latency))
 }
 
 /// Ping a peer to measure QUIC RTT.
@@ -1971,5 +1982,42 @@ mod input_coalescing_tests {
         ));
         assert!((pending.0 - 0.25).abs() < f64::EPSILON);
         assert!((pending.1 + 0.25).abs() < f64::EPSILON);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn client_update_restart_requires_a_newer_clean_release_and_success() {
+        let newer = "v999.0.0";
+        assert!(should_attempt_client_update(newer));
+        assert!(!should_attempt_client_update(BUILD_VERSION));
+        assert!(!should_attempt_client_update("v0.0.0"));
+        assert!(!should_attempt_client_update("v999.0.0-dirty"));
+        assert!(!should_attempt_client_update("unknown"));
+
+        let installed: std::result::Result<(), &str> = Ok(());
+        assert_eq!(
+            update_restart_reason(newer, &installed),
+            Some(RestartReason::UpdateInstalled {
+                version: newer.to_string(),
+            })
+        );
+        let failed = Err("download failed");
+        assert_eq!(update_restart_reason(newer, &failed), None);
+    }
+
+    #[test]
+    fn latency_restart_is_requested_only_after_watchdog_trips() {
+        assert!(matches!(
+            client_shutdown_exit(false),
+            SessionExit::Disconnected
+        ));
+        assert!(matches!(
+            client_shutdown_exit(true),
+            SessionExit::RestartRequested(RestartReason::LatencyWatchdog)
+        ));
     }
 }
