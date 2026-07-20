@@ -12,8 +12,9 @@ use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use crate::app::{
-    client_pairing_decision, validate_client_server_hello, CancellationToken, PairingDecision,
-    RestartReason, RetryPolicy, SessionExit,
+    client_pairing_decision, complete_client_pairing, require_handshake_message,
+    validate_client_server_hello, CancellationToken, HandshakeMessage, PairingCompletion,
+    PairingDecision, RestartReason, RetryPolicy, SessionExit,
 };
 use crate::input::inject::{InputInjector, InputInjectorFactory, PlatformInputInjectorFactory};
 use crate::input::wake::PlatformDisplaySessionControl;
@@ -1282,84 +1283,80 @@ async fn run_client_session(
     // Accept control stream and do handshake
     let (mut control_send, mut control_recv) = connection.accept_bi().await?;
 
-    let (mut server_screen, server_build_version) = match recv_message(&mut control_recv).await? {
+    let hello = match recv_message(&mut control_recv).await? {
         Some(Message::Hello {
             version,
             hostname,
             screen,
             fingerprint,
             build_version,
-        }) => {
-            validate_client_server_hello(
-                version,
-                PROTOCOL_VERSION,
-                &fingerprint,
-                &tls_fingerprint,
-                screen.width,
-                screen.height,
-            )?;
-
-            let server_ver = build_version.as_deref().unwrap_or("unknown");
-            info!(
-                "Server: {} (proto v{}, build {}, screen: {}x{})",
-                hostname, version, server_ver, screen.width, screen.height
-            );
-            if server_ver != BUILD_VERSION {
-                warn!(
-                    "Version mismatch: server={}, client={}",
-                    server_ver, BUILD_VERSION
-                );
-            }
-
-            let pairing = client_pairing_decision(trust_store.is_trusted(&fingerprint)?);
-            let otp = match pairing {
-                PairingDecision::UseTrustedIdentity => {
-                    info!("Server fingerprint already trusted");
-                    None
-                }
-                PairingDecision::PromptForOtp => Some(prompt_pairing_code(addr).await?),
-            };
-
-            let ack = Message::HelloAck {
-                accepted: true,
-                otp: otp.clone(),
-                screen: Some(ScreenLayout {
-                    width: my_w,
-                    height: my_h,
-                }),
-                build_version: Some(BUILD_VERSION.to_string()),
-            };
-            send_message(&mut control_send, &ack).await?;
-
-            // Wait for PairingResult
-            match recv_message(&mut control_recv).await? {
-                Some(Message::PairingResult { success: true }) => {
-                    if matches!(pairing, PairingDecision::PromptForOtp) {
-                        trust_store.trust(&fingerprint)?;
-                        info!("Paired successfully. Fingerprint stored.");
-                    }
-                }
-                Some(Message::PairingResult { success: false }) => {
-                    return Err(eyre!("Pairing failed: invalid code"));
-                }
-                other => {
-                    return Err(eyre!("Expected PairingResult, got: {:?}", other));
-                }
-            }
-
-            let ver = build_version.unwrap_or_else(|| "unknown".to_string());
-            let mut runtime = RuntimeStatus::new("client", "connected");
-            runtime.peer_addr = Some(addr.to_string());
-            runtime.peer_name = Some(hostname);
-            runtime.peer_screen = Some(format!("{}x{}", screen.width, screen.height));
-            runtime.peer_build = Some(ver.clone());
-            status::write_status(runtime).ok();
-            (screen, ver)
-        }
-        other => {
-            return Err(eyre!("Expected Hello, got: {:?}", other));
-        }
+        }) => HandshakeMessage::Expected((version, hostname, screen, fingerprint, build_version)),
+        Some(other) => HandshakeMessage::Unexpected(protocol::message_summary(&other)),
+        None => HandshakeMessage::StreamClosed,
     };
+    let (version, hostname, screen, fingerprint, build_version) =
+        require_handshake_message("Hello", hello)?;
+
+    validate_client_server_hello(
+        version,
+        PROTOCOL_VERSION,
+        &fingerprint,
+        &tls_fingerprint,
+        screen.width,
+        screen.height,
+    )?;
+
+    let server_ver = build_version.as_deref().unwrap_or("unknown");
+    info!(
+        "Server: {} (proto v{}, build {}, screen: {}x{})",
+        hostname, version, server_ver, screen.width, screen.height
+    );
+    if server_ver != BUILD_VERSION {
+        warn!(
+            "Version mismatch: server={}, client={}",
+            server_ver, BUILD_VERSION
+        );
+    }
+
+    let pairing = client_pairing_decision(trust_store.is_trusted(&fingerprint)?);
+    let otp = match pairing {
+        PairingDecision::UseTrustedIdentity => {
+            info!("Server fingerprint already trusted");
+            None
+        }
+        PairingDecision::PromptForOtp => Some(prompt_pairing_code(addr).await?),
+    };
+
+    let ack = Message::HelloAck {
+        accepted: true,
+        version: PROTOCOL_VERSION,
+        otp,
+        screen: Some(my_screen),
+        build_version: Some(protocol::local_build_version()),
+    };
+    send_message(&mut control_send, &ack).await?;
+
+    let pairing_response = match recv_message(&mut control_recv).await? {
+        Some(Message::PairingResult { success }) => HandshakeMessage::Expected(success),
+        Some(other) => HandshakeMessage::Unexpected(protocol::message_summary(&other)),
+        None => HandshakeMessage::StreamClosed,
+    };
+    if matches!(
+        complete_client_pairing(pairing, pairing_response)?,
+        PairingCompletion::PersistTrust
+    ) {
+        trust_store.trust(&fingerprint)?;
+        info!("Paired successfully. Fingerprint stored.");
+    }
+
+    let server_build_version = build_version.unwrap_or_else(|| "unknown".to_string());
+    let mut runtime = RuntimeStatus::new("client", "connected");
+    runtime.peer_addr = Some(addr.to_string());
+    runtime.peer_name = Some(hostname);
+    runtime.peer_screen = Some(format!("{}x{}", screen.width, screen.height));
+    runtime.peer_build = Some(server_build_version.clone());
+    status::write_status(runtime).ok();
+    let mut server_screen = screen;
 
     // Auto-update only if server has a strictly newer clean release version
     if should_attempt_client_update(&server_build_version) {
