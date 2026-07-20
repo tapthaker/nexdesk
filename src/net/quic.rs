@@ -16,6 +16,7 @@ use crate::app::{
     ClientChannelDisposition, HandshakeMessage, PairingCompletion, PairingDecision, RestartReason,
     RetryPolicy, SessionExit, UpdateExecution, UpdatePolicy, UpdateSource,
 };
+use crate::clipboard::PlatformClipboard;
 use crate::input::inject::{InputInjector, InputInjectorFactory, PlatformInputInjectorFactory};
 use crate::input::wake::PlatformDisplaySessionControl;
 use crate::net::discovery;
@@ -29,9 +30,9 @@ use crate::net::transition::{ClientOutput, ClientTransition, ServerOutput, Serve
 use crate::net::update::{ExecutableUpdateInstaller, GithubReleaseRepository};
 use crate::ports::{
     ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand, ClientControlEvent,
-    ClientInputEvent, ClientPeerLink, ClientTransportEvent, DisplaySessionControl, PairingPrompt,
-    PeerDirection, PeerScreen, PeerScrollPhase, Release, ReleaseRepository, TrustStore,
-    UpdateInstaller,
+    ClientInputEvent, ClientPeerLink, ClientTransportEvent, Clipboard, DisplaySessionControl,
+    PairingPrompt, PeerDirection, PeerScreen, PeerScrollPhase, Release, ReleaseRepository,
+    TrustStore, UpdateInstaller,
 };
 use crate::status::{self, RuntimeStatus};
 
@@ -644,25 +645,34 @@ async fn handle_server_connection(
     let ft_conn = connection.clone();
     tokio::spawn(async move {
         loop {
-            match ft_conn.accept_bi().await {
-                Ok((send, recv)) => {
-                    tokio::spawn(async move {
-                        match crate::filetransfer::recv::receive_files(send, recv).await {
-                            Ok(paths) if !paths.is_empty() => {
-                                info!("Received {} file(s) from client", paths.len());
-                                tokio::task::spawn_blocking(move || {
-                                    crate::filetransfer::clipboard_files::set_clipboard_files(
-                                        &paths,
-                                    )
-                                    .ok();
-                                })
-                                .await
-                                .ok();
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                warn!("File transfer receive error: {}", e);
-                            }
+            tokio::select! {
+                result = ft_conn.accept_bi() => {
+                    match result {
+                        Ok((send, recv)) => {
+                            let Ok(permit) = ft_semaphore.clone().try_acquire_owned() else {
+                                warn!(
+                                    "Rejecting incoming file transfer: too many concurrent transfers (max {})",
+                                    MAX_CONCURRENT_FILE_TRANSFERS
+                                );
+                                continue;
+                            };
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                match crate::filetransfer::recv::receive_files(send, recv).await {
+                                    Ok(paths) if !paths.is_empty() => {
+                                        info!("Received {} file(s) from client", paths.len());
+                                        tokio::task::spawn_blocking(move || {
+                                            PlatformClipboard.write_files(&paths).ok();
+                                        })
+                                        .await
+                                        .ok();
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        warn!("File transfer receive error: {}", e);
+                                    }
+                                }
+                            });
                         }
                     });
                 }
@@ -736,9 +746,9 @@ async fn handle_server_connection(
                         let ft_conn = connection.clone();
                         tokio::spawn(async move {
                             let files = tokio::task::spawn_blocking(|| {
-                                crate::filetransfer::clipboard_files::get_clipboard_files()
+                                PlatformClipboard.read_files().ok()
                             }).await.ok().flatten();
-                            if let Some(files) = files {
+                            if let Some(files) = files.filter(|files| !files.is_empty()) {
                                 info!("Transferring {} clipboard file(s) to client", files.len());
                                 if let Err(e) = crate::filetransfer::send::send_files(&ft_conn, files).await {
                                     warn!("File transfer error: {}", e);
@@ -918,9 +928,9 @@ async fn handle_server_connection(
                         let ft_conn = connection.clone();
                         tokio::spawn(async move {
                             let files = tokio::task::spawn_blocking(|| {
-                                crate::filetransfer::clipboard_files::get_clipboard_files()
+                                PlatformClipboard.read_files().ok()
                             }).await.ok().flatten();
-                            if let Some(files) = files {
+                            if let Some(files) = files.filter(|files| !files.is_empty()) {
                                 info!("Transferring {} clipboard file(s) to client", files.len());
                                 if let Err(e) = crate::filetransfer::send::send_files(&ft_conn, files).await {
                                     warn!("File transfer error: {}", e);
@@ -1545,7 +1555,7 @@ async fn run_client_session(
                                     Ok(paths) if !paths.is_empty() => {
                                         info!("Received {} file(s) from server", paths.len());
                                         tokio::task::spawn_blocking(move || {
-                                            crate::filetransfer::clipboard_files::set_clipboard_files(&paths).ok();
+                                            PlatformClipboard.write_files(&paths).ok();
                                         }).await.ok();
                                     }
                                     Ok(_) => {}
@@ -1726,9 +1736,9 @@ async fn run_client_session(
                                 let ft_conn = connection.clone();
                                 tokio::spawn(async move {
                                     let files = tokio::task::spawn_blocking(|| {
-                                        crate::filetransfer::clipboard_files::get_clipboard_files()
+                                        PlatformClipboard.read_files().ok()
                                     }).await.ok().flatten();
-                                    if let Some(files) = files {
+                                    if let Some(files) = files.filter(|files| !files.is_empty()) {
                                         info!("Transferring {} clipboard file(s) to server", files.len());
                                         if let Err(e) = crate::filetransfer::send::send_files(&ft_conn, files).await {
                                             warn!("File transfer error: {}", e);
