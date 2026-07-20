@@ -87,6 +87,59 @@ pub enum ClientClipboardCommand {
     SetPeerText(String),
 }
 
+/// Logical server transport channels. The aliases deliberately share channel
+/// identity with the client side while retaining role-specific API names.
+pub type ServerChannel = ClientChannel;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServerControlEvent {
+    Heartbeat { timestamp: u64 },
+    SwitchBackRequested { direction: PeerDirection },
+    PeerScreenChanged(PeerScreen),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServerClipboardEvent {
+    TextChanged(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServerControlCommand {
+    AcknowledgeHeartbeat { timestamp: u64 },
+    LocalScreenChanged(PeerScreen),
+    WakePeerDisplay,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ServerInputCommand {
+    MouseMoved {
+        x: i32,
+        y: i32,
+    },
+    MouseButtonChanged {
+        button: u8,
+        pressed: bool,
+    },
+    MouseScrolled {
+        dx: f64,
+        dy: f64,
+        phase: PeerScrollPhase,
+    },
+    KeyChanged {
+        keycode: u32,
+        pressed: bool,
+        modifiers: u16,
+    },
+    SwitchToPeer {
+        direction: PeerDirection,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServerClipboardCommand {
+    SetPeerText(String),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransportFailure {
     pub channel: ClientChannel,
@@ -124,6 +177,25 @@ impl ClientTransportEvent {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum ServerTransportEvent {
+    Control(ServerControlEvent),
+    Clipboard(ServerClipboardEvent),
+    Closed(ServerChannel),
+    Failed(TransportFailure),
+}
+
+impl ServerTransportEvent {
+    pub fn channel(&self) -> ServerChannel {
+        match self {
+            Self::Control(_) => ServerChannel::Control,
+            Self::Clipboard(_) => ServerChannel::Clipboard,
+            Self::Closed(channel) => *channel,
+            Self::Failed(failure) => failure.channel,
+        }
+    }
+}
+
 /// Post-handshake client transport boundary.
 pub trait ClientPeerLink: Send + Sync {
     fn next_event(&self) -> TransportFuture<'_, Option<ClientTransportEvent>>;
@@ -131,6 +203,17 @@ pub trait ClientPeerLink: Send + Sync {
     fn send_control(&self, command: ClientControlCommand) -> TransportFuture<'_, Result<()>>;
 
     fn send_clipboard(&self, command: ClientClipboardCommand) -> TransportFuture<'_, Result<()>>;
+}
+
+/// Post-handshake server transport boundary.
+pub trait ServerPeerLink: Send + Sync {
+    fn next_event(&self) -> TransportFuture<'_, Option<ServerTransportEvent>>;
+
+    fn send_control(&self, command: ServerControlCommand) -> TransportFuture<'_, Result<()>>;
+
+    fn send_input(&self, command: ServerInputCommand) -> TransportFuture<'_, Result<()>>;
+
+    fn send_clipboard(&self, command: ServerClipboardCommand) -> TransportFuture<'_, Result<()>>;
 }
 
 #[cfg(test)]
@@ -156,10 +239,39 @@ mod tests {
         }
     }
 
+    struct ClosedServerLink;
+
+    impl ServerPeerLink for ClosedServerLink {
+        fn next_event(&self) -> TransportFuture<'_, Option<ServerTransportEvent>> {
+            Box::pin(async { None })
+        }
+
+        fn send_control(&self, _command: ServerControlCommand) -> TransportFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn send_input(&self, _command: ServerInputCommand) -> TransportFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn send_clipboard(
+            &self,
+            _command: ServerClipboardCommand,
+        ) -> TransportFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     #[test]
     fn client_peer_link_is_object_safe() {
         fn assert_object_safe(_: &dyn ClientPeerLink) {}
         assert_object_safe(&ClosedLink);
+    }
+
+    #[test]
+    fn server_peer_link_is_object_safe() {
+        fn assert_object_safe(_: &dyn ServerPeerLink) {}
+        assert_object_safe(&ClosedServerLink);
     }
 
     #[test]

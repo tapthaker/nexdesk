@@ -13,7 +13,9 @@ pub use status::StatusSink;
 pub use transport::{
     ClientChannel, ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand,
     ClientControlEvent, ClientInputEvent, ClientPeerLink, ClientTransportEvent, PeerDirection,
-    PeerScreen, PeerScrollPhase, TransportFailure, TransportFuture,
+    PeerScreen, PeerScrollPhase, ServerChannel, ServerClipboardCommand, ServerClipboardEvent,
+    ServerControlCommand, ServerControlEvent, ServerInputCommand, ServerPeerLink,
+    ServerTransportEvent, TransportFailure, TransportFuture,
 };
 pub use trust::TrustStore;
 pub use update::{

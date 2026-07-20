@@ -180,7 +180,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 ### T2.2 — Move server sessions onto typed transport
 
-- [ ] **T2.2.1** Build a Quinn server adapter producing the same typed peer-link abstraction.
+- [x] **T2.2.1** Build a Quinn server adapter producing the same typed peer-link abstraction.
 - [ ] **T2.2.2** Separate server handshake decisions from concrete streams.
 - [ ] **T2.2.3** Add server handshake scenarios for OTP, trusted certificates, absent certificates, version mismatch, malformed messages, and disconnects.
 - [ ] **T2.2.4** Move the server event loop to typed transport operations.
@@ -387,4 +387,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `9b90b79` | T2.1.3 | Injected capture creation through the server connection path. |
 | 2026-07-19 | `6f06fa3` | T2.1.4 | Added an injectable local graphical-session lock source. |
 | 2026-07-19 | `96e0332` | T2.1.5 | Routed server lock checks and display wake through platform ports. |
-| 2026-07-19 | this commit | T2.1.6 | Released local input before awaiting lock notifications. |
+| 2026-07-19 | `9e6382e` | T2.1.6 | Released local input before awaiting lock notifications. |
+| 2026-07-19 | this commit | T2.2.1 | Added a typed Quinn server peer-link adapter. |

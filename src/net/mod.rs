@@ -4,6 +4,7 @@ pub mod pairing;
 pub mod protocol;
 pub mod quic;
 pub(crate) mod quinn_client;
+pub(crate) mod quinn_server;
 pub mod tls;
 pub mod transition;
 pub mod update;
