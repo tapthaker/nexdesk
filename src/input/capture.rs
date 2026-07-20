@@ -30,8 +30,26 @@ pub trait InputCapture: Send {
     }
 }
 
+/// Factory boundary for creating an input capturer for one server connection.
+pub trait InputCaptureFactory: Send + Sync {
+    fn create(&self) -> Result<Box<dyn InputCapture>>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlatformInputCaptureFactory;
+
+impl InputCaptureFactory for PlatformInputCaptureFactory {
+    fn create(&self) -> Result<Box<dyn InputCapture>> {
+        create_platform_capturer()
+    }
+}
+
 /// Create a platform-appropriate input capturer.
 pub fn create_capturer() -> Result<Box<dyn InputCapture>> {
+    PlatformInputCaptureFactory.create()
+}
+
+fn create_platform_capturer() -> Result<Box<dyn InputCapture>> {
     #[cfg(target_os = "linux")]
     {
         // On Wayland, XQueryPointer returns stale data, so use evdev.
@@ -58,5 +76,46 @@ pub fn create_capturer() -> Result<Box<dyn InputCapture>> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(color_eyre::eyre::eyre!("Unsupported platform"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct StubCapturer;
+
+    impl InputCapture for StubCapturer {
+        fn mouse_position(&self) -> Result<(i32, i32)> {
+            Ok((100, 200))
+        }
+
+        fn screen_size(&self) -> Result<(u32, u32)> {
+            Ok((1920, 1080))
+        }
+
+        fn mouse_buttons(&self) -> Result<u8> {
+            Ok(0)
+        }
+
+        fn poll_key_events(&mut self) -> Result<Vec<Message>> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct StubFactory;
+
+    impl InputCaptureFactory for StubFactory {
+        fn create(&self) -> Result<Box<dyn InputCapture>> {
+            Ok(Box::new(StubCapturer))
+        }
+    }
+
+    #[test]
+    fn capture_factory_is_object_safe_and_creates_trait_objects() {
+        let factory: &dyn InputCaptureFactory = &StubFactory;
+        let capturer = factory.create().unwrap();
+        assert_eq!(capturer.mouse_position().unwrap(), (100, 200));
+        assert_eq!(capturer.screen_size().unwrap(), (1920, 1080));
     }
 }
