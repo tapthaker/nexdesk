@@ -12,7 +12,7 @@ use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use crate::app::{CancellationToken, RestartReason, RetryPolicy, SessionExit};
-use crate::input::inject::InputInjector;
+use crate::input::inject::{InputInjector, InputInjectorFactory, PlatformInputInjectorFactory};
 use crate::net::discovery;
 use crate::net::protocol::{self, Message, ScreenLayout, BUILD_VERSION, PROTOCOL_VERSION};
 use crate::net::tls;
@@ -1054,6 +1054,7 @@ trait ClientReconnectDriver {
 
 struct ProductionClientDriver {
     explicit_addr: Option<String>,
+    injector_factory: Arc<dyn InputInjectorFactory>,
 }
 
 struct ConnectedClient {
@@ -1089,7 +1090,12 @@ impl ClientReconnectDriver for ProductionClientDriver {
     }
 
     async fn run_session(&mut self, connected: Self::Connected) -> Result<SessionExit> {
-        run_client_session(connected.connection, connected.addr).await
+        run_client_session(
+            connected.connection,
+            connected.addr,
+            self.injector_factory.as_ref(),
+        )
+        .await
     }
 
     fn record_disconnected(&mut self, addr: SocketAddr) {
@@ -1191,9 +1197,20 @@ async fn connect_with_cancellation(
     addr: Option<&str>,
     cancellation: CancellationToken,
 ) -> Result<SessionExit> {
+    connect_with_dependencies(addr, cancellation, Arc::new(PlatformInputInjectorFactory)).await
+}
+
+async fn connect_with_dependencies(
+    addr: Option<&str>,
+    cancellation: CancellationToken,
+    injector_factory: Arc<dyn InputInjectorFactory>,
+) -> Result<SessionExit> {
     let explicit_addr = explicit_connect_addr_arg(addr)?;
     let _idle_sleep_inhibitor = crate::input::wake::inhibit_idle_system_sleep();
-    let mut driver = ProductionClientDriver { explicit_addr };
+    let mut driver = ProductionClientDriver {
+        explicit_addr,
+        injector_factory,
+    };
     run_client_reconnect_loop(&mut driver, RetryPolicy::default(), cancellation).await
 }
 
@@ -1201,6 +1218,7 @@ async fn connect_with_cancellation(
 async fn run_client_session(
     connection: quinn::Connection,
     addr: SocketAddr,
+    injector_factory: &dyn InputInjectorFactory,
 ) -> Result<SessionExit> {
     let tls_fingerprint = tls::peer_fingerprint(&connection)
         .ok_or_else(|| eyre!("Server did not present a certificate"))?;
@@ -1211,7 +1229,7 @@ async fn run_client_session(
     status::write_status(runtime).ok();
 
     // Create input injector early so we can send screen size in handshake
-    let mut injector = crate::input::inject::create_injector()?;
+    let mut injector = injector_factory.create()?;
     let (my_w, my_h) = injector.screen_size()?;
     info!("Local screen: {}x{}", my_w, my_h);
 
