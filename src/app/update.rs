@@ -1,4 +1,7 @@
-use crate::ports::Release;
+use color_eyre::eyre::Result;
+
+use super::RestartReason;
+use crate::ports::{Release, ReleaseRepository, UpdateInstaller};
 
 pub const MAX_RELEASE_VERSION_BYTES: usize = 64;
 
@@ -28,6 +31,12 @@ pub enum UpdateRejection {
 pub enum UpdateDecision {
     Install(Release),
     Ignore(UpdateRejection),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UpdateExecution {
+    Ignored(UpdateRejection),
+    RestartRequested(RestartReason),
 }
 
 /// Pure update eligibility policy, independent of release transport and local
@@ -60,6 +69,27 @@ impl UpdatePolicy {
         }
         UpdateDecision::Install(release)
     }
+}
+
+/// Apply policy and, only when eligible, stream and install the selected release.
+pub async fn execute_update(
+    policy: &UpdatePolicy,
+    release: Release,
+    source: UpdateSource,
+    repository: &dyn ReleaseRepository,
+    installer: &dyn UpdateInstaller,
+) -> Result<UpdateExecution> {
+    let release = match policy.evaluate(release, source) {
+        UpdateDecision::Install(release) => release,
+        UpdateDecision::Ignore(reason) => return Ok(UpdateExecution::Ignored(reason)),
+    };
+    let asset = repository.stream_asset(&release).await?;
+    installer.install(&release, asset).await?;
+    Ok(UpdateExecution::RestartRequested(
+        RestartReason::UpdateInstalled {
+            version: release.version,
+        },
+    ))
 }
 
 fn parse_semver(version: &str) -> Option<(u32, u32, u32)> {

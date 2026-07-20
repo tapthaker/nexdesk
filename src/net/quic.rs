@@ -11,9 +11,10 @@ use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use crate::app::{
-    client_pairing_decision, complete_client_pairing, require_handshake_message,
+    client_pairing_decision, complete_client_pairing, execute_update, require_handshake_message,
     validate_client_server_hello, CancellationToken, HandshakeMessage, PairingCompletion,
-    PairingDecision, RestartReason, RetryPolicy, SessionExit,
+    PairingDecision, RestartReason, RetryPolicy, SessionExit, UpdateExecution, UpdatePolicy,
+    UpdateSource,
 };
 use crate::input::inject::{InputInjector, InputInjectorFactory, PlatformInputInjectorFactory};
 use crate::input::wake::PlatformDisplaySessionControl;
@@ -23,7 +24,10 @@ use crate::net::protocol::{self, Message, ScreenLayout, BUILD_VERSION, PROTOCOL_
 use crate::net::tls;
 use crate::net::tls::ConfigTrustStore;
 use crate::net::transition::{ClientOutput, ClientTransition, ServerOutput, ServerTransition};
-use crate::ports::{DisplaySessionControl, PairingPrompt, TrustStore};
+use crate::net::update::{ExecutableUpdateInstaller, GithubReleaseRepository};
+use crate::ports::{
+    DisplaySessionControl, PairingPrompt, Release, ReleaseRepository, TrustStore, UpdateInstaller,
+};
 use crate::status::{self, RuntimeStatus};
 
 const DEFAULT_PORT: u16 = 4242;
@@ -320,21 +324,20 @@ fn system_time_millis_u64(time: std::time::SystemTime) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn should_attempt_client_update(server_build: &str) -> bool {
-    server_build != BUILD_VERSION
-        && crate::net::update::is_release_version(server_build)
-        && crate::net::update::is_newer(server_build, BUILD_VERSION)
-}
-
-fn update_restart_reason<E>(
+async fn attempt_client_update(
     server_build: &str,
-    update_result: &std::result::Result<(), E>,
-) -> Option<RestartReason> {
-    update_result
-        .is_ok()
-        .then(|| RestartReason::UpdateInstalled {
-            version: server_build.to_string(),
-        })
+    source: UpdateSource,
+    repository: &dyn ReleaseRepository,
+    installer: &dyn UpdateInstaller,
+) -> Result<UpdateExecution> {
+    execute_update(
+        &UpdatePolicy::new(BUILD_VERSION),
+        Release::new(server_build),
+        source,
+        repository,
+        installer,
+    )
+    .await
 }
 
 fn client_shutdown_exit(restart_for_latency: bool) -> SessionExit {
@@ -1092,6 +1095,8 @@ struct ProductionClientDriver {
     display_control: Arc<dyn DisplaySessionControl>,
     trust_store: Arc<dyn TrustStore>,
     pairing_prompt: Arc<dyn PairingPrompt>,
+    release_repository: Arc<dyn ReleaseRepository>,
+    update_installer: Arc<dyn UpdateInstaller>,
 }
 
 struct ConnectedClient {
@@ -1134,6 +1139,8 @@ impl ClientReconnectDriver for ProductionClientDriver {
             self.display_control.as_ref(),
             self.trust_store.as_ref(),
             self.pairing_prompt.as_ref(),
+            self.release_repository.as_ref(),
+            self.update_installer.as_ref(),
         )
         .await
     }
@@ -1244,6 +1251,8 @@ async fn connect_with_cancellation(
         Arc::new(PlatformDisplaySessionControl),
         Arc::new(ConfigTrustStore),
         Arc::new(TerminalPairingPrompt::new()),
+        Arc::new(GithubReleaseRepository),
+        Arc::new(ExecutableUpdateInstaller),
     )
     .await
 }
@@ -1255,6 +1264,8 @@ async fn connect_with_dependencies(
     display_control: Arc<dyn DisplaySessionControl>,
     trust_store: Arc<dyn TrustStore>,
     pairing_prompt: Arc<dyn PairingPrompt>,
+    release_repository: Arc<dyn ReleaseRepository>,
+    update_installer: Arc<dyn UpdateInstaller>,
 ) -> Result<SessionExit> {
     let explicit_addr = explicit_connect_addr_arg(addr)?;
     let _idle_sleep_inhibitor = display_control.inhibit_idle_sleep()?;
@@ -1264,6 +1275,8 @@ async fn connect_with_dependencies(
         display_control,
         trust_store,
         pairing_prompt,
+        release_repository,
+        update_installer,
     };
     run_client_reconnect_loop(&mut driver, RetryPolicy::default(), cancellation).await
 }
@@ -1276,6 +1289,8 @@ async fn run_client_session(
     display_control: &dyn DisplaySessionControl,
     trust_store: &dyn TrustStore,
     pairing_prompt: &dyn PairingPrompt,
+    release_repository: &dyn ReleaseRepository,
+    update_installer: &dyn UpdateInstaller,
 ) -> Result<SessionExit> {
     let tls_fingerprint = tls::peer_fingerprint(&connection)
         .ok_or_else(|| eyre!("Server did not present a certificate"))?;
@@ -1306,6 +1321,30 @@ async fn run_client_session(
     };
     let (version, hostname, screen, fingerprint, build_version) =
         require_handshake_message("Hello", hello)?;
+
+    if version != PROTOCOL_VERSION {
+        let source = if fingerprint == tls_fingerprint && trust_store.is_trusted(&fingerprint)? {
+            UpdateSource::TrustedPeer
+        } else {
+            UpdateSource::UntrustedPeer
+        };
+        let candidate = build_version.as_deref().unwrap_or("unknown");
+        match attempt_client_update(candidate, source, release_repository, update_installer).await {
+            Ok(UpdateExecution::RestartRequested(reason)) => {
+                info!(
+                    "Updated to {} after protocol mismatch. Restarting...",
+                    candidate
+                );
+                connection.close(0u32.into(), b"updating");
+                return Ok(SessionExit::RestartRequested(reason));
+            }
+            Ok(UpdateExecution::Ignored(_)) => {}
+            Err(error) => warn!(
+                "Self-update after protocol mismatch failed: {}. Rejecting incompatible peer.",
+                error
+            ),
+        }
+    }
 
     validate_client_server_hello(
         version,
@@ -1368,24 +1407,24 @@ async fn run_client_session(
     status::write_status(runtime).ok();
     let mut server_screen = screen;
 
-    // Auto-update only if server has a strictly newer clean release version
-    if should_attempt_client_update(&server_build_version) {
-        info!(
-            "Server has newer version {}, attempting self-update...",
-            server_build_version
-        );
-        let update_result = crate::net::update::self_update(&server_build_version).await;
-        if let Some(reason) = update_restart_reason(&server_build_version, &update_result) {
+    match attempt_client_update(
+        &server_build_version,
+        UpdateSource::TrustedPeer,
+        release_repository,
+        update_installer,
+    )
+    .await
+    {
+        Ok(UpdateExecution::RestartRequested(reason)) => {
             info!("Updated to {}. Restarting...", server_build_version);
             connection.close(0u32.into(), b"updating");
             return Ok(SessionExit::RestartRequested(reason));
         }
-        if let Err(e) = update_result {
-            warn!(
-                "Self-update failed: {}. Continuing with current version.",
-                e
-            );
-        }
+        Ok(UpdateExecution::Ignored(_)) => {}
+        Err(error) => warn!(
+            "Self-update failed: {}. Continuing with current version.",
+            error
+        ),
     }
 
     let mut transition = ClientTransition::new(my_w, my_h);
@@ -2393,24 +2432,36 @@ mod lifecycle_tests {
         assert!(!should_retry_resolution(None));
     }
 
-    #[test]
-    fn client_update_restart_requires_a_newer_clean_release_and_success() {
-        let newer = "v999.0.0";
-        assert!(should_attempt_client_update(newer));
-        assert!(!should_attempt_client_update(BUILD_VERSION));
-        assert!(!should_attempt_client_update("v0.0.0"));
-        assert!(!should_attempt_client_update("v999.0.0-dirty"));
-        assert!(!should_attempt_client_update("unknown"));
+    #[tokio::test]
+    async fn client_update_uses_injected_repository_and_installer() {
+        use crate::testing::{AssetStreamStep, FakeUpdateInstaller, ScriptedReleaseRepository};
 
-        let installed: std::result::Result<(), &str> = Ok(());
+        let repository = ScriptedReleaseRepository::new();
+        let installer = FakeUpdateInstaller::new();
+        repository.push_asset("v999.0.0", Some(3), [AssetStreamStep::bytes(b"bin")]);
+        installer.succeed_next();
+
         assert_eq!(
-            update_restart_reason(newer, &installed),
-            Some(RestartReason::UpdateInstalled {
-                version: newer.to_string(),
+            attempt_client_update(
+                "v999.0.0",
+                UpdateSource::TrustedPeer,
+                &repository,
+                &installer,
+            )
+            .await
+            .unwrap(),
+            UpdateExecution::RestartRequested(RestartReason::UpdateInstalled {
+                version: "v999.0.0".to_string(),
             })
         );
-        let failed = Err("download failed");
-        assert_eq!(update_restart_reason(newer, &failed), None);
+        assert_eq!(installer.installed_updates().len(), 1);
+
+        assert_eq!(
+            attempt_client_update("v0.0.0", UpdateSource::TrustedPeer, &repository, &installer,)
+                .await
+                .unwrap(),
+            UpdateExecution::Ignored(crate::app::UpdateRejection::NotNewer)
+        );
     }
 
     #[test]

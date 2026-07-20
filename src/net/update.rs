@@ -1,8 +1,17 @@
+use std::io;
+use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
 use color_eyre::eyre::{eyre, Result};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::app::MAX_RELEASE_VERSION_BYTES;
 pub use crate::app::{is_newer, is_release_version};
+use crate::ports::{Release, ReleaseAsset, ReleaseRepository, UpdateFuture, UpdateInstaller};
 
 const MAX_UPDATE_SIZE: u64 = 100 * 1024 * 1024;
 const MAX_RELEASE_API_RESPONSE_SIZE: u64 = 64 * 1024;
@@ -43,73 +52,215 @@ fn safe_release_tag_for_error(version: &str) -> String {
     crate::status::terminal_safe(version, MAX_RELEASE_TAG_BYTES)
 }
 
-/// Downloads the target version binary from GitHub releases and replaces the
-/// current executable. Returns `Ok(())` on success — caller decides whether
-/// to restart.
+/// GitHub-backed release metadata and executable asset repository.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GithubReleaseRepository;
+
+impl ReleaseRepository for GithubReleaseRepository {
+    fn latest_release(&self) -> UpdateFuture<'_, Release> {
+        Box::pin(async { check_latest_version().await.map(Release::new) })
+    }
+
+    fn stream_asset<'a>(&'a self, release: &'a Release) -> UpdateFuture<'a, ReleaseAsset> {
+        Box::pin(async move {
+            if !is_release_version(&release.version) {
+                return Err(eyre!(
+                    "Not a clean release version: {}",
+                    safe_release_tag_for_error(&release.version)
+                ));
+            }
+            let platform = platform_slug().ok_or_else(|| {
+                eyre!(
+                    "Unsupported platform: {}-{}",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                )
+            })?;
+            let url = format!(
+                "https://github.com/tapthaker/nexdesk/releases/download/{}/nexdesk-{}",
+                release.version, platform
+            );
+            info!("Downloading update from {}", url);
+            let client = reqwest::Client::builder()
+                .user_agent("nexdesk")
+                .timeout(UPDATE_HTTP_TIMEOUT)
+                .build()
+                .map_err(|e| eyre!("Failed to build HTTP client: {}", e))?;
+            let response = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| eyre!("Failed to download update: {}", e))?;
+            if !response.status().is_success() {
+                return Err(eyre!("Download failed with HTTP {}", response.status()));
+            }
+            let declared_size = response.content_length();
+            if declared_size.is_some_and(|length| length > MAX_UPDATE_SIZE) {
+                return Err(eyre!(
+                    "Downloaded binary is too large: {} bytes (max {})",
+                    declared_size.expect("declared size was checked"),
+                    MAX_UPDATE_SIZE
+                ));
+            }
+
+            let (sender, receiver) = mpsc::channel(1);
+            tokio::spawn(pump_response(response, sender));
+            Ok(ReleaseAsset::new(
+                declared_size,
+                Box::pin(HttpAssetReader {
+                    receiver,
+                    current: None,
+                }),
+            ))
+        })
+    }
+}
+
+async fn pump_response(mut response: reqwest::Response, sender: mpsc::Sender<io::Result<Vec<u8>>>) {
+    loop {
+        let item = match response.chunk().await {
+            Ok(Some(chunk)) => Ok(chunk.to_vec()),
+            Ok(None) => break,
+            Err(error) => Err(io::Error::other(format!(
+                "Failed to read response body: {error}"
+            ))),
+        };
+        let failed = item.is_err();
+        if sender.send(item).await.is_err() || failed {
+            break;
+        }
+    }
+}
+
+struct HttpAssetReader {
+    receiver: mpsc::Receiver<io::Result<Vec<u8>>>,
+    current: Option<(Vec<u8>, usize)>,
+}
+
+impl AsyncRead for HttpAssetReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if buffer.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        loop {
+            if let Some((bytes, offset)) = &mut this.current {
+                let count = buffer.remaining().min(bytes.len().saturating_sub(*offset));
+                if count == 0 {
+                    this.current = None;
+                    continue;
+                }
+                buffer.put_slice(&bytes[*offset..*offset + count]);
+                *offset += count;
+                if *offset == bytes.len() {
+                    this.current = None;
+                }
+                return Poll::Ready(Ok(()));
+            }
+            match Pin::new(&mut this.receiver).poll_recv(cx) {
+                Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => continue,
+                Poll::Ready(Some(Ok(bytes))) => this.current = Some((bytes, 0)),
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error)),
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+/// Production installer that atomically replaces the current executable.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExecutableUpdateInstaller;
+
+impl UpdateInstaller for ExecutableUpdateInstaller {
+    fn install<'a>(&'a self, release: &'a Release, asset: ReleaseAsset) -> UpdateFuture<'a, ()> {
+        Box::pin(async move {
+            if asset
+                .declared_size
+                .is_some_and(|length| length > MAX_UPDATE_SIZE)
+            {
+                return Err(eyre!(
+                    "Downloaded binary is too large: {} bytes (max {})",
+                    asset.declared_size.expect("declared size was checked"),
+                    MAX_UPDATE_SIZE
+                ));
+            }
+            let exe_path = std::env::current_exe()
+                .map_err(|e| eyre!("Failed to get current exe path: {}", e))?;
+            let exe_dir = exe_path
+                .parent()
+                .ok_or_else(|| eyre!("Current exe has no parent directory"))?;
+            let (mut file, tmp_path) = create_update_temp_file(exe_dir)?;
+            let mut reader = asset.into_reader();
+            let mut buffer = vec![0u8; 64 * 1024];
+            let mut downloaded = 0u64;
+            loop {
+                let read = reader
+                    .read(&mut buffer)
+                    .await
+                    .map_err(|e| eyre!("Failed to read response body: {}", e))?;
+                if read == 0 {
+                    break;
+                }
+                downloaded = checked_downloaded_size(downloaded, read)?;
+                if downloaded > MAX_UPDATE_SIZE {
+                    return Err(eyre!(
+                        "Downloaded binary exceeded max size: {} bytes (max {})",
+                        downloaded,
+                        MAX_UPDATE_SIZE
+                    ));
+                }
+                file.write_all(&buffer[..read])
+                    .await
+                    .map_err(|e| eyre!("Failed to write temp file: {}", e))?;
+            }
+            file.flush()
+                .await
+                .map_err(|e| eyre!("Failed to flush temp file: {}", e))?;
+            file.sync_all()
+                .await
+                .map_err(|e| eyre!("Failed to sync temp update file: {}", e))?;
+            drop(file);
+            if downloaded == 0 {
+                return Err(eyre!("Downloaded binary is empty"));
+            }
+            info!("Downloaded {} bytes", downloaded);
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
+                    .map_err(|e| eyre!("Failed to set permissions: {}", e))?;
+                sync_file_path(&tmp_path)
+                    .map_err(|e| eyre!("Failed to sync executable permissions: {}", e))?;
+            }
+
+            tmp_path
+                .persist(&exe_path)
+                .map_err(|e| eyre!("Failed to replace executable: {}", e.error))?;
+            sync_directory(exe_dir).map_err(|e| {
+                eyre!(
+                    "Failed to sync executable directory after update ({}): {}",
+                    exe_dir.display(),
+                    e
+                )
+            })?;
+            info!("Successfully updated to {}", release.version);
+            Ok(())
+        })
+    }
+}
+
+/// Downloads the target version and atomically replaces the current executable.
 pub async fn self_update(target_version: &str) -> Result<()> {
-    if !is_release_version(target_version) {
-        return Err(eyre!("Not a clean release version: {}", target_version));
-    }
-
-    let platform = platform_slug().ok_or_else(|| {
-        eyre!(
-            "Unsupported platform: {}-{}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        )
-    })?;
-
-    let url = format!(
-        "https://github.com/tapthaker/nexdesk/releases/download/{}/nexdesk-{}",
-        target_version, platform
-    );
-    info!("Downloading update from {}", url);
-
-    let response = reqwest::get(&url)
-        .await
-        .map_err(|e| eyre!("Failed to download update: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(eyre!("Download failed with HTTP {}", response.status()));
-    }
-
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| eyre!("Failed to read response body: {}", e))?;
-
-    if bytes.is_empty() {
-        return Err(eyre!("Downloaded binary is empty"));
-    }
-
-    info!("Downloaded {} bytes", bytes.len());
-
-    let exe_path =
-        std::env::current_exe().map_err(|e| eyre!("Failed to get current exe path: {}", e))?;
-
-    let exe_dir = exe_path
-        .parent()
-        .ok_or_else(|| eyre!("Current exe has no parent directory"))?;
-
-    let tmp_path = exe_dir.join(".nexdesk-update.tmp");
-
-    // Write to temp file
-    std::fs::write(&tmp_path, &bytes).map_err(|e| eyre!("Failed to write temp file: {}", e))?;
-
-    // Set executable permissions
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| eyre!("Failed to set permissions: {}", e))?;
-    }
-
-    // Atomic replace
-    std::fs::rename(&tmp_path, &exe_path)
-        .map_err(|e| eyre!("Failed to replace executable: {}", e))?;
-
-    info!("Successfully updated to {}", target_version);
-    Ok(())
+    let release = Release::new(target_version);
+    let repository = GithubReleaseRepository;
+    let asset = repository.stream_asset(&release).await?;
+    ExecutableUpdateInstaller.install(&release, asset).await
 }
 
 /// Fetches the latest release tag from GitHub (e.g. "v0.1.8").
