@@ -203,7 +203,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 ### T3.1 — Discovery
 
-- [ ] **T3.1.1** Introduce a discovery interface supporting browse streams and single-peer resolution.
+- [x] **T3.1.1** Introduce a discovery interface supporting browse streams and single-peer resolution.
 - [ ] **T3.1.2** Adapt `mdns-sd` behind the production discovery adapter.
 - [ ] **T3.1.3** Add scripted discovery with delayed peers, malformed peers, closure, and failures.
 - [ ] **T3.1.4** Test discovery retry, timeout, cancellation, deduplication, and address selection with virtual time.
@@ -400,4 +400,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `982f648` | T2.3.4 | Covered local locking during polling and layer-shell sharing. |
 | 2026-07-19 | `a3c6019` | T2.3.5 | Covered blocked sends, capture failure, resize, and disconnect. |
 | 2026-07-19 | `0b730d8` | T2.3.6 | Centralized server exit cleanup for grabs and remote input. |
-| 2026-07-19 | this commit | T2.3.7 | Asserted server transport and background tasks terminate. |
+| 2026-07-19 | `79049e5` | T2.3.7 | Asserted server transport and background tasks terminate. |
+| 2026-07-19 | this commit | T3.1.1 | Added typed peer discovery and browse-stream ports. |

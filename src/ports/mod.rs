@@ -1,4 +1,5 @@
 mod clipboard;
+mod discovery;
 mod pairing;
 mod platform;
 mod status;
@@ -7,6 +8,9 @@ mod trust;
 mod update;
 
 pub use clipboard::Clipboard;
+pub use discovery::{
+    DiscoveredPeer, DiscoveryBrowse, DiscoveryEvent, DiscoveryFuture, PeerDiscovery,
+};
 pub use pairing::{PairingPrompt, PairingPromptFuture};
 pub use platform::{DisplaySessionControl, LocalSessionLockSource, SleepInhibitor};
 pub use status::StatusSink;
