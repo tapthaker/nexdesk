@@ -215,7 +215,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T3.2.2** Add repository interfaces only around operations requiring fault injection; retain real temp filesystem semantics otherwise.
 - [x] **T3.2.3** Add atomic-write failure tests covering create, write, flush, sync, persist, and directory-sync stages.
 - [x] **T3.2.4** Add concurrent trust/config update tests.
-- [ ] **T3.2.5** Add stale, corrupt, oversized, permission, and process-reuse status scenarios.
+- [x] **T3.2.5** Add stale, corrupt, oversized, permission, and process-reuse status scenarios.
 
 ### T3.3 — Service manager and command execution
 
@@ -409,4 +409,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `236fec5` | T3.2.1 | Made config, certificate, and status paths explicitly injectable. |
 | 2026-07-19 | `cc26bcb` | T3.2.2 | Added semantic atomic-file storage while retaining real temporary files. |
 | 2026-07-19 | `f5f5a9f` | T3.2.3 | Covered every durable atomic-write failure stage. |
-| 2026-07-19 | this commit | T3.2.4 | Serialized concurrent trust/config updates without lost entries. |
+| 2026-07-19 | `d659da8` | T3.2.4 | Serialized concurrent trust/config updates without lost entries. |
+| 2026-07-19 | this commit | T3.2.5 | Bounded stale, corrupt, oversized, unreadable, and reused-process statuses. |

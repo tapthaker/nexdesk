@@ -9,6 +9,7 @@ use crate::ports::{AtomicFileStore, RealAtomicFileStore, StatusSink};
 
 pub const MAX_STATUS_DISPLAY_BYTES: usize = 1024;
 pub const MAX_COMMAND_OUTPUT_DISPLAY_BYTES: usize = 64 * 1024;
+pub const MAX_STATUS_FILE_BYTES: u64 = 1024 * 1024;
 
 pub fn terminal_safe(value: &str, max_bytes: usize) -> String {
     terminal_safe_with(value, max_bytes, |_| false)
@@ -110,9 +111,37 @@ pub fn load_status_at(path: &std::path::Path) -> Result<Option<RuntimeStatus>> {
     if !path.exists() {
         return Ok(None);
     }
+    let metadata = std::fs::metadata(path)
+        .wrap_err_with(|| format!("Failed to inspect runtime status: {}", path.display()))?;
+    if metadata.len() > MAX_STATUS_FILE_BYTES {
+        return Err(color_eyre::eyre::eyre!(
+            "Runtime status file is too large: {} bytes",
+            metadata.len()
+        ));
+    }
     let contents = std::fs::read_to_string(path)
         .wrap_err_with(|| format!("Failed to read runtime status: {}", path.display()))?;
     let status = serde_json::from_str(&contents).wrap_err("Failed to parse runtime status")?;
+    Ok(Some(status))
+}
+
+pub fn load_status_with_policy(
+    path: &std::path::Path,
+    now: u64,
+    max_age_secs: u64,
+    current_process_started_at: Option<u64>,
+) -> Result<Option<RuntimeStatus>> {
+    let Some(status) = load_status_at(path)? else {
+        return Ok(None);
+    };
+    if now.saturating_sub(status.updated_at) > max_age_secs {
+        return Ok(None);
+    }
+    if status.pid == std::process::id()
+        && current_process_started_at.is_some_and(|started| status.updated_at < started)
+    {
+        return Ok(None);
+    }
     Ok(Some(status))
 }
 
@@ -126,6 +155,61 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_raw_status(path: &std::path::Path, updated_at: u64, pid: u32) {
+        let mut status = RuntimeStatus::new("server", "ready");
+        status.updated_at = updated_at;
+        status.pid = pid;
+        std::fs::write(path, serde_json::to_vec(&status).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn stale_corrupt_oversized_and_process_reuse_statuses_are_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("status.json");
+
+        write_raw_status(&path, 10, 100);
+        assert!(load_status_with_policy(&path, 100, 30, None)
+            .unwrap()
+            .is_none());
+
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(load_status_at(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("parse"));
+
+        std::fs::write(&path, vec![b'x'; MAX_STATUS_FILE_BYTES as usize + 1]).unwrap();
+        assert!(load_status_at(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("too large"));
+
+        write_raw_status(&path, 50, std::process::id());
+        assert!(load_status_with_policy(&path, 60, 30, Some(55))
+            .unwrap()
+            .is_none());
+        assert!(load_status_with_policy(&path, 60, 30, Some(45))
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_status_reports_permission_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("status.json");
+        write_raw_status(&path, 10, 100);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = load_status_at(&path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        if let Err(error) = result {
+            assert!(error.to_string().contains("read runtime status"));
+        }
+    }
 
     #[test]
     fn runtime_status_can_use_an_explicit_temporary_path() {
