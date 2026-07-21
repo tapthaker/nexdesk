@@ -1,4 +1,5 @@
 mod clipboard;
+mod command;
 mod discovery;
 mod pairing;
 mod persistence;
@@ -9,6 +10,7 @@ mod trust;
 mod update;
 
 pub use clipboard::Clipboard;
+pub use command::{CommandOutput, CommandRequest, CommandRunner};
 pub use discovery::{
     DiscoveredPeer, DiscoveryBrowse, DiscoveryEvent, DiscoveryFuture, PeerDiscovery,
 };
