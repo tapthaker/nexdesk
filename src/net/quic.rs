@@ -268,6 +268,12 @@ fn server_session_is_locked(lock_source: &dyn LocalSessionLockSource) -> bool {
     }
 }
 
+fn require_layer_shell_event(
+    event: Option<crate::input::wayland_layer_shell::LayerShellEvent>,
+) -> Result<crate::input::wayland_layer_shell::LayerShellEvent> {
+    event.ok_or_else(|| eyre!("layer-shell capture stopped"))
+}
+
 fn inject_with_timing(
     injector: &mut dyn InputInjector,
     msg: &Message,
@@ -1170,13 +1176,20 @@ async fn handle_server_connection(
                 }
             }
             // Branch: Layer-shell events (only when layer-shell is active)
-            Some(event) = async {
+            event = async {
                 match &mut capture_rx {
                     Some(rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }
             }, if use_layer_shell => {
                 use crate::input::wayland_layer_shell::{LayerShellEvent, LayerShellCommand};
+                let event = match require_layer_shell_event(event) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        warn!("{}; ending the connection so capture can be recreated", error);
+                        break;
+                    }
+                };
                 send_user_activity(peer.as_ref(), &mut last_user_activity_sent).await;
 
                 match event {
@@ -2862,6 +2875,13 @@ mod lifecycle_tests {
             poll.await.unwrap().unwrap(),
             Some(Message::ClipboardUpdate { .. })
         ));
+    }
+
+    #[test]
+    fn closed_layer_shell_capture_ends_the_server_session() {
+        let error = require_layer_shell_event(None).unwrap_err();
+
+        assert_eq!(error.to_string(), "layer-shell capture stopped");
     }
 
     #[tokio::test]
