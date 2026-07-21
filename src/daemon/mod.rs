@@ -1,4 +1,4 @@
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub mod launchagent;
 
 #[cfg(target_os = "linux")]

@@ -55,52 +55,62 @@ fn plist_content(args: &[&str]) -> String {
 }
 
 pub fn start() -> Result<()> {
-    let path = plist_path();
+    start_with_runner(&RealCommandRunner, &plist_path(), current_uid())
+}
+
+fn start_with_runner(runner: &dyn CommandRunner, path: &std::path::Path, uid: u32) -> Result<()> {
     if !path.is_file() {
         return Err(eyre!(
             "nexdesk daemon is not installed; run `nexdesk setup` first"
         ));
     }
 
-    let uid = current_uid();
     let domain = format!("gui/{uid}");
     let service = format!("{domain}/{LABEL}");
 
-    if command_stdout("launchctl", &["print", &service]).is_err() {
-        run_launchctl(&["bootstrap", &domain, path.to_string_lossy().as_ref()])
-            .wrap_err("Failed to load nexdesk daemon")?;
+    if command_stdout_with_runner(runner, "launchctl", &["print", &service]).is_err() {
+        run_launchctl_with_runner(
+            runner,
+            &["bootstrap", &domain, path.to_string_lossy().as_ref()],
+        )
+        .wrap_err("Failed to load nexdesk daemon")?;
     }
-    run_launchctl(&["enable", &service]).wrap_err("Failed to enable nexdesk daemon")?;
-    run_launchctl(&["kickstart", &service]).wrap_err("Failed to start nexdesk daemon")?;
+    run_launchctl_with_runner(runner, &["enable", &service])
+        .wrap_err("Failed to enable nexdesk daemon")?;
+    run_launchctl_with_runner(runner, &["kickstart", &service])
+        .wrap_err("Failed to start nexdesk daemon")?;
 
     println!("nexdesk daemon started");
     Ok(())
 }
 
 pub fn stop() -> Result<()> {
-    if !plist_path().is_file() {
+    stop_with_runner(&RealCommandRunner, &plist_path(), current_uid())
+}
+
+fn stop_with_runner(runner: &dyn CommandRunner, path: &std::path::Path, uid: u32) -> Result<()> {
+    if !path.is_file() {
         return Err(eyre!(
             "nexdesk daemon is not installed; run `nexdesk setup` first"
         ));
     }
 
-    let uid = current_uid();
     let service = format!("gui/{uid}/{LABEL}");
 
-    if command_stdout("launchctl", &["print", &service]).is_err() {
+    if command_stdout_with_runner(runner, "launchctl", &["print", &service]).is_err() {
         println!("nexdesk daemon is already stopped");
         return Ok(());
     }
 
-    run_launchctl(&["bootout", &service]).wrap_err("Failed to stop nexdesk daemon")?;
+    run_launchctl_with_runner(runner, &["bootout", &service])
+        .wrap_err("Failed to stop nexdesk daemon")?;
     println!("nexdesk daemon stopped");
     Ok(())
 }
 
 pub fn print_status() -> Result<()> {
     let uid = current_uid();
-    let service = format!("gui/{uid}/{LABEL}");
-    let loaded = command_stdout("launchctl", &["print", &service]).is_ok();
+    let loaded = service_loaded_with_runner(&RealCommandRunner, uid);
     let process = command_stdout("pgrep", &["-a", "nexdesk"]).ok();
     let listener = command_stdout("sh", &["-c", "lsof -nP -iUDP:4242 2>/dev/null || true"])
         .unwrap_or_default();
@@ -147,7 +157,16 @@ pub fn print_logs() -> Result<()> {
 }
 
 pub fn install(args: &[&str]) -> Result<()> {
-    let path = plist_path();
+    install_with_runner(args, &plist_path(), current_uid(), &RealCommandRunner)
+}
+
+fn install_with_runner(
+    args: &[&str],
+    path: &std::path::Path,
+    uid: u32,
+    runner: &dyn CommandRunner,
+) -> Result<()> {
+    let path = path.to_path_buf();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).wrap_err("Failed to create LaunchAgents directory")?;
     }
@@ -155,15 +174,22 @@ pub fn install(args: &[&str]) -> Result<()> {
 
     info!("Installed LaunchAgent at {}", path.display());
 
-    let uid = current_uid();
     let domain = format!("gui/{uid}");
     let service = format!("{domain}/{LABEL}");
 
-    let _ = run_launchctl(&["bootout", &domain, path.to_string_lossy().as_ref()]);
-    run_launchctl(&["bootstrap", &domain, path.to_string_lossy().as_ref()])
-        .wrap_err("Failed to bootstrap LaunchAgent")?;
-    run_launchctl(&["enable", &service]).wrap_err("Failed to enable LaunchAgent")?;
-    run_launchctl(&["kickstart", "-k", &service]).wrap_err("Failed to start LaunchAgent")?;
+    let _ = run_launchctl_with_runner(
+        runner,
+        &["bootout", &domain, path.to_string_lossy().as_ref()],
+    );
+    run_launchctl_with_runner(
+        runner,
+        &["bootstrap", &domain, path.to_string_lossy().as_ref()],
+    )
+    .wrap_err("Failed to bootstrap LaunchAgent")?;
+    run_launchctl_with_runner(runner, &["enable", &service])
+        .wrap_err("Failed to enable LaunchAgent")?;
+    run_launchctl_with_runner(runner, &["kickstart", "-k", &service])
+        .wrap_err("Failed to start LaunchAgent")?;
 
     info!("Loaded and started LaunchAgent {}", LABEL);
 
@@ -194,6 +220,11 @@ fn print_connection_summary() {
         }
         None => println!("Connected: unknown"),
     }
+}
+
+fn service_loaded_with_runner(runner: &dyn CommandRunner, uid: u32) -> bool {
+    let service = format!("gui/{uid}/{LABEL}");
+    command_stdout_with_runner(runner, "launchctl", &["print", &service]).is_ok()
 }
 
 fn command_stdout(program: &str, args: &[&str]) -> Result<String> {
@@ -242,4 +273,50 @@ fn run_launchctl(args: &[&str]) -> Result<()> {
 
 fn run_launchctl_with_runner(runner: &dyn CommandRunner, args: &[&str]) -> Result<()> {
     run_checked(runner, "launchctl", args).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ports::CommandOutput;
+    use crate::testing::{CommandObservation, ScriptedCommandRunner};
+
+    fn success() -> CommandOutput {
+        CommandOutput {
+            success: true,
+            code: Some(0),
+            signal: None,
+            stdout: b"loaded".to_vec(),
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        }
+    }
+
+    #[test]
+    fn launchd_install_start_stop_and_status_use_only_scripted_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let plist = temp.path().join("agent.plist");
+        let runner = ScriptedCommandRunner::new();
+        for _ in 0..10 {
+            runner.push_output(success());
+        }
+
+        install_with_runner(&["connect", "192.0.2.1:4242"], &plist, 501, &runner).unwrap();
+        start_with_runner(&runner, &plist, 501).unwrap();
+        stop_with_runner(&runner, &plist, 501).unwrap();
+        assert!(service_loaded_with_runner(&runner, 501));
+
+        assert_eq!(runner.remaining_actions(), 0);
+        assert_eq!(
+            runner
+                .observations()
+                .snapshot()
+                .into_iter()
+                .filter(|entry| matches!(entry.event, CommandObservation::Run(_)))
+                .count(),
+            10
+        );
+        assert!(plist.is_file());
+    }
 }
