@@ -1,6 +1,7 @@
 pub mod app;
 pub mod cli;
 mod clipboard;
+mod command;
 mod config;
 mod cursor;
 mod daemon;

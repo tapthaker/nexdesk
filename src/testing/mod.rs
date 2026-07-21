@@ -7,6 +7,7 @@ mod observation;
 mod recording_injector;
 mod recording_status;
 mod scripted_capturer;
+mod scripted_command_runner;
 mod scripted_discovery;
 mod scripted_pairing_prompt;
 mod scripted_peer_link;
@@ -38,6 +39,7 @@ pub use recording_status::RecordingStatusSink;
 pub use scripted_capturer::{
     CaptureObservation, CaptureOperation, GrabChange, ScriptedCaptureFactory, ScriptedCapturer,
 };
+pub use scripted_command_runner::{BlockingCommand, CommandObservation, ScriptedCommandRunner};
 pub use scripted_discovery::{DiscoveryObservation, ScriptedDiscovery};
 pub use scripted_pairing_prompt::{PairingPromptObservation, ScriptedPairingPrompt};
 pub use scripted_peer_link::{
