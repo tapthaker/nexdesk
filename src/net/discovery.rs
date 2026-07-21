@@ -20,10 +20,8 @@ fn local_ipv4() -> Option<String> {
     }
 }
 
-fn preferred_service_addr(info: &ServiceInfo) -> Option<SocketAddr> {
-    let port = info.get_port();
-    let addresses = info.get_addresses();
-
+fn preferred_addr(addresses: impl IntoIterator<Item = IpAddr>, port: u16) -> Option<SocketAddr> {
+    let addresses = addresses.into_iter().collect::<Vec<_>>();
     let selected = addresses
         .iter()
         .copied()
@@ -33,9 +31,12 @@ fn preferred_service_addr(info: &ServiceInfo) -> Option<SocketAddr> {
                 matches!(addr, IpAddr::V6(v6) if !v6.is_loopback() && !v6.is_unspecified() && !v6.is_unicast_link_local())
             })
         })
-        .or_else(|| addresses.iter().copied().next())?;
-
+        .or_else(|| addresses.first().copied())?;
     Some(SocketAddr::new(selected, port))
+}
+
+fn preferred_service_addr(info: &ServiceInfo) -> Option<SocketAddr> {
+    preferred_addr(info.get_addresses().iter().copied(), info.get_port())
 }
 
 /// Advertise this machine on the local network via mDNS.
@@ -270,37 +271,20 @@ impl PeerDiscovery for MdnsDiscovery {
     }
 
     fn resolve_one(&self, timeout: Duration) -> DiscoveryFuture<'_, Result<SocketAddr>> {
-        Box::pin(async move { mdns_resolve_one(timeout).await })
+        Box::pin(async move { discover_one_attempt(timeout).await })
     }
 }
 
 /// Discover the first nexdesk server on the LAN.
 /// Returns its socket address or an error if none found within `timeout`.
 pub async fn discover_one(timeout: Duration) -> Result<SocketAddr> {
-    MdnsDiscovery.resolve_one(timeout).await
-}
-
-async fn mdns_resolve_one(timeout: Duration) -> Result<SocketAddr> {
-    let attempts = 3;
-    let per_attempt = timeout
-        .checked_div(attempts)
-        .filter(|duration| !duration.is_zero())
-        .unwrap_or(timeout);
-
-    for attempt in 1..=attempts {
-        match discover_one_attempt(per_attempt).await {
-            Ok(addr) => return Ok(addr),
-            Err(e) if attempt < attempts => {
-                debug!(
-                    "mDNS discovery attempt {}/{} failed: {}. Restarting browse session...",
-                    attempt, attempts, e
-                );
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    Err(eyre!("No nexdesk server found within {:?}", timeout))
+    crate::app::resolve_peer_with_retry(
+        &MdnsDiscovery,
+        timeout,
+        3,
+        &crate::app::CancellationToken::new(),
+    )
+    .await
 }
 
 async fn discover_one_attempt(timeout: Duration) -> Result<SocketAddr> {
@@ -339,6 +323,25 @@ async fn discover_one_attempt(timeout: Duration) -> Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_selection_prefers_routable_ipv4_then_ipv6_then_fallback() {
+        let loopback = "127.0.0.1".parse().unwrap();
+        let ipv6 = "2001:db8::1".parse().unwrap();
+        let ipv4 = "192.0.2.1".parse().unwrap();
+        assert_eq!(
+            preferred_addr([loopback, ipv6, ipv4], 4242).unwrap(),
+            "192.0.2.1:4242".parse().unwrap()
+        );
+        assert_eq!(
+            preferred_addr([loopback, ipv6], 4242).unwrap(),
+            "[2001:db8::1]:4242".parse().unwrap()
+        );
+        assert_eq!(
+            preferred_addr([loopback], 4242).unwrap(),
+            "127.0.0.1:4242".parse().unwrap()
+        );
+    }
 
     #[test]
     fn mdns_adapter_implements_discovery_port() {

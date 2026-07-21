@@ -1,5 +1,6 @@
 mod cancellation;
 mod client_transport;
+mod discovery;
 mod handshake;
 mod reconnect;
 mod server_transport;
@@ -8,6 +9,7 @@ mod update;
 
 pub use cancellation::CancellationToken;
 pub use client_transport::{client_channel_disposition, ClientChannelDisposition};
+pub use discovery::{resolve_peer_with_retry, DiscoveredPeerSet};
 pub(crate) use handshake::{
     client_pairing_decision, complete_client_pairing, decide_server_handshake,
     require_handshake_message, require_server_certificate_fingerprint,
