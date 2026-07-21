@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use color_eyre::eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
 
-use crate::config::NexdeskConfig;
+use crate::config::PersistenceRoots;
 use crate::ports::StatusSink;
 
 pub const MAX_STATUS_DISPLAY_BYTES: usize = 1024;
@@ -68,7 +68,9 @@ impl RuntimeStatus {
 }
 
 pub fn status_path() -> Result<PathBuf> {
-    Ok(NexdeskConfig::config_dir()?.join("runtime-status.json"))
+    let roots = PersistenceRoots::production()?;
+    roots.ensure_config_root()?;
+    Ok(roots.status_path())
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -80,9 +82,12 @@ impl StatusSink for FileStatusSink {
     }
 }
 
-pub fn write_status(mut status: RuntimeStatus) -> Result<()> {
+pub fn write_status(status: RuntimeStatus) -> Result<()> {
+    write_status_at(&status_path()?, status)
+}
+
+pub fn write_status_at(path: &std::path::Path, mut status: RuntimeStatus) -> Result<()> {
     status.updated_at = now_secs();
-    let path = status_path()?;
     let bytes = serde_json::to_vec_pretty(&status).wrap_err("Failed to encode runtime status")?;
     std::fs::write(&path, bytes)
         .wrap_err_with(|| format!("Failed to write runtime status: {}", path.display()))?;
@@ -90,11 +95,14 @@ pub fn write_status(mut status: RuntimeStatus) -> Result<()> {
 }
 
 pub fn load_status() -> Result<Option<RuntimeStatus>> {
-    let path = status_path()?;
+    load_status_at(&status_path()?)
+}
+
+pub fn load_status_at(path: &std::path::Path) -> Result<Option<RuntimeStatus>> {
     if !path.exists() {
         return Ok(None);
     }
-    let contents = std::fs::read_to_string(&path)
+    let contents = std::fs::read_to_string(path)
         .wrap_err_with(|| format!("Failed to read runtime status: {}", path.display()))?;
     let status = serde_json::from_str(&contents).wrap_err("Failed to parse runtime status")?;
     Ok(Some(status))
@@ -105,4 +113,22 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_status_can_use_an_explicit_temporary_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("nested").join("status.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        write_status_at(&path, RuntimeStatus::new("server", "ready")).unwrap();
+        let loaded = load_status_at(&path).unwrap().unwrap();
+
+        assert_eq!(loaded.role, "server");
+        assert_eq!(loaded.state, "ready");
+    }
 }

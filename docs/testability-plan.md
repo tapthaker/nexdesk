@@ -211,7 +211,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 ### T3.2 — Config, trust, certificates, and status
 
-- [ ] **T3.2.1** Make config/certificate/status roots explicitly injectable while keeping production defaults.
+- [x] **T3.2.1** Make config/certificate/status roots explicitly injectable while keeping production defaults.
 - [ ] **T3.2.2** Add repository interfaces only around operations requiring fault injection; retain real temp filesystem semantics otherwise.
 - [ ] **T3.2.3** Add atomic-write failure tests covering create, write, flush, sync, persist, and directory-sync stages.
 - [ ] **T3.2.4** Add concurrent trust/config update tests.
@@ -405,4 +405,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `9f36ef9` | T3.1.2 | Adapted mDNS browsing and resolution behind discovery ports. |
 | 2026-07-19 | `cf98bbd` | T3.1.3 | Added delayed and failing scripted discovery sessions. |
 | 2026-07-19 | `38fbd50` | T3.1.4 | Covered discovery retry, timeout, cancellation, deduplication, and address choice. |
-| 2026-07-19 | this commit | T3.1.5 | Added an opt-in real multicast mDNS smoke test. |
+| 2026-07-19 | `538a91e` | T3.1.5 | Added an opt-in real multicast mDNS smoke test. |
+| 2026-07-19 | this commit | T3.2.1 | Made config, certificate, and status paths explicitly injectable. |

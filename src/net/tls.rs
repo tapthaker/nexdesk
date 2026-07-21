@@ -27,7 +27,13 @@ pub fn generate_self_signed() -> Result<(CertificateDer<'static>, PrivateKeyDer<
 
 /// Load or generate certificates. Stores them in the config certs directory.
 pub fn load_or_generate_certs() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
-    let certs_dir = NexdeskConfig::certs_dir()?;
+    load_or_generate_certs_in(&NexdeskConfig::certs_dir()?)
+}
+
+pub fn load_or_generate_certs_in(
+    certs_dir: &std::path::Path,
+) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+    std::fs::create_dir_all(certs_dir)?;
     let cert_path = certs_dir.join("cert.der");
     let key_path = certs_dir.join("key.der");
 
@@ -210,5 +216,23 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
             rustls::SignatureScheme::RSA_PKCS1_SHA384,
             rustls::SignatureScheme::RSA_PKCS1_SHA512,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn certificates_can_use_an_explicit_temporary_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let certs = temp.path().join("isolated-certs");
+
+        let (first, _) = load_or_generate_certs_in(&certs).unwrap();
+        let (second, _) = load_or_generate_certs_in(&certs).unwrap();
+
+        assert_eq!(first.as_ref(), second.as_ref());
+        assert!(certs.join("cert.der").exists());
+        assert!(certs.join("key.der").exists());
     }
 }
