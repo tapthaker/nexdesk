@@ -12,6 +12,8 @@ mod setup;
 mod status;
 pub mod testing;
 
+pub use net::discovery::{start_advertising, AdvertiseHandle, MdnsDiscovery};
+
 use std::io::{IsTerminal, Write};
 
 use app::{RunOutcome, SessionExit};
