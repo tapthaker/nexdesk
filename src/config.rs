@@ -4,6 +4,8 @@ use color_eyre::eyre::{Result, WrapErr};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::ports::{AtomicFileStore, RealAtomicFileStore};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistenceRoots {
     config_root: PathBuf,
@@ -113,11 +115,20 @@ impl NexdeskConfig {
     }
 
     pub fn save_to(&self, roots: &PersistenceRoots) -> Result<()> {
+        self.save_to_store(roots, &RealAtomicFileStore)
+    }
+
+    pub fn save_to_store(
+        &self,
+        roots: &PersistenceRoots,
+        store: &dyn AtomicFileStore,
+    ) -> Result<()> {
         roots.ensure_config_root()?;
         let path = roots.config_path();
         let contents = toml::to_string_pretty(self).wrap_err("Failed to serialize config")?;
-        std::fs::write(&path, contents).wrap_err("Failed to write config file")?;
-        Ok(())
+        store
+            .replace(&path, contents.as_bytes())
+            .wrap_err("Failed to write config file")
     }
 
     fn default_config() -> Self {

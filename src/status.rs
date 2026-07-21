@@ -5,7 +5,7 @@ use color_eyre::eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
 
 use crate::config::PersistenceRoots;
-use crate::ports::StatusSink;
+use crate::ports::{AtomicFileStore, RealAtomicFileStore, StatusSink};
 
 pub const MAX_STATUS_DISPLAY_BYTES: usize = 1024;
 pub const MAX_COMMAND_OUTPUT_DISPLAY_BYTES: usize = 64 * 1024;
@@ -86,12 +86,20 @@ pub fn write_status(status: RuntimeStatus) -> Result<()> {
     write_status_at(&status_path()?, status)
 }
 
-pub fn write_status_at(path: &std::path::Path, mut status: RuntimeStatus) -> Result<()> {
+pub fn write_status_at(path: &std::path::Path, status: RuntimeStatus) -> Result<()> {
+    write_status_with_store(path, status, &RealAtomicFileStore)
+}
+
+pub fn write_status_with_store(
+    path: &std::path::Path,
+    mut status: RuntimeStatus,
+    store: &dyn AtomicFileStore,
+) -> Result<()> {
     status.updated_at = now_secs();
     let bytes = serde_json::to_vec_pretty(&status).wrap_err("Failed to encode runtime status")?;
-    std::fs::write(&path, bytes)
-        .wrap_err_with(|| format!("Failed to write runtime status: {}", path.display()))?;
-    Ok(())
+    store
+        .replace(path, &bytes)
+        .wrap_err_with(|| format!("Failed to write runtime status: {}", path.display()))
 }
 
 pub fn load_status() -> Result<Option<RuntimeStatus>> {

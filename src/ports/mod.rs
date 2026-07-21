@@ -1,6 +1,7 @@
 mod clipboard;
 mod discovery;
 mod pairing;
+mod persistence;
 mod platform;
 mod status;
 mod transport;
@@ -12,6 +13,7 @@ pub use discovery::{
     DiscoveredPeer, DiscoveryBrowse, DiscoveryEvent, DiscoveryFuture, PeerDiscovery,
 };
 pub use pairing::{PairingPrompt, PairingPromptFuture};
+pub use persistence::{AtomicFileStore, RealAtomicFileStore};
 pub use platform::{DisplaySessionControl, LocalSessionLockSource, SleepInhibitor};
 pub use status::StatusSink;
 pub use transport::{
