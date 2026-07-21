@@ -222,7 +222,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T3.3.1** Introduce a bounded command-runner interface shared by command-based adapters.
 - [x] **T3.3.2** Implement real and scripted command runners with stdout/stderr limits, hangs, signals, and exit statuses.
 - [x] **T3.3.3** Route systemd, launchd, session query, and clipboard command adapters through the runner where appropriate.
-- [ ] **T3.3.4** Add Linux service install/start/stop/status scenario tests without invoking systemd or sudo.
+- [x] **T3.3.4** Add Linux service install/start/stop/status scenario tests without invoking systemd or sudo.
 - [ ] **T3.3.5** Add macOS service install/start/stop/status scenario tests without invoking launchctl.
 - [ ] **T3.3.6** Add command timeout and child-process cleanup tests.
 
@@ -413,4 +413,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `3a8c543` | T3.2.5 | Bounded stale, corrupt, oversized, unreadable, and reused-process statuses. |
 | 2026-07-19 | `ba44003` | T3.3.1 | Added a bounded semantic command-runner port. |
 | 2026-07-19 | `5fe4cde` | T3.3.2 | Added real and scripted bounded process execution. |
-| 2026-07-19 | this commit | T3.3.3 | Routed service, session, and text-clipboard commands through runners. |
+| 2026-07-19 | `cfd31ff` | T3.3.3 | Routed service, session, and text-clipboard commands through runners. |
+| 2026-07-19 | this commit | T3.3.4 | Tested Linux service lifecycle using only scripted commands. |

@@ -73,37 +73,44 @@ WantedBy=default.target
 }
 
 pub fn start() -> Result<()> {
-    if !service_file_path().is_file() {
+    start_with_runner(&RealCommandRunner, &service_file_path())
+}
+
+fn start_with_runner(runner: &dyn CommandRunner, service_path: &std::path::Path) -> Result<()> {
+    if !service_path.is_file() {
         return Err(eyre!(
             "nexdesk daemon is not installed; run `nexdesk setup` first"
         ));
     }
 
-    run_systemctl(&["--user", "daemon-reload"]).wrap_err("Failed to reload systemd user units")?;
-    run_systemctl(&["--user", "start", "nexdesk.service"])
+    run_systemctl_with_runner(runner, &["--user", "daemon-reload"])
+        .wrap_err("Failed to reload systemd user units")?;
+    run_systemctl_with_runner(runner, &["--user", "start", "nexdesk.service"])
         .wrap_err("Failed to start nexdesk daemon")?;
     println!("nexdesk daemon started");
     Ok(())
 }
 
 pub fn stop() -> Result<()> {
-    if !service_file_path().is_file() {
+    stop_with_runner(&RealCommandRunner, &service_file_path())
+}
+
+fn stop_with_runner(runner: &dyn CommandRunner, service_path: &std::path::Path) -> Result<()> {
+    if !service_path.is_file() {
         return Err(eyre!(
             "nexdesk daemon is not installed; run `nexdesk setup` first"
         ));
     }
 
-    run_systemctl(&["--user", "stop", "nexdesk.service"])
+    run_systemctl_with_runner(runner, &["--user", "stop", "nexdesk.service"])
         .wrap_err("Failed to stop nexdesk daemon")?;
     println!("nexdesk daemon stopped");
     Ok(())
 }
 
 pub fn print_status() -> Result<()> {
-    let active = command_stdout("systemctl", &["--user", "is-active", "nexdesk.service"])
-        .unwrap_or_else(|_| "unknown".into());
-    let enabled = command_stdout("systemctl", &["--user", "is-enabled", "nexdesk.service"])
-        .unwrap_or_else(|_| "unknown".into());
+    let (active, enabled) = service_status_with_runner(&RealCommandRunner);
+
     let process = command_stdout("pgrep", &["-a", "nexdesk"]).ok();
     let listener = command_stdout(
         "sh",
@@ -168,9 +175,17 @@ pub fn print_logs() -> Result<()> {
 }
 
 pub fn install(args: &[&str]) -> Result<()> {
-    configure_firewall(args);
+    install_with_runner(args, &service_file_path(), &RealCommandRunner)
+}
 
-    let path = service_file_path();
+fn install_with_runner(
+    args: &[&str],
+    path: &std::path::Path,
+    runner: &dyn CommandRunner,
+) -> Result<()> {
+    configure_firewall_with_runner(args, runner);
+
+    let path = path.to_path_buf();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).wrap_err("Failed to create systemd user directory")?;
     }
@@ -183,13 +198,17 @@ pub fn install(args: &[&str]) -> Result<()> {
         }
     }
 
-    run_systemctl(&["--user", "daemon-reload"]).wrap_err("Failed to reload systemd user units")?;
-    run_systemctl(&[
-        "--user",
-        "enable",
-        "--now",
-        &format!("{SERVICE_NAME}.service"),
-    ])
+    run_systemctl_with_runner(runner, &["--user", "daemon-reload"])
+        .wrap_err("Failed to reload systemd user units")?;
+    run_systemctl_with_runner(
+        runner,
+        &[
+            "--user",
+            "enable",
+            "--now",
+            &format!("{SERVICE_NAME}.service"),
+        ],
+    )
     .wrap_err("Failed to enable and start systemd user service")?;
 
     info!("Enabled and started systemd user service {}", SERVICE_NAME);
@@ -197,17 +216,17 @@ pub fn install(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn configure_firewall(args: &[&str]) {
+fn configure_firewall_with_runner(args: &[&str], runner: &dyn CommandRunner) {
     if args.first() != Some(&"serve") {
         return;
     }
 
     let port = service_port(args);
-    if !ufw_is_active() {
+    if !ufw_is_active_with_runner(runner) {
         return;
     }
 
-    match run_sudo_ufw(&[
+    match run_sudo_ufw_with_runner(runner, &[
         "allow",
         &format!("{port}/udp"),
         "comment",
@@ -238,19 +257,15 @@ fn service_port(args: &[&str]) -> u16 {
     4242
 }
 
-fn ufw_is_active() -> bool {
-    run_command(
-        &RealCommandRunner,
-        "systemctl",
-        &["is-active", "--quiet", "ufw"],
-    )
-    .is_ok_and(|output| output.success)
+fn ufw_is_active_with_runner(runner: &dyn CommandRunner) -> bool {
+    run_command(runner, "systemctl", &["is-active", "--quiet", "ufw"])
+        .is_ok_and(|output| output.success)
 }
 
-fn run_sudo_ufw(args: &[&str]) -> Result<()> {
+fn run_sudo_ufw_with_runner(runner: &dyn CommandRunner, args: &[&str]) -> Result<()> {
     let mut command_args = vec!["-n", "ufw"];
     command_args.extend_from_slice(args);
-    run_checked(&RealCommandRunner, "sudo", &command_args).map(|_| ())
+    run_checked(runner, "sudo", &command_args).map(|_| ())
 }
 
 fn print_connection_summary() {
@@ -273,6 +288,22 @@ fn print_connection_summary() {
         }
         None => println!("Connected: unknown"),
     }
+}
+
+fn service_status_with_runner(runner: &dyn CommandRunner) -> (String, String) {
+    let active = command_stdout_with_runner(
+        runner,
+        "systemctl",
+        &["--user", "is-active", "nexdesk.service"],
+    )
+    .unwrap_or_else(|_| "unknown".into());
+    let enabled = command_stdout_with_runner(
+        runner,
+        "systemctl",
+        &["--user", "is-enabled", "nexdesk.service"],
+    )
+    .unwrap_or_else(|_| "unknown".into());
+    (active, enabled)
 }
 
 fn command_stdout(program: &str, args: &[&str]) -> Result<String> {
@@ -321,4 +352,51 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
 
 fn run_systemctl_with_runner(runner: &dyn CommandRunner, args: &[&str]) -> Result<()> {
     run_checked(runner, "systemctl", args).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ports::CommandOutput;
+    use crate::testing::{CommandObservation, ScriptedCommandRunner};
+
+    fn output(stdout: &str) -> CommandOutput {
+        CommandOutput {
+            success: true,
+            code: Some(0),
+            signal: None,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        }
+    }
+
+    #[test]
+    fn systemd_install_start_stop_and_status_use_only_scripted_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = temp.path().join("nexdesk.service");
+        let runner = ScriptedCommandRunner::new();
+        for value in ["", "", "", "", "", "active", "enabled"] {
+            runner.push_output(output(value));
+        }
+
+        install_with_runner(&["connect", "192.0.2.1:4242"], &service, &runner).unwrap();
+        start_with_runner(&runner, &service).unwrap();
+        stop_with_runner(&runner, &service).unwrap();
+        assert_eq!(
+            service_status_with_runner(&runner),
+            ("active".to_string(), "enabled".to_string())
+        );
+
+        let commands = runner
+            .observations()
+            .snapshot()
+            .into_iter()
+            .filter(|entry| matches!(entry.event, CommandObservation::Run(_)))
+            .count();
+        assert_eq!(commands, 7);
+        assert_eq!(runner.remaining_actions(), 0);
+        assert!(service.is_file());
+    }
 }
