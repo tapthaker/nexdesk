@@ -9,6 +9,33 @@ use crate::ports::{CommandOutput, CommandRequest, CommandRunner};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RealCommandRunner;
 
+pub fn run_command(
+    runner: &dyn CommandRunner,
+    program: &str,
+    args: &[&str],
+) -> Result<CommandOutput> {
+    runner.run(&CommandRequest::new(program).args(args.iter().copied()))
+}
+
+pub fn run_checked(
+    runner: &dyn CommandRunner,
+    program: &str,
+    args: &[&str],
+) -> Result<CommandOutput> {
+    let output = run_command(runner, program, args)?;
+    if output.success {
+        Ok(output)
+    } else {
+        Err(eyre!(
+            "{} {} exited with {:?}: {}",
+            program,
+            args.join(" "),
+            output.code,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
 impl CommandRunner for RealCommandRunner {
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput> {
         let mut child = Command::new(&request.program)

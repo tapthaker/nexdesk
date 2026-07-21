@@ -95,7 +95,52 @@ impl ClipboardSync {
 // On Linux: try wl-paste/wl-copy first, fall back to xclip
 // ---------------------------------------------------------------------------
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn read_text_with_runner(
+    runner: &dyn crate::ports::CommandRunner,
+    program: &str,
+    args: &[&str],
+    max_bytes: usize,
+) -> Result<String> {
+    let mut request = crate::ports::CommandRequest::new(program).args(args.iter().copied());
+    request.max_stdout_bytes = max_bytes;
+    let output = runner.run(&request)?;
+    if output.stdout_truncated {
+        return Err(eyre!(
+            "{} output too large: exceeds {} bytes",
+            program,
+            max_bytes
+        ));
+    }
+    if !output.success {
+        return Err(eyre!("{} exited with {:?}", program, output.code));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn write_text_with_runner(
+    runner: &dyn crate::ports::CommandRunner,
+    program: &str,
+    args: &[&str],
+    text: &str,
+) -> Result<()> {
+    let mut request = crate::ports::CommandRequest::new(program).args(args.iter().copied());
+    request.stdin = text.as_bytes().to_vec();
+    let output = runner.run(&request)?;
+    if output.success {
+        Ok(())
+    } else {
+        Err(eyre!(
+            "{} exited with {:?}: {}",
+            program,
+            output.code,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(test)]
 fn read_text_from_command(
     mut command: std::process::Command,
     name: &str,
@@ -150,7 +195,7 @@ fn read_text_from_command(
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn write_text_to_command(mut command: std::process::Command, text: &str, name: &str) -> Result<()> {
     use std::io::{Read, Write};
     use std::process::Stdio;
@@ -219,92 +264,47 @@ fn write_text_to_command(mut command: std::process::Command, text: &str, name: &
     }
 }
 
-#[cfg(target_os = "linux")]
-fn write_text_to_daemonizing_command(
-    mut command: std::process::Command,
-    text: &str,
-    name: &str,
-) -> Result<()> {
-    use std::io::Write;
-    use std::process::Stdio;
-
-    // wl-copy and xclip may fork a long-lived clipboard owner. Do not pipe
-    // stderr: the owner inherits that pipe, so waiting for EOF would block the
-    // clipboard receive task indefinitely and eventually stall QUIC traffic.
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| eyre!("{}: {}", name, e))?;
-
-    let write_result = match child.stdin.take() {
-        Some(mut stdin) => stdin
-            .write_all(text.as_bytes())
-            .map_err(|e| eyre!("{} write: {}", name, e)),
-        None => Err(eyre!("{} stdin unavailable", name)),
-    };
-    if let Err(err) = write_result {
-        child.kill().ok();
-        child.wait().ok();
-        return Err(err);
-    }
-
-    let status = child.wait().map_err(|e| eyre!("{} wait: {}", name, e))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(eyre!("{} exited with {}", name, status))
-    }
-}
-
 #[cfg(target_os = "macos")]
 pub(super) fn read_clipboard() -> Result<String> {
-    read_text_from_command(
-        std::process::Command::new("pbpaste"),
+    read_text_with_runner(
+        &crate::command::RealCommandRunner,
         "pbpaste",
+        &[],
         MAX_CLIPBOARD_TEXT_BYTES,
     )
 }
 
 #[cfg(target_os = "macos")]
 pub(super) fn write_clipboard(text: &str) -> Result<()> {
-    write_text_to_command(std::process::Command::new("pbcopy"), text, "pbcopy")
+    write_text_with_runner(&crate::command::RealCommandRunner, "pbcopy", &[], text)
 }
 
 #[cfg(target_os = "linux")]
 pub(super) fn read_clipboard() -> Result<String> {
-    use std::process::Command;
-
-    // Try wl-paste first (Wayland), fall back to xclip (X11). Read stdout with
-    // the same limit enforced on outgoing clipboard sync so a huge local
-    // clipboard cannot be buffered unboundedly before the size check.
-    let mut wl_paste = Command::new("wl-paste");
-    wl_paste.args(["--no-newline"]);
-    if let Ok(text) = read_text_from_command(wl_paste, "wl-paste", MAX_CLIPBOARD_TEXT_BYTES) {
+    let runner = crate::command::RealCommandRunner;
+    if let Ok(text) = read_text_with_runner(
+        &runner,
+        "wl-paste",
+        &["--no-newline"],
+        MAX_CLIPBOARD_TEXT_BYTES,
+    ) {
         return Ok(text);
     }
-
-    let mut xclip = Command::new("xclip");
-    xclip.args(["-selection", "clipboard", "-o"]);
-    read_text_from_command(xclip, "xclip", MAX_CLIPBOARD_TEXT_BYTES)
+    read_text_with_runner(
+        &runner,
+        "xclip",
+        &["-selection", "clipboard", "-o"],
+        MAX_CLIPBOARD_TEXT_BYTES,
+    )
 }
 
 #[cfg(target_os = "linux")]
 pub(super) fn write_clipboard(text: &str) -> Result<()> {
-    use std::process::Command;
-
-    // Try wl-copy first (Wayland), fall back to xclip (X11). Both may fork a
-    // long-lived clipboard owner, so they must not inherit a stderr pipe that
-    // this process waits to reach EOF.
-    let wl_copy = Command::new("wl-copy");
-    if write_text_to_daemonizing_command(wl_copy, text, "wl-copy").is_ok() {
+    let runner = crate::command::RealCommandRunner;
+    if write_text_with_runner(&runner, "wl-copy", &[], text).is_ok() {
         return Ok(());
     }
-
-    let mut xclip = Command::new("xclip");
-    xclip.args(["-selection", "clipboard"]);
-    write_text_to_daemonizing_command(xclip, text, "xclip")
+    write_text_with_runner(&runner, "xclip", &["-selection", "clipboard"], text)
 }
 
 #[cfg(test)]

@@ -1,9 +1,9 @@
-use std::path::PathBuf;
-use std::process::Command;
-
 use color_eyre::eyre::{eyre, Result, WrapErr};
+use std::path::PathBuf;
 use tracing::info;
 
+use crate::command::{run_checked, run_command, RealCommandRunner};
+use crate::ports::CommandRunner;
 use crate::status;
 
 const LABEL: &str = "com.nexdesk.agent";
@@ -197,31 +197,21 @@ fn print_connection_summary() {
 }
 
 fn command_stdout(program: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .wrap_err_with(|| format!("Failed to run {} {}", program, args.join(" ")))?;
+    command_stdout_with_runner(&RealCommandRunner, program, args)
+}
 
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(eyre!(
-        "{} {} exited with {}: {}",
-        program,
-        args.join(" "),
-        output.status,
-        stderr.trim()
-    ))
+fn command_stdout_with_runner(
+    runner: &dyn CommandRunner,
+    program: &str,
+    args: &[&str],
+) -> Result<String> {
+    let output = run_checked(runner, program, args)?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn print_command(program: &str, args: &[&str]) -> Result<()> {
     println!("\n$ {} {}", program, args.join(" "));
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .wrap_err_with(|| format!("Failed to run {} {}", program, args.join(" ")))?;
+    let output = run_command(&RealCommandRunner, program, args)?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !stdout.trim().is_empty() {
@@ -239,34 +229,17 @@ fn print_command(program: &str, args: &[&str]) -> Result<()> {
         }
     }
 
-    if !output.status.success() {
-        println!("(exit status: {})", output.status);
+    if !output.success {
+        println!("(exit status: {:?})", output.code);
     }
 
     Ok(())
 }
 
 fn run_launchctl(args: &[&str]) -> Result<()> {
-    let output = Command::new("launchctl")
-        .args(args)
-        .output()
-        .wrap_err_with(|| format!("Failed to run launchctl {}", args.join(" ")))?;
+    run_launchctl_with_runner(&RealCommandRunner, args)
+}
 
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Err(eyre!(
-        "launchctl {} exited with {}{}\n{}",
-        args.join(" "),
-        output.status,
-        if stdout.trim().is_empty() {
-            String::new()
-        } else {
-            format!("\n{}", stdout.trim())
-        },
-        stderr.trim()
-    ))
+fn run_launchctl_with_runner(runner: &dyn CommandRunner, args: &[&str]) -> Result<()> {
+    run_checked(runner, "launchctl", args).map(|_| ())
 }

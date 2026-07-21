@@ -1,9 +1,9 @@
-use std::path::PathBuf;
-use std::process::Command;
-
 use color_eyre::eyre::{eyre, Result, WrapErr};
+use std::path::PathBuf;
 use tracing::{info, warn};
 
+use crate::command::{run_checked, run_command, RealCommandRunner};
+use crate::ports::CommandRunner;
 use crate::status;
 
 const SERVICE_NAME: &str = "nexdesk";
@@ -239,38 +239,18 @@ fn service_port(args: &[&str]) -> u16 {
 }
 
 fn ufw_is_active() -> bool {
-    let output = Command::new("systemctl")
-        .args(["is-active", "--quiet", "ufw"])
-        .status();
-
-    matches!(output, Ok(status) if status.success())
+    run_command(
+        &RealCommandRunner,
+        "systemctl",
+        &["is-active", "--quiet", "ufw"],
+    )
+    .is_ok_and(|output| output.success)
 }
 
 fn run_sudo_ufw(args: &[&str]) -> Result<()> {
-    let output = Command::new("sudo")
-        .arg("-n")
-        .arg("ufw")
-        .args(args)
-        .output()
-        .wrap_err_with(|| format!("Failed to run sudo -n ufw {}", args.join(" ")))?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Err(eyre!(
-        "sudo -n ufw {} exited with {}{}\n{}",
-        args.join(" "),
-        output.status,
-        if stdout.trim().is_empty() {
-            String::new()
-        } else {
-            format!("\n{}", stdout.trim())
-        },
-        stderr.trim()
-    ))
+    let mut command_args = vec!["-n", "ufw"];
+    command_args.extend_from_slice(args);
+    run_checked(&RealCommandRunner, "sudo", &command_args).map(|_| ())
 }
 
 fn print_connection_summary() {
@@ -296,31 +276,21 @@ fn print_connection_summary() {
 }
 
 fn command_stdout(program: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .wrap_err_with(|| format!("Failed to run {} {}", program, args.join(" ")))?;
+    command_stdout_with_runner(&RealCommandRunner, program, args)
+}
 
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(eyre!(
-        "{} {} exited with {}: {}",
-        program,
-        args.join(" "),
-        output.status,
-        stderr.trim()
-    ))
+fn command_stdout_with_runner(
+    runner: &dyn CommandRunner,
+    program: &str,
+    args: &[&str],
+) -> Result<String> {
+    let output = run_checked(runner, program, args)?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn print_command(program: &str, args: &[&str]) -> Result<()> {
     println!("\n$ {} {}", program, args.join(" "));
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .wrap_err_with(|| format!("Failed to run {} {}", program, args.join(" ")))?;
+    let output = run_command(&RealCommandRunner, program, args)?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !stdout.trim().is_empty() {
@@ -338,34 +308,17 @@ fn print_command(program: &str, args: &[&str]) -> Result<()> {
         }
     }
 
-    if !output.status.success() {
-        println!("(exit status: {})", output.status);
+    if !output.success {
+        println!("(exit status: {:?})", output.code);
     }
 
     Ok(())
 }
 
 fn run_systemctl(args: &[&str]) -> Result<()> {
-    let output = Command::new("systemctl")
-        .args(args)
-        .output()
-        .wrap_err_with(|| format!("Failed to run systemctl {}", args.join(" ")))?;
+    run_systemctl_with_runner(&RealCommandRunner, args)
+}
 
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Err(eyre!(
-        "systemctl {} exited with {}{}\n{}",
-        args.join(" "),
-        output.status,
-        if stdout.trim().is_empty() {
-            String::new()
-        } else {
-            format!("\n{}", stdout.trim())
-        },
-        stderr.trim()
-    ))
+fn run_systemctl_with_runner(runner: &dyn CommandRunner, args: &[&str]) -> Result<()> {
+    run_checked(runner, "systemctl", args).map(|_| ())
 }
