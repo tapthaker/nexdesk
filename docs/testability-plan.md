@@ -204,7 +204,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 ### T3.1 — Discovery
 
 - [x] **T3.1.1** Introduce a discovery interface supporting browse streams and single-peer resolution.
-- [ ] **T3.1.2** Adapt `mdns-sd` behind the production discovery adapter.
+- [x] **T3.1.2** Adapt `mdns-sd` behind the production discovery adapter.
 - [ ] **T3.1.3** Add scripted discovery with delayed peers, malformed peers, closure, and failures.
 - [ ] **T3.1.4** Test discovery retry, timeout, cancellation, deduplication, and address selection with virtual time.
 - [ ] **T3.1.5** Add a real mDNS smoke test marked for environments where multicast is available.
@@ -401,4 +401,5 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `a3c6019` | T2.3.5 | Covered blocked sends, capture failure, resize, and disconnect. |
 | 2026-07-19 | `0b730d8` | T2.3.6 | Centralized server exit cleanup for grabs and remote input. |
 | 2026-07-19 | `79049e5` | T2.3.7 | Asserted server transport and background tasks terminate. |
-| 2026-07-19 | this commit | T3.1.1 | Added typed peer discovery and browse-stream ports. |
+| 2026-07-19 | `75fc697` | T3.1.1 | Added typed peer discovery and browse-stream ports. |
+| 2026-07-19 | this commit | T3.1.2 | Adapted mDNS browsing and resolution behind discovery ports. |

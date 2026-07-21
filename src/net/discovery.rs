@@ -5,6 +5,9 @@ use color_eyre::eyre::{eyre, Result};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use tracing::{debug, info};
 
+pub use crate::ports::DiscoveredPeer;
+use crate::ports::{DiscoveryBrowse, DiscoveryEvent, DiscoveryFuture, PeerDiscovery};
+
 const SERVICE_TYPE: &str = "_nexdesk._udp.local.";
 
 /// Get the primary local IPv4 address using the routing table (no packets sent).
@@ -84,59 +87,26 @@ pub async fn advertise(port: u16) -> Result<()> {
 
 /// Discover peers on the local network via mDNS.
 pub async fn discover() -> Result<()> {
-    let mdns = ServiceDaemon::new()?;
-
-    let receiver = mdns.browse(SERVICE_TYPE)?;
-
+    let mut browse = MdnsDiscovery.browse().await?;
     info!("Browsing for nexdesk peers on the network...");
     info!("Press Ctrl+C to stop\n");
 
-    let browse_handle = tokio::task::spawn_blocking(move || loop {
-        match receiver.recv() {
-            Ok(event) => match event {
-                ServiceEvent::ServiceResolved(info) => {
-                    let hostname = info.get_property_val_str("hostname").unwrap_or("unknown");
-                    let platform = info.get_property_val_str("platform").unwrap_or("unknown");
-                    let addrs: Vec<String> =
-                        info.get_addresses().iter().map(|a| a.to_string()).collect();
-                    let selected = preferred_service_addr(&info)
-                        .map(|addr| addr.to_string())
-                        .unwrap_or_else(|| "none".to_string());
-
-                    println!(
-                                "  Found peer: {} ({})\n    Selected: {}\n    Addresses: {}\n    Port: {}\n",
-                                hostname,
-                                platform,
-                                selected,
-                                addrs.join(", "),
-                                info.get_port(),
-                            );
-                }
-                ServiceEvent::ServiceRemoved(_, full_name) => {
-                    println!("  Peer left: {}\n", full_name);
-                }
-                ServiceEvent::SearchStarted(_) => {
-                    debug!("mDNS search started");
-                }
-                other => {
-                    debug!("mDNS event: {:?}", other);
-                }
-            },
-            Err(_) => break,
-        }
-    });
-
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("\nShutting down discovery...");
-        }
-        result = browse_handle => {
-            result?;
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("\nShutting down discovery...");
+                break;
+            }
+            event = browse.next_event() => match event? {
+                Some(DiscoveryEvent::Found(peer)) => println!(
+                    "  Found peer: {} ({})\n    Selected: {}\n",
+                    peer.name, peer.platform, peer.addr,
+                ),
+                Some(DiscoveryEvent::Removed(name)) => println!("  Peer left: {}\n", name),
+                None => break,
+            }
         }
     }
-
-    mdns.shutdown()?;
-
     Ok(())
 }
 
@@ -192,13 +162,6 @@ pub fn start_advertising(port: u16) -> Result<AdvertiseHandle> {
     Ok(AdvertiseHandle { mdns: Some(mdns) })
 }
 
-/// A peer discovered via mDNS browsing.
-pub struct DiscoveredPeer {
-    pub name: String,
-    pub platform: String,
-    pub addr: SocketAddr,
-}
-
 /// Handle to a running mDNS browse. Shuts down on drop.
 pub struct BrowseHandle {
     mdns: Option<ServiceDaemon>,
@@ -246,9 +209,78 @@ pub fn start_browsing() -> Result<(std::sync::mpsc::Receiver<DiscoveredPeer>, Br
     Ok((rx, BrowseHandle { mdns: Some(mdns) }))
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MdnsDiscovery;
+
+struct MdnsBrowse {
+    _mdns: BrowseHandle,
+    events: tokio::sync::mpsc::UnboundedReceiver<Result<DiscoveryEvent>>,
+}
+
+impl DiscoveryBrowse for MdnsBrowse {
+    fn next_event(&mut self) -> DiscoveryFuture<'_, Result<Option<DiscoveryEvent>>> {
+        Box::pin(async move {
+            match self.events.recv().await {
+                Some(Ok(event)) => Ok(Some(event)),
+                Some(Err(error)) => Err(error),
+                None => Ok(None),
+            }
+        })
+    }
+}
+
+impl PeerDiscovery for MdnsDiscovery {
+    fn browse(&self) -> DiscoveryFuture<'_, Result<Box<dyn DiscoveryBrowse>>> {
+        Box::pin(async move {
+            let mdns = ServiceDaemon::new()?;
+            let receiver = mdns.browse(SERVICE_TYPE)?;
+            let (send, events) = tokio::sync::mpsc::unbounded_channel();
+            std::thread::spawn(move || loop {
+                let event = match receiver.recv() {
+                    Ok(ServiceEvent::ServiceResolved(info)) => {
+                        let Some(addr) = preferred_service_addr(&info) else {
+                            continue;
+                        };
+                        Ok(DiscoveryEvent::Found(DiscoveredPeer {
+                            name: info
+                                .get_property_val_str("hostname")
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            platform: info
+                                .get_property_val_str("platform")
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            addr,
+                        }))
+                    }
+                    Ok(ServiceEvent::ServiceRemoved(_, name)) => Ok(DiscoveryEvent::Removed(name)),
+                    Ok(_) => continue,
+                    Err(error) => Err(eyre!("mDNS browse channel closed: {}", error)),
+                };
+                let terminal = event.is_err();
+                if send.send(event).is_err() || terminal {
+                    break;
+                }
+            });
+            Ok(Box::new(MdnsBrowse {
+                _mdns: BrowseHandle { mdns: Some(mdns) },
+                events,
+            }) as Box<dyn DiscoveryBrowse>)
+        })
+    }
+
+    fn resolve_one(&self, timeout: Duration) -> DiscoveryFuture<'_, Result<SocketAddr>> {
+        Box::pin(async move { mdns_resolve_one(timeout).await })
+    }
+}
+
 /// Discover the first nexdesk server on the LAN.
 /// Returns its socket address or an error if none found within `timeout`.
 pub async fn discover_one(timeout: Duration) -> Result<SocketAddr> {
+    MdnsDiscovery.resolve_one(timeout).await
+}
+
+async fn mdns_resolve_one(timeout: Duration) -> Result<SocketAddr> {
     let attempts = 3;
     let per_attempt = timeout
         .checked_div(attempts)
@@ -301,5 +333,16 @@ async fn discover_one_attempt(timeout: Duration) -> Result<SocketAddr> {
         Ok(Ok(addr)) => addr,
         Ok(Err(e)) => Err(e.into()),
         Err(_) => Err(eyre!("No nexdesk server found within {:?}", timeout)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mdns_adapter_implements_discovery_port() {
+        fn assert_adapter(_: &dyn PeerDiscovery) {}
+        assert_adapter(&MdnsDiscovery);
     }
 }
