@@ -6,7 +6,7 @@ use ring::digest;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tracing::info;
 
-use crate::config::NexdeskConfig;
+use crate::config::{NexdeskConfig, PersistenceRoots};
 use crate::ports::TrustStore;
 
 /// Generate a self-signed certificate and return (cert_der, key_der).
@@ -74,19 +74,48 @@ pub fn show_fingerprint() -> Result<()> {
 }
 
 fn is_fingerprint_trusted_in_config(fp: &str) -> Result<bool> {
-    let config = NexdeskConfig::load()?;
+    is_fingerprint_trusted_at(&PersistenceRoots::production()?, fp)
+}
+
+fn is_fingerprint_trusted_at(roots: &PersistenceRoots, fp: &str) -> Result<bool> {
+    let config = NexdeskConfig::load_from(roots)?;
     Ok(config.trusted_fingerprints.contains(&fp.to_uppercase()))
 }
 
 fn trust_fingerprint_in_config(fp: &str) -> Result<bool> {
-    let mut config = NexdeskConfig::load()?;
+    trust_fingerprint_at(&PersistenceRoots::production()?, fp)
+}
+
+fn trust_fingerprint_at(roots: &PersistenceRoots, fp: &str) -> Result<bool> {
     let normalized = fp.to_uppercase();
-    if config.trusted_fingerprints.contains(&normalized) {
-        return Ok(false);
+    NexdeskConfig::update_from(roots, |config| {
+        if config.trusted_fingerprints.contains(&normalized) {
+            return Ok(false);
+        }
+        config.trusted_fingerprints.push(normalized);
+        Ok(true)
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct RootedConfigTrustStore {
+    roots: PersistenceRoots,
+}
+
+impl RootedConfigTrustStore {
+    pub fn new(roots: PersistenceRoots) -> Self {
+        Self { roots }
     }
-    config.trusted_fingerprints.push(normalized);
-    config.save()?;
-    Ok(true)
+}
+
+impl TrustStore for RootedConfigTrustStore {
+    fn is_trusted(&self, fingerprint: &str) -> Result<bool> {
+        is_fingerprint_trusted_at(&self.roots, fingerprint)
+    }
+
+    fn trust(&self, fingerprint: &str) -> Result<()> {
+        trust_fingerprint_at(&self.roots, fingerprint).map(|_| ())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -222,6 +251,29 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_trust_updates_preserve_every_config_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = PersistenceRoots::from_config_root(temp.path());
+        let store = RootedConfigTrustStore::new(roots.clone());
+        let mut workers = Vec::new();
+        for index in 0..16 {
+            let store = store.clone();
+            workers.push(std::thread::spawn(move || {
+                store.trust(&format!("fingerprint-{index}"))
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+
+        let config = NexdeskConfig::load_from(&roots).unwrap();
+        assert_eq!(config.trusted_fingerprints.len(), 16);
+        for index in 0..16 {
+            assert!(store.is_trusted(&format!("fingerprint-{index}")).unwrap());
+        }
+    }
 
     #[test]
     fn certificates_can_use_an_explicit_temporary_directory() {

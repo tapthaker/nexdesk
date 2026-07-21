@@ -1,10 +1,13 @@
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use color_eyre::eyre::{Result, WrapErr};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::ports::{AtomicFileStore, RealAtomicFileStore};
+
+static CONFIG_UPDATE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistenceRoots {
@@ -116,6 +119,19 @@ impl NexdeskConfig {
 
     pub fn save_to(&self, roots: &PersistenceRoots) -> Result<()> {
         self.save_to_store(roots, &RealAtomicFileStore)
+    }
+
+    pub fn update_from<T>(
+        roots: &PersistenceRoots,
+        update: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let _guard = CONFIG_UPDATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut config = Self::load_from(roots)?;
+        let result = update(&mut config)?;
+        config.save_to(roots)?;
+        Ok(result)
     }
 
     pub fn save_to_store(
