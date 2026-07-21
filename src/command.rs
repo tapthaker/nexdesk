@@ -38,11 +38,18 @@ pub fn run_checked(
 
 impl CommandRunner for RealCommandRunner {
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput> {
-        let mut child = Command::new(&request.program)
+        let mut command = Command::new(&request.program);
+        command
             .args(&request.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command
             .spawn()
             .wrap_err_with(|| format!("Failed to start {}", request.program))?;
 
@@ -62,8 +69,7 @@ impl CommandRunner for RealCommandRunner {
                 break status;
             }
             if started.elapsed() >= request.timeout {
-                child.kill().ok();
-                child.wait().ok();
+                terminate_child_tree(&mut child);
                 let _ = input_task.join();
                 let _ = stdout_task.join();
                 let _ = stderr_task.join();
@@ -100,6 +106,16 @@ impl CommandRunner for RealCommandRunner {
             stderr_truncated,
         })
     }
+}
+
+fn terminate_child_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    child.kill().ok();
+    child.wait().ok();
 }
 
 fn drain_bounded(
@@ -154,9 +170,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn real_runner_terminates_hung_process_at_timeout() {
-        let mut request = CommandRequest::new("sh").args(["-c", "sleep 10"]);
-        request.timeout = Duration::from_millis(50);
+        let temp = tempfile::tempdir().unwrap();
+        let pid_path = temp.path().join("pid");
+        let script = format!("echo $$ > {}; sleep 10", pid_path.display());
+        let mut request = CommandRequest::new("sh").args(["-c", &script]);
+        request.timeout = Duration::from_millis(100);
+
         let error = RealCommandRunner.run(&request).unwrap_err();
+
         assert!(error.to_string().contains("timed out"));
+        let pid: i32 = std::fs::read_to_string(pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let process_exists = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!process_exists, "timed-out child process {pid} survived");
     }
 }
