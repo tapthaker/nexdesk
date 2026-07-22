@@ -86,6 +86,63 @@ fn discovery_refresh_due(state: &SetupState, now: Instant) -> bool {
         })
 }
 
+fn render_setup(frame: &mut Frame, state: &SetupState) {
+    let chunks = Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ])
+        .split(frame.area());
+
+    let title = if state.step == Step::Done {
+        " Nexdesk Setup - Complete ".to_string()
+    } else {
+        format!(
+            " Nexdesk Setup - Step {}/{}: {} ",
+            state.step.number(),
+            Step::total_steps(),
+            state.step.title()
+        )
+    };
+    frame.render_widget(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+        chunks[0],
+    );
+
+    let content_area = chunks[1];
+    match state.step {
+        Step::Welcome => welcome::render(frame, content_area),
+        Step::Role => role::render(frame, content_area, state),
+        Step::Network => network::render(frame, content_area, state),
+        Step::Screens => screens::render(frame, content_area, state),
+        Step::Certificates => certificates::render(frame, content_area, state),
+        Step::Permissions => permissions::render(frame, content_area, state),
+        Step::Service => service::render(frame, content_area, state),
+        Step::Done => render_done(frame, content_area),
+    };
+
+    let navigation = if state.step == Step::Done {
+        " Press 'q' to exit "
+    } else if state.step == Step::Screens {
+        " ←↑↓→ Select edge | Enter: Next | Backspace: Back | q: Quit "
+    } else if state.step == Step::Network {
+        " ↑/↓ Select | R: Refresh | Tab: Switch mode | Enter: Next | Backspace: Back | q: Quit "
+    } else {
+        " ←/→ Navigate | Enter: Next | q: Quit "
+    };
+    frame.render_widget(
+        Paragraph::new(navigation)
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::ALL)),
+        chunks[2],
+    );
+}
+
 pub async fn run() -> Result<()> {
     // When invoked via `curl | sh`, stdin may be a pipe or /dev/tty opened
     // read-only by the shell's `<` redirect. On macOS, kqueue returns EINVAL
@@ -166,64 +223,7 @@ pub async fn run() -> Result<()> {
             }
         }
 
-        terminal.draw(|frame| {
-            let area = frame.area();
-
-            // Header
-            let chunks = Layout::default()
-                .direction(ratatui::layout::Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(0),
-                    Constraint::Length(3),
-                ])
-                .split(area);
-
-            // Title bar
-            let title = if state.step == Step::Done {
-                " Nexdesk Setup - Complete ".to_string()
-            } else {
-                format!(
-                    " Nexdesk Setup - Step {}/{}: {} ",
-                    state.step.number(),
-                    Step::total_steps(),
-                    state.step.title()
-                )
-            };
-            let header = Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan));
-            frame.render_widget(header, chunks[0]);
-
-            // Content
-            let content_area = chunks[1];
-            match state.step {
-                Step::Welcome => welcome::render(frame, content_area),
-                Step::Role => role::render(frame, content_area, &state),
-                Step::Network => network::render(frame, content_area, &state),
-                Step::Screens => screens::render(frame, content_area, &state),
-                Step::Certificates => certificates::render(frame, content_area, &state),
-                Step::Permissions => permissions::render(frame, content_area, &state),
-                Step::Service => service::render(frame, content_area, &state),
-                Step::Done => render_done(frame, content_area),
-            };
-
-            // Footer
-            let nav = if state.step == Step::Done {
-                " Press 'q' to exit "
-            } else if state.step == Step::Screens {
-                " ←↑↓→ Select edge | Enter: Next | Backspace: Back | q: Quit "
-            } else if state.step == Step::Network {
-                " ↑/↓ Select | R: Refresh | Tab: Switch mode | Enter: Next | Backspace: Back | q: Quit "
-            } else {
-                " ←/→ Navigate | Enter: Next | q: Quit "
-            };
-            let footer = Paragraph::new(nav)
-                .alignment(Alignment::Center)
-                .block(Block::default().borders(Borders::ALL));
-            frame.render_widget(footer, chunks[2]);
-        })?;
+        terminal.draw(|frame| render_setup(frame, &state))?;
 
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
@@ -434,6 +434,45 @@ mod tests {
             peer_receiver: None,
             _browse_handle: None,
             discovery_started_at: None,
+        }
+    }
+
+    fn rendered_setup(state: &SetupState) -> String {
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render_setup(frame, state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                rendered.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            rendered.push('\n');
+        }
+        rendered
+    }
+
+    #[test]
+    fn every_setup_screen_renders_into_a_ratatui_buffer() {
+        let cases = [
+            (Step::Welcome, "Welcome to Nexdesk!"),
+            (Step::Role, "Select this machine's role"),
+            (Step::Network, "Network Configuration"),
+            (Step::Screens, "Where is the other machine's screen"),
+            (Step::Certificates, "Certificate Setup"),
+            (Step::Permissions, "Accessibility Permission"),
+            (Step::Service, "Install as Background Service"),
+            (Step::Done, "Setup complete!"),
+        ];
+
+        for (step, expected) in cases {
+            let mut state = state();
+            state.step = step;
+            let rendered = rendered_setup(&state);
+            assert!(
+                rendered.contains(expected),
+                "{step:?} did not render {expected:?}\n{rendered}"
+            );
         }
     }
 
