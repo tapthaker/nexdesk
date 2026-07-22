@@ -229,7 +229,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 ### T3.4 — File transfer
 
 - [x] **T3.4.1** Move file-transfer protocol flow onto reusable typed message streams independent of Quinn concrete stream types.
-- [ ] **T3.4.2** Add deterministic transfer identifiers through injected entropy.
+- [x] **T3.4.2** Add deterministic transfer identifiers through injected entropy.
 - [ ] **T3.4.3** Add sender scenarios for mutation, truncation, growth, identity change, cancel, timeout, and mid-frame disconnect.
 - [ ] **T3.4.4** Add receiver scenarios for malformed offers, offsets, duplicates, checksum errors, collisions, cancellation, timeout, and disk failure.
 - [ ] **T3.4.5** Add concurrent transfer limit and shutdown tests.
@@ -418,3 +418,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `744b58f` | T3.3.5 | Tested macOS service lifecycle using only scripted commands. |
 | 2026-07-19 | this commit | T3.3.6 | Killed timed-out command process groups and verified cleanup. |
 | 2026-07-22 | this commit | T3.4.1 | Moved file-transfer flow onto generic typed framed streams with in-memory coverage. |
+| 2026-07-22 | this commit | T3.4.2 | Injected transfer ID generation and verified deterministic IDs across outgoing messages. |
