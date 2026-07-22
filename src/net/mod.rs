@@ -10,3 +10,5 @@ pub(crate) mod quinn_server;
 pub mod tls;
 pub mod transition;
 pub mod update;
+#[cfg(test)]
+pub(crate) mod update_http_fixture;
