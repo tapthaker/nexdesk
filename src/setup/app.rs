@@ -232,9 +232,7 @@ pub async fn run() -> Result<()> {
         // Drain any newly discovered peers from the mDNS browse task
         if let Some(rx) = &state.peer_receiver {
             while let Ok(peer) = rx.try_recv() {
-                if !state.discovered_peers.iter().any(|p| p.addr == peer.addr) {
-                    state.discovered_peers.push(peer);
-                }
+                merge_discovered_peer(&mut state.discovered_peers, peer);
             }
         }
 
@@ -413,6 +411,17 @@ async fn apply_step_with_terminal(
     result
 }
 
+fn merge_discovered_peer(peers: &mut Vec<DiscoveredPeer>, peer: DiscoveredPeer) {
+    if let Some(existing) = peers
+        .iter_mut()
+        .find(|existing| existing.fingerprint == peer.fingerprint)
+    {
+        *existing = peer;
+    } else {
+        peers.push(peer);
+    }
+}
+
 fn apply_network_selection(state: &mut SetupState) -> Result<()> {
     if state.use_discovery {
         let peer = state
@@ -553,6 +562,28 @@ mod tests {
             peer_receiver: None,
             _browse_handle: None,
         }
+    }
+
+    #[test]
+    fn discovered_identity_replaces_its_stale_address() {
+        let mut peers = vec![DiscoveredPeer {
+            name: "desk".to_string(),
+            platform: "linux".to_string(),
+            addr: "192.0.2.10:4242".parse().unwrap(),
+            fingerprint: "AA:BB:CC".to_string(),
+        }];
+        merge_discovered_peer(
+            &mut peers,
+            DiscoveredPeer {
+                name: "desk".to_string(),
+                platform: "linux".to_string(),
+                addr: "192.0.2.20:4242".parse().unwrap(),
+                fingerprint: "AA:BB:CC".to_string(),
+            },
+        );
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].addr, "192.0.2.20:4242".parse().unwrap());
     }
 
     #[test]

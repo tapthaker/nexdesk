@@ -45,14 +45,14 @@ pub async fn resolve_peer_with_retry(
 
 #[derive(Debug, Default)]
 pub struct DiscoveredPeerSet {
-    peers: BTreeMap<SocketAddr, DiscoveredPeer>,
+    peers: BTreeMap<String, DiscoveredPeer>,
 }
 
 impl DiscoveredPeerSet {
     pub fn apply(&mut self, event: DiscoveryEvent) {
         match event {
             DiscoveryEvent::Found(peer) => {
-                self.peers.insert(peer.addr, peer);
+                self.peers.insert(peer.fingerprint.clone(), peer);
             }
             DiscoveryEvent::Removed(name) => {
                 self.peers.retain(|_, peer| peer.name != name);
@@ -146,19 +146,18 @@ mod tests {
     }
 
     #[test]
-    fn peer_set_deduplicates_addresses_and_removes_names() {
-        let addr = "192.0.2.10:4242".parse().unwrap();
+    fn peer_set_tracks_identity_across_address_changes_and_removes_names() {
         let mut peers = DiscoveredPeerSet::default();
-        for platform in ["linux", "macos"] {
+        for addr in ["192.0.2.10:4242", "192.0.2.20:4242"] {
             peers.apply(DiscoveryEvent::Found(DiscoveredPeer {
                 name: "desk".to_string(),
-                platform: platform.to_string(),
-                addr,
+                platform: "linux".to_string(),
+                addr: addr.parse().unwrap(),
                 fingerprint: "AA:BB".to_string(),
             }));
         }
         assert_eq!(peers.peers().len(), 1);
-        assert_eq!(peers.peers()[0].platform, "macos");
+        assert_eq!(peers.peers()[0].addr, "192.0.2.20:4242".parse().unwrap());
 
         peers.apply(DiscoveryEvent::Removed("desk".to_string()));
         assert!(peers.peers().is_empty());
