@@ -40,7 +40,7 @@ where
     Ok(output_paths)
 }
 
-async fn receive_files_into<W, R>(
+pub(crate) async fn receive_files_into<W, R>(
     stream: &mut FileTransferMessageStream<W, R>,
     staging_dir: &Path,
 ) -> Result<Vec<PathBuf>>

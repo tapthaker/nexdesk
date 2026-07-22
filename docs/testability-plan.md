@@ -280,7 +280,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 - [x] **T5.2.1** Add a protocol decode/validation fuzz target.
 - [x] **T5.2.2** Add a framed-stream chunk-boundary fuzz target.
-- [ ] **T5.2.3** Add a file-transfer message-sequence fuzz target.
+- [x] **T5.2.3** Add a file-transfer message-sequence fuzz target.
 - [ ] **T5.2.4** Add bounded fuzz runs to scheduled CI and retain crashing artifacts.
 
 ### T5.3 — Mutation and coverage gates
@@ -453,3 +453,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | T5.1.5 | Documented source-parallel minimized-seed retention; initial property runs found no defects. |
 | 2026-07-22 | this commit | T5.2.1 | Added a libFuzzer target for framed protocol decoding, semantic validation, and re-encoding. |
 | 2026-07-22 | this commit | T5.2.2 | Added adversarial async chunk-boundary fuzzing cross-checked against slice decoding. |
+| 2026-07-22 | this commit | T5.2.3 | Added bounded semantic file-transfer sequence fuzzing through the production receiver and temporary storage. |

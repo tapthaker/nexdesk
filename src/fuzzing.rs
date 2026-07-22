@@ -44,6 +44,7 @@ fn fuzz_runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .expect("create fuzz runtime")
     })
@@ -105,6 +106,100 @@ pub fn exercise_framed_chunks(input: &[u8]) {
     }
 }
 
+/// Drive the production receiver with a bounded, byte-derived sequence of
+/// semantic file-transfer messages over in-memory framed streams.
+pub fn exercise_file_transfer_sequence(input: &[u8]) {
+    use crate::filetransfer::stream::{FileTransferMessage, FileTransferMessageStream};
+    use crate::net::protocol::FileInfo;
+
+    const TRANSFER_ID: u64 = 7;
+    let bytes = &input[..input.len().min(256)];
+    let size = u64::from(bytes.first().copied().unwrap_or(0) % 16);
+    let name = match bytes.get(1).copied().unwrap_or(0) % 4 {
+        0 => "fuzz.bin",
+        1 => "../escape",
+        2 => "",
+        _ => "nested/file",
+    };
+    let total_size = if bytes.get(2).copied().unwrap_or(0) & 1 == 0 {
+        size
+    } else {
+        size.saturating_add(1)
+    };
+    let mut messages = vec![FileTransferMessage::Offer {
+        transfer_id: TRANSFER_ID,
+        files: vec![FileInfo {
+            name: name.to_string(),
+            size,
+        }],
+        total_size,
+    }];
+
+    for chunk in bytes.get(3..).unwrap_or_default().chunks(5).take(48) {
+        let byte = |index: usize| chunk.get(index).copied().unwrap_or(0);
+        let transfer_id = if byte(1) & 1 == 0 {
+            TRANSFER_ID
+        } else {
+            TRANSFER_ID + 1
+        };
+        match byte(0) % 6 {
+            0 => messages.push(FileTransferMessage::Chunk {
+                transfer_id,
+                file_index: u32::from(byte(2) % 3),
+                offset: u64::from(byte(3) % 20),
+                data: if byte(4) & 1 == 0 {
+                    vec![byte(4)]
+                } else {
+                    Vec::new()
+                },
+            }),
+            1 => messages.push(FileTransferMessage::Complete {
+                transfer_id,
+                file_index: u32::from(byte(2) % 3),
+                checksum: if byte(3) & 1 == 0 {
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string()
+                } else {
+                    format!("{:02x}", byte(4))
+                },
+            }),
+            2 => messages.push(FileTransferMessage::Done { transfer_id }),
+            3 => messages.push(FileTransferMessage::Cancel { transfer_id }),
+            4 => messages.push(FileTransferMessage::Offer {
+                transfer_id,
+                files: Vec::new(),
+                total_size: 0,
+            }),
+            _ => messages.push(FileTransferMessage::Accept { transfer_id }),
+        }
+    }
+    messages.push(FileTransferMessage::Cancel {
+        transfer_id: TRANSFER_ID,
+    });
+
+    fuzz_runtime().block_on(async move {
+        let root = tempfile::tempdir().expect("create fuzz transfer root");
+        let (receiver_writer, peer_reader) = tokio::io::duplex(64 * 1024);
+        let (peer_writer, receiver_reader) = tokio::io::duplex(64 * 1024);
+        let mut receiver = FileTransferMessageStream::new(receiver_writer, receiver_reader);
+        let mut peer = FileTransferMessageStream::new(peer_writer, peer_reader);
+
+        let receive = crate::filetransfer::recv::receive_files_into(&mut receiver, root.path());
+        let send = async {
+            for message in messages {
+                if peer.send(message).await.is_err() {
+                    break;
+                }
+            }
+        };
+        let (result, ()) = tokio::join!(receive, send);
+        if let Ok(paths) = result {
+            for path in paths {
+                assert!(path.starts_with(root.path()));
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +216,12 @@ mod tests {
         exercise_framed_chunks(&chunked);
         exercise_framed_chunks(&[0]);
         exercise_framed_chunks(&[0, 0, 0]);
+    }
+
+    #[test]
+    fn file_transfer_sequence_harness_terminates_for_valid_and_invalid_flows() {
+        exercise_file_transfer_sequence(&[]);
+        exercise_file_transfer_sequence(&[0, 0, 0, 3, 0, 0, 0, 0]);
+        exercise_file_transfer_sequence(&[8, 1, 1, 0, 1, 2, 3, 4]);
     }
 }
