@@ -2651,9 +2651,145 @@ mod input_coalescing_tests {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use proptest::prelude::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    fn peer_direction_strategy() -> impl Strategy<Value = PeerDirection> {
+        prop_oneof![
+            Just(PeerDirection::Left),
+            Just(PeerDirection::Right),
+            Just(PeerDirection::Up),
+            Just(PeerDirection::Down),
+        ]
+    }
+
+    fn client_session_event_strategy() -> impl Strategy<Value = ClientInputEvent> {
+        prop_oneof![
+            peer_direction_strategy()
+                .prop_map(|direction| ClientInputEvent::SwitchToClient { direction }),
+            (-2_000i32..=2_000, -2_000i32..=2_000)
+                .prop_map(|(x, y)| ClientInputEvent::MouseMoved { x, y }),
+            (0u8..=7, any::<bool>()).prop_map(|(button, pressed)| {
+                ClientInputEvent::MouseButtonChanged { button, pressed }
+            }),
+            (0u32..=255, any::<bool>(), any::<u16>()).prop_map(|(keycode, pressed, modifiers)| {
+                ClientInputEvent::KeyChanged {
+                    keycode,
+                    pressed,
+                    modifiers,
+                }
+            }),
+            (-100i16..=100, -100i16..=100).prop_map(|(dx, dy)| {
+                ClientInputEvent::MouseScrolled {
+                    dx: f64::from(dx),
+                    dy: f64::from(dy),
+                    phase: PeerScrollPhase::None,
+                }
+            }),
+        ]
+    }
+
+    async fn run_generated_client_session(
+        rig: &crate::testing::ClientRig,
+        events: Vec<ClientInputEvent>,
+    ) {
+        for _ in 0..events.len() {
+            rig.peer.succeed_next_control_send();
+        }
+        for event in events {
+            rig.peer.push_event(ClientTransportEvent::Input(event));
+        }
+        rig.peer.push_channel_close(ClientChannel::Input);
+
+        let mut injector = rig.injector_factory.create().unwrap();
+        let mut transition = ClientTransition::new(1920, 1080);
+        let mut injected_keys = HashSet::new();
+        let mut injected_buttons = HashSet::new();
+
+        while let Some(event) = rig.peer.next_event().await {
+            match event {
+                ClientTransportEvent::Input(event) => {
+                    let original = protocol_input_message(event);
+                    match transition.handle(original.clone()) {
+                        ClientOutput::Ignore => {
+                            inject_late_release(
+                                &mut *injector,
+                                &original,
+                                &mut injected_keys,
+                                &mut injected_buttons,
+                            )
+                            .unwrap();
+                        }
+                        ClientOutput::Activate => {
+                            rig.display.wake_display().unwrap();
+                        }
+                        ClientOutput::InjectMove { x, y } => {
+                            injector.inject(&Message::MouseMove { x, y }).unwrap();
+                        }
+                        ClientOutput::Forward(message) => {
+                            injector.inject(&message).unwrap();
+                            track_injected_input(
+                                &message,
+                                &mut injected_keys,
+                                &mut injected_buttons,
+                            );
+                        }
+                        ClientOutput::SwitchBack { direction, inject } => {
+                            if let Some((x, y)) = inject {
+                                injector.inject(&Message::MouseMove { x, y }).unwrap();
+                            }
+                            restore_client_input_state(
+                                &mut *injector,
+                                &rig.display,
+                                &mut injected_keys,
+                                &mut injected_buttons,
+                            );
+                            rig.peer
+                                .send_control(ClientControlCommand::RequestSwitchBack {
+                                    direction: peer_direction(direction),
+                                })
+                                .await
+                                .unwrap();
+                        }
+                    }
+                }
+                ClientTransportEvent::Closed(ClientChannel::Input) => break,
+                other => panic!("unexpected generated client event: {other:?}"),
+            }
+        }
+
+        restore_client_input_state(
+            &mut *injector,
+            &rig.display,
+            &mut injected_keys,
+            &mut injected_buttons,
+        );
+        rig.peer.shutdown().await;
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn generated_client_sessions_restore_inputs_cursor_and_tasks(
+            events in prop::collection::vec(client_session_event_strategy(), 0..96),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let rig = crate::testing::ClientRig::new();
+                run_generated_client_session(&rig, events).await;
+                rig.assert_pressed_inputs(&[], &[]);
+                rig.assert_cursor_visible(true);
+                assert_eq!(rig.peer.pending_events(), 0);
+                rig.assert_tasks_completed();
+            });
+        }
+    }
 
     #[derive(Clone, Copy)]
     enum BlockingStage {
