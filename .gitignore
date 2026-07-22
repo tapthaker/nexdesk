@@ -1,4 +1,6 @@
 /target
+/fuzz/artifacts
+/fuzz/target
 *.swp
 *.swo
 *~

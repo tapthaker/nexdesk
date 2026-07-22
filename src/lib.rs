@@ -6,6 +6,8 @@ mod config;
 mod cursor;
 mod daemon;
 mod filetransfer;
+#[doc(hidden)]
+pub mod fuzzing;
 mod input;
 mod net;
 mod persistence;
