@@ -274,7 +274,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T5.1.2** Add generated `ServerTransition` sequences with grab and held-key invariants.
 - [x] **T5.1.3** Add generated full client-session sequences over the fake peer link.
 - [x] **T5.1.4** Add generated full server-session sequences over the fake peer link.
-- [ ] **T5.1.5** Persist minimal regression cases for every property-test defect found.
+- [x] **T5.1.5** Persist minimal regression cases for every property-test defect found.
 
 ### T5.2 — Fuzzing
 
@@ -450,3 +450,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | T5.1.2 | Generated server transition sequences and enforced grab and held-input cleanup invariants. |
 | 2026-07-22 | this commit | T5.1.3 | Ran generated typed client-input sessions through the fake peer and verified disconnect cleanup. |
 | 2026-07-22 | this commit | T5.1.4 | Ran generated server capture/peer sessions and verified grab, remote-input, and task cleanup. |
+| 2026-07-22 | this commit | T5.1.5 | Documented source-parallel minimized-seed retention; initial property runs found no defects. |
