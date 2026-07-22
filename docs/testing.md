@@ -69,6 +69,8 @@ cargo +nightly fuzz run file_transfer_sequence -- -max_total_time=60 -timeout=10
 
 Scheduled CI runs each target for two minutes and retains any files under `fuzz/artifacts/<target>` for 30 days. Reproduce and minimize a retained crash before committing it to the target's corpus with its fix.
 
+Targeted mutation-test commands and results are recorded in [`mutation-testing.md`](mutation-testing.md).
+
 Generate an LCOV coverage report after installing [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov):
 
 ```bash

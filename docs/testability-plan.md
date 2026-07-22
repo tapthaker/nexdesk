@@ -285,7 +285,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 ### T5.3 — Mutation and coverage gates
 
-- [ ] **T5.3.1** Run `cargo-mutants` against transition and protocol modules and record surviving mutants.
+- [x] **T5.3.1** Run `cargo-mutants` against transition and protocol modules and record surviving mutants.
 - [ ] **T5.3.2** Add tests that kill high-value surviving mutants.
 - [ ] **T5.3.3** Establish per-module coverage visibility for core and orchestration code.
 - [ ] **T5.3.4** Introduce a coverage threshold only after deterministic suites stabilize.
@@ -455,3 +455,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | T5.2.2 | Added adversarial async chunk-boundary fuzzing cross-checked against slice decoding. |
 | 2026-07-22 | this commit | T5.2.3 | Added bounded semantic file-transfer sequence fuzzing through the production receiver and temporary storage. |
 | 2026-07-22 | this commit | T5.2.4 | Scheduled independent bounded fuzz jobs and retained per-target crash artifacts for 30 days. |
+| 2026-07-22 | this commit | T5.3.1 | Tested 220 transition/protocol mutants: 209 caught, 11 unviable, and none survived. |
