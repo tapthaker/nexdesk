@@ -42,6 +42,30 @@ end_of_record
         self.assertIn("| Core | 50.0% | 100.0% |", rendered)
         self.assertIn("| Orchestration | 100.0% | 0.0% |", rendered)
 
+    def test_area_line_thresholds_report_only_regressions(self):
+        modules = {
+            "src/net/protocol.rs": coverage_summary.ModuleCoverage(
+                lines={1: 1, 2: 1, 3: 1, 4: 0}
+            ),
+            "src/app/update.rs": coverage_summary.ModuleCoverage(lines={1: 1, 2: 0}),
+        }
+
+        self.assertEqual(
+            coverage_summary.threshold_failures(
+                modules, {"Core": 75.0, "Orchestration": 50.0}
+            ),
+            [],
+        )
+        self.assertEqual(
+            coverage_summary.threshold_failures(
+                modules, {"Core": 80.0, "Orchestration": 60.0}
+            ),
+            [
+                "Core line coverage 75.0% is below 80.0%",
+                "Orchestration line coverage 50.0% is below 60.0%",
+            ],
+        )
+
     def test_normalizes_relative_and_windows_source_paths(self):
         self.assertEqual(
             coverage_summary.repository_path(r"C:\repo\src\setup\flow.rs"),

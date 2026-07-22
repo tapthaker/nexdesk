@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -75,6 +76,28 @@ def percent(covered: int, total: int) -> str:
     return "n/a" if total == 0 else f"{covered * 100 / total:.1f}%"
 
 
+def area_line_counts(
+    modules: dict[str, ModuleCoverage], area: str
+) -> tuple[int, int]:
+    selected = [coverage for path, coverage in modules.items() if category(path) == area]
+    return (
+        sum(coverage.covered_lines for coverage in selected),
+        sum(coverage.total_lines for coverage in selected),
+    )
+
+
+def threshold_failures(
+    modules: dict[str, ModuleCoverage], thresholds: dict[str, float]
+) -> list[str]:
+    failures = []
+    for area, minimum in thresholds.items():
+        covered, total = area_line_counts(modules, area)
+        actual = 0.0 if total == 0 else covered * 100 / total
+        if actual < minimum:
+            failures.append(f"{area} line coverage {actual:.1f}% is below {minimum:.1f}%")
+    return failures
+
+
 def render(modules: dict[str, ModuleCoverage]) -> str:
     selected = [(category(path), path, coverage) for path, coverage in modules.items()]
     selected = [entry for entry in selected if entry[0] is not None]
@@ -121,8 +144,25 @@ def render(modules: dict[str, ModuleCoverage]) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("lcov", type=Path)
+    parser.add_argument("--fail-under-core-lines", type=float)
+    parser.add_argument("--fail-under-orchestration-lines", type=float)
     args = parser.parse_args()
-    print(render(parse_lcov(args.lcov)), end="")
+    modules = parse_lcov(args.lcov)
+    print(render(modules), end="")
+
+    thresholds = {
+        area: minimum
+        for area, minimum in (
+            ("Core", args.fail_under_core_lines),
+            ("Orchestration", args.fail_under_orchestration_lines),
+        )
+        if minimum is not None
+    }
+    failures = threshold_failures(modules, thresholds)
+    if failures:
+        for failure in failures:
+            print(f"coverage threshold failed: {failure}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

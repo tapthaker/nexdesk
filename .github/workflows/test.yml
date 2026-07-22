@@ -96,10 +96,17 @@ jobs:
       - name: Generate LCOV report
         run: cargo llvm-cov --all-targets --lcov --output-path lcov.info
 
-      - name: Summarize core and orchestration coverage
+      - name: Enforce core and orchestration coverage floors
         run: |
-          python scripts/coverage-summary.py lcov.info | tee coverage-summary.md
+          set +e
+          python scripts/coverage-summary.py lcov.info \
+            --fail-under-core-lines 85 \
+            --fail-under-orchestration-lines 60 \
+            > coverage-summary.md
+          status=$?
+          cat coverage-summary.md
           cat coverage-summary.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
       - name: Store coverage reports
         uses: actions/upload-artifact@v4

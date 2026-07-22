@@ -83,7 +83,13 @@ CI stores `lcov.info` and `coverage-summary.md` as the `coverage-lcov` artifact.
 python scripts/coverage-summary.py lcov.info
 ```
 
-Coverage is initially informational and has no required percentage threshold.
+The deterministic Linux baseline currently reports 88.3% core line coverage and 64.2% orchestration line coverage. CI enforces conservative regression floors of 85% and 60%, respectively; it does not gate on function coverage yet. Reproduce the gate locally with:
+
+```bash
+python scripts/coverage-summary.py lcov.info \
+  --fail-under-core-lines 85 \
+  --fail-under-orchestration-lines 60
+```
 
 Run the opt-in live GitHub update contract smoke test only when external network access is intended:
 
