@@ -198,7 +198,11 @@ pub struct BrowseHandle {
 impl Drop for BrowseHandle {
     fn drop(&mut self) {
         if let Some(mdns) = self.mdns.take() {
-            mdns.shutdown().ok();
+            if let Ok(shutdown) = mdns.shutdown() {
+                // Ensure the daemon releases its cache and multicast sockets before
+                // setup starts a replacement browse session.
+                shutdown.recv_timeout(Duration::from_millis(250)).ok();
+            }
         }
     }
 }

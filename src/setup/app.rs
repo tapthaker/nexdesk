@@ -3,6 +3,7 @@ use std::io;
 use std::io::IsTerminal;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+use std::time::{Duration, Instant};
 
 use color_eyre::eyre::{eyre, Result};
 use crossterm::{
@@ -16,6 +17,8 @@ use crate::config::NexdeskConfig;
 use crate::net::discovery::{BrowseHandle, DiscoveredPeer};
 
 use super::{certificates, network, permissions, role, screens, service, welcome};
+
+const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -136,6 +139,7 @@ pub struct SetupState {
     accessibility_prompted: bool,
     peer_receiver: Option<std::sync::mpsc::Receiver<DiscoveredPeer>>,
     _browse_handle: Option<BrowseHandle>,
+    discovery_started_at: Option<Instant>,
 }
 
 impl SetupState {
@@ -156,8 +160,33 @@ impl SetupState {
             accessibility_prompted: false,
             peer_receiver: None,
             _browse_handle: None,
+            discovery_started_at: None,
         })
     }
+}
+
+fn restart_peer_browsing(state: &mut SetupState) {
+    state._browse_handle = None;
+    state.peer_receiver = None;
+    state.discovered_peers.clear();
+    state.peer_selection = 0;
+    state.discovery_started_at = Some(Instant::now());
+    match crate::net::discovery::start_browsing() {
+        Ok((receiver, handle)) => {
+            state.peer_receiver = Some(receiver);
+            state._browse_handle = Some(handle);
+        }
+        Err(error) => tracing::warn!("Failed to refresh peer discovery: {}", error),
+    }
+}
+
+fn discovery_refresh_due(state: &SetupState, now: Instant) -> bool {
+    state.step == Step::Network
+        && state.use_discovery
+        && state.discovered_peers.is_empty()
+        && state.discovery_started_at.is_some_and(|started| {
+            now.saturating_duration_since(started) >= DISCOVERY_REFRESH_INTERVAL
+        })
 }
 
 pub async fn run() -> Result<()> {
@@ -219,6 +248,10 @@ pub async fn run() -> Result<()> {
     let mut state = SetupState::new()?;
 
     loop {
+        if discovery_refresh_due(&state, Instant::now()) {
+            restart_peer_browsing(&mut state);
+        }
+
         // On the Permissions step, trigger the prompt once and poll for status
         if state.step == Step::Permissions {
             if !state.accessibility_prompted {
@@ -286,7 +319,7 @@ pub async fn run() -> Result<()> {
             } else if state.step == Step::Screens {
                 " ←↑↓→ Select edge | Enter: Next | Backspace: Back | q: Quit "
             } else if state.step == Step::Network {
-                " ↑/↓ Select peer | Tab: Switch mode | Enter: Next | Backspace: Back | q: Quit "
+                " ↑/↓ Select | R: Refresh | Tab: Switch mode | Enter: Next | Backspace: Back | q: Quit "
             } else {
                 " ←/→ Navigate | Enter: Next | q: Quit "
             };
@@ -358,6 +391,11 @@ pub async fn run() -> Result<()> {
                             }
                             _ => {}
                         }
+                    }
+                    KeyCode::Char('r') | KeyCode::Char('R')
+                        if state.step == Step::Network && state.use_discovery =>
+                    {
+                        restart_peer_browsing(&mut state);
                     }
                     KeyCode::Char(c) => {
                         if state.step == Step::Network && !state.use_discovery {
@@ -461,21 +499,16 @@ async fn apply_step(state: &mut SetupState) -> Result<()> {
                 }
                 .to_string(),
             );
-            // Stop any previous discovery
-            state._browse_handle = None;
-            state.peer_receiver = None;
-            state.discovered_peers.clear();
-            // Start mDNS discovery when role is client
+            // Start with a fresh mDNS daemon and multicast sockets when the
+            // client enters discovery. The browser will refresh periodically
+            // until a peer is found.
             if state.role_selection == 1 {
-                match crate::net::discovery::start_browsing() {
-                    Ok((rx, handle)) => {
-                        state.peer_receiver = Some(rx);
-                        state._browse_handle = Some(handle);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to start peer discovery: {}", e);
-                    }
-                }
+                restart_peer_browsing(state);
+            } else {
+                state._browse_handle = None;
+                state.peer_receiver = None;
+                state.discovered_peers.clear();
+                state.discovery_started_at = None;
             }
         }
         Step::Network => apply_network_selection(state)?,
@@ -561,7 +594,34 @@ mod tests {
             accessibility_prompted: false,
             peer_receiver: None,
             _browse_handle: None,
+            discovery_started_at: None,
         }
+    }
+
+    #[test]
+    fn empty_discovery_refreshes_on_a_bounded_interval() {
+        let mut state = state();
+        let started = Instant::now();
+        state.discovery_started_at = Some(started);
+
+        assert!(!discovery_refresh_due(
+            &state,
+            started + DISCOVERY_REFRESH_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(discovery_refresh_due(
+            &state,
+            started + DISCOVERY_REFRESH_INTERVAL
+        ));
+        state.discovered_peers.push(DiscoveredPeer {
+            name: "desk".to_string(),
+            platform: "linux".to_string(),
+            addr: "192.0.2.10:4242".parse().unwrap(),
+            fingerprint: "AA:BB".to_string(),
+        });
+        assert!(!discovery_refresh_due(
+            &state,
+            started + DISCOVERY_REFRESH_INTERVAL
+        ));
     }
 
     #[test]

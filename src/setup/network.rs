@@ -21,7 +21,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SetupState) {
 
         if state.discovered_peers.is_empty() {
             lines.push(Line::from(Span::styled(
-                "  Searching for peers...",
+                "  Searching for peers... (auto-refreshes every 5s; press R now)",
                 Style::default().fg(Color::Yellow),
             )));
         } else {
