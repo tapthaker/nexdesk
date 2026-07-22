@@ -314,7 +314,7 @@ The first complete client/server rigs must cover these release-blocking invarian
 - [ ] **A9** Untrusted peers cannot trigger an update.
 - [ ] **A10** Successful updates request restart; failed updates do not.
 - [x] **A11** Every outbound protocol message passes semantic validation.
-- [ ] **A12** Reconnect/discovery/file-transfer timeouts run under virtual time.
+- [x] **A12** Reconnect/discovery/file-transfer timeouts run under virtual time.
 
 ## Findings discovered during implementation
 
@@ -465,3 +465,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | T5.4.2 | Resolved all strict Clippy findings with behavior-preserving simplifications and documented composition-boundary exceptions. |
 | 2026-07-22 | this commit | T5.4.3 | Promoted all-target strict Clippy to a required CI job and documented the local gate. |
 | 2026-07-22 | this commit | A11 | Proved the shared outbound framing path rejects semantically invalid messages before writing any bytes. |
+| 2026-07-22 | this commit | A12 | Proved reconnect backoff uses virtual time alongside existing virtual-time discovery and file-transfer timeout coverage. |

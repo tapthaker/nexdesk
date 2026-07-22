@@ -3087,6 +3087,24 @@ mod lifecycle_tests {
         calls
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_backoff_runs_under_virtual_time() {
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move { wait_for_retry(&cancellation, Duration::from_secs(60)).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+
+        tokio::time::advance(Duration::from_secs(59)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(task.await.unwrap());
+    }
+
     #[tokio::test]
     async fn reconnect_loop_cancels_during_resolution() {
         let calls = cancel_at_stage(BlockingStage::Resolution).await;
