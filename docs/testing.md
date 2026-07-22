@@ -55,6 +55,8 @@ Run the explicit deterministic scenario gate:
 scripts/test-deterministic.sh
 ```
 
+This gate includes the fingerprint-rediscovery scenario that connects to an initial address, tolerates a reboot window and nonmatching advertisement, then reconnects to the same certificate identity at its new address.
+
 Before committing a change, run the narrowest relevant test command while developing, followed by formatting and `cargo test --all-targets` when the change can affect shared behavior.
 
 A single test can be run with a fully qualified filter, for example:

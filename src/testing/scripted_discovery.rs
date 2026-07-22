@@ -16,7 +16,10 @@ pub enum DiscoveryObservation {
     EventDelivered(DiscoveryEvent),
     BrowseClosed,
     Failed(String),
-    ResolveStarted(Duration),
+    ResolveStarted {
+        expected_fingerprint: String,
+        timeout: Duration,
+    },
     Resolved(SocketAddr),
 }
 
@@ -180,7 +183,10 @@ impl PeerDiscovery for ScriptedDiscovery {
         let expected_fingerprint = expected_fingerprint.to_uppercase();
         Box::pin(async move {
             self.observations
-                .record(DiscoveryObservation::ResolveStarted(timeout));
+                .record(DiscoveryObservation::ResolveStarted {
+                    expected_fingerprint: expected_fingerprint.clone(),
+                    timeout,
+                });
             let action = lock_recover(&self.scripts)
                 .resolves
                 .pop_front()

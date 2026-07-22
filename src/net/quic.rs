@@ -3067,6 +3067,86 @@ mod lifecycle_tests {
         }
     }
 
+    struct FingerprintRediscoveryDriver {
+        discovery: crate::testing::ScriptedDiscovery,
+        expected_fingerprint: String,
+        connected_addrs: Vec<SocketAddr>,
+        session_exits: VecDeque<SessionExit>,
+    }
+
+    impl ClientReconnectDriver for FingerprintRediscoveryDriver {
+        type Connected = SocketAddr;
+
+        async fn resolve_target(&mut self) -> Result<SocketAddr> {
+            crate::ports::PeerDiscovery::resolve_one(
+                &self.discovery,
+                &self.expected_fingerprint,
+                Duration::from_secs(1),
+            )
+            .await
+        }
+
+        async fn connect_target(&mut self, addr: SocketAddr) -> Result<Self::Connected> {
+            self.connected_addrs.push(addr);
+            Ok(addr)
+        }
+
+        async fn run_session(&mut self, _connected: Self::Connected) -> Result<SessionExit> {
+            self.session_exits
+                .pop_front()
+                .ok_or_else(|| eyre!("unexpected reconnect session"))
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_rediscovery_follows_fingerprint_to_changed_address_scenario() {
+        const FINGERPRINT: &str = "AA:BB:CC";
+        let old_addr = "192.0.2.10:4242".parse().unwrap();
+        let new_addr = "192.0.2.77:4242".parse().unwrap();
+        let discovery = crate::testing::ScriptedDiscovery::new();
+        discovery.resolve_to(FINGERPRINT, old_addr);
+        discovery.fail_resolve("server rebooting");
+        discovery.resolve_to("DD:EE:FF", old_addr);
+        discovery.resolve_to("aa:bb:cc", new_addr);
+
+        let mut driver = FingerprintRediscoveryDriver {
+            discovery: discovery.clone(),
+            expected_fingerprint: FINGERPRINT.to_string(),
+            connected_addrs: Vec::new(),
+            session_exits: VecDeque::from([SessionExit::Disconnected, SessionExit::Cancelled]),
+        };
+
+        let outcome = run_client_reconnect_loop(
+            &mut driver,
+            RetryPolicy::fixed(Duration::ZERO),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, SessionExit::Cancelled));
+        assert_eq!(driver.connected_addrs, [old_addr, new_addr]);
+        assert_eq!(discovery.remaining_resolves(), 0);
+
+        let observations = discovery.observations().snapshot();
+        let fingerprints = observations
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                crate::testing::DiscoveryObservation::ResolveStarted {
+                    expected_fingerprint,
+                    ..
+                } => Some(expected_fingerprint.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fingerprints, [FINGERPRINT; 4]);
+        assert!(observations.iter().any(|entry| matches!(
+            &entry.event,
+            crate::testing::DiscoveryObservation::Failed(message)
+                if message.contains("no peer matched fingerprint")
+        )));
+    }
+
     async fn wait_for_call(counter: &AtomicUsize) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while counter.load(Ordering::SeqCst) == 0 {
