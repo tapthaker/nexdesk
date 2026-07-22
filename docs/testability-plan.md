@@ -252,7 +252,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 - [x] **T4.2.1** Add a local HTTP server fixture for the reqwest adapter only.
 - [x] **T4.2.2** Test release lookup statuses, malformed JSON, chunked bodies, size limits, and timeouts.
-- [ ] **T4.2.3** Test binary download statuses, empty/truncated/chunked bodies, declared/actual size limits, and timeouts.
+- [x] **T4.2.3** Test binary download statuses, empty/truncated/chunked bodies, declared/actual size limits, and timeouts.
 - [ ] **T4.2.4** Test successful atomic installation in a temporary executable root.
 - [ ] **T4.2.5** Add an opt-in live GitHub contract smoke test that is excluded from normal CI.
 
@@ -326,6 +326,7 @@ The first complete client/server rigs must cover these release-blocking invarian
 | FT-4 | Fixed | A stalled sender could leave a receiver waiting forever. | T3.4.4 adds a virtual-time-covered receive timeout. |
 | FT-5 | Fixed | Each accepted file-transfer stream spawned an unbounded background task. | T3.4.5 bounds each connection to four transfers and aborts and joins all transfer tasks on shutdown. |
 | QUIC-1 | Fixed | Client Quinn channel readers were detached and could not be explicitly joined during shutdown. | T4.1.6 adds client peer-link shutdown, supervises all readers, and verifies both endpoints become idle. |
+| UPDATE-1 | Fixed | Undeclared oversized update bodies were bounded only later by the installer, not while the HTTP adapter streamed them. | T4.2.3 enforces the actual-byte limit in the response pump and propagates a reader error. |
 
 ## Progress log
 
@@ -436,3 +437,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | T4.1.6 | Joined client/server Quinn readers and verified graceful endpoint idleness. |
 | 2026-07-22 | this commit | T4.2.1 | Added a scripted localhost HTTP fixture for reqwest adapter contract tests. |
 | 2026-07-22 | this commit | T4.2.2 | Covered release metadata statuses, JSON parsing, chunking, size bounds, and timeout. |
+| 2026-07-22 | this commit | T4.2.3 | Covered executable HTTP status, body framing, declared/actual limits, and timeout. |

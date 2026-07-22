@@ -81,45 +81,63 @@ impl ReleaseRepository for GithubReleaseRepository {
                 release.version, platform
             );
             info!("Downloading update from {}", url);
-            let client = reqwest::Client::builder()
-                .user_agent("nexdesk")
-                .timeout(UPDATE_HTTP_TIMEOUT)
-                .build()
-                .map_err(|e| eyre!("Failed to build HTTP client: {}", e))?;
-            let response = client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| eyre!("Failed to download update: {}", e))?;
-            if !response.status().is_success() {
-                return Err(eyre!("Download failed with HTTP {}", response.status()));
-            }
-            let declared_size = response.content_length();
-            if declared_size.is_some_and(|length| length > MAX_UPDATE_SIZE) {
-                return Err(eyre!(
-                    "Downloaded binary is too large: {} bytes (max {})",
-                    declared_size.expect("declared size was checked"),
-                    MAX_UPDATE_SIZE
-                ));
-            }
-
-            let (sender, receiver) = mpsc::channel(1);
-            tokio::spawn(pump_response(response, sender));
-            Ok(ReleaseAsset::new(
-                declared_size,
-                Box::pin(HttpAssetReader {
-                    receiver,
-                    current: None,
-                }),
-            ))
+            let client = update_http_client(UPDATE_HTTP_TIMEOUT)?;
+            stream_asset_at(&client, &url, MAX_UPDATE_SIZE).await
         })
     }
 }
 
-async fn pump_response(mut response: reqwest::Response, sender: mpsc::Sender<io::Result<Vec<u8>>>) {
+async fn stream_asset_at(
+    client: &reqwest::Client,
+    url: &str,
+    max_size: u64,
+) -> Result<ReleaseAsset> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| eyre!("Failed to download update: {}", e))?;
+    if !response.status().is_success() {
+        return Err(eyre!("Download failed with HTTP {}", response.status()));
+    }
+    let declared_size = response.content_length();
+    if declared_size.is_some_and(|length| length > max_size) {
+        return Err(eyre!(
+            "Downloaded binary is too large: {} bytes (max {})",
+            declared_size.expect("declared size was checked"),
+            max_size
+        ));
+    }
+
+    let (sender, receiver) = mpsc::channel(1);
+    tokio::spawn(pump_response(response, sender, max_size));
+    Ok(ReleaseAsset::new(
+        declared_size,
+        Box::pin(HttpAssetReader {
+            receiver,
+            current: None,
+        }),
+    ))
+}
+
+async fn pump_response(
+    mut response: reqwest::Response,
+    sender: mpsc::Sender<io::Result<Vec<u8>>>,
+    max_size: u64,
+) {
+    let mut downloaded = 0u64;
     loop {
         let item = match response.chunk().await {
-            Ok(Some(chunk)) => Ok(chunk.to_vec()),
+            Ok(Some(chunk)) => match checked_downloaded_size(downloaded, chunk.len()) {
+                Ok(total) if total <= max_size => {
+                    downloaded = total;
+                    Ok(chunk.to_vec())
+                }
+                Ok(total) => Err(io::Error::other(format!(
+                    "Downloaded binary exceeded max size: {total} bytes (max {max_size})"
+                ))),
+                Err(error) => Err(io::Error::other(error.to_string())),
+            },
             Ok(None) => break,
             Err(error) => Err(io::Error::other(format!(
                 "Failed to read response body: {error}"
@@ -498,6 +516,111 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("response exceeded max size"));
+    }
+
+    async fn read_asset(asset: ReleaseAsset) -> io::Result<Vec<u8>> {
+        let mut reader = asset.into_reader();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await?;
+        Ok(bytes)
+    }
+
+    #[tokio::test]
+    async fn binary_download_rejects_http_statuses() {
+        let fixture = LocalHttpFixture::start().await;
+        let client = update_http_client(Duration::from_secs(1)).unwrap();
+        for status in [404, 500] {
+            fixture.push(ScriptedHttpResponse::bytes(status, "failure"));
+            let error = stream_asset_at(&client, &fixture.url("/asset"), 1024)
+                .await
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains(&format!("HTTP {status}")), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_download_exposes_empty_and_chunked_bodies() {
+        let fixture = LocalHttpFixture::start().await;
+        let client = update_http_client(Duration::from_secs(1)).unwrap();
+
+        fixture.push(ScriptedHttpResponse::bytes(200, Vec::new()));
+        let empty = stream_asset_at(&client, &fixture.url("/asset"), 1024)
+            .await
+            .unwrap();
+        assert_eq!(empty.declared_size, Some(0));
+        assert!(read_asset(empty).await.unwrap().is_empty());
+
+        fixture.push(ScriptedHttpResponse::chunked(
+            200,
+            vec![b"release ".to_vec(), b"binary".to_vec()],
+        ));
+        let chunked = stream_asset_at(&client, &fixture.url("/asset"), 1024)
+            .await
+            .unwrap();
+        assert_eq!(chunked.declared_size, None);
+        assert_eq!(read_asset(chunked).await.unwrap(), b"release binary");
+    }
+
+    #[tokio::test]
+    async fn truncated_binary_body_fails_during_streaming() {
+        let fixture = LocalHttpFixture::start().await;
+        fixture.push(ScriptedHttpResponse::truncated(200, 10, b"short".to_vec()));
+        let asset = stream_asset_at(
+            &update_http_client(Duration::from_secs(1)).unwrap(),
+            &fixture.url("/asset"),
+            1024,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(asset.declared_size, Some(10));
+        assert!(read_asset(asset).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn binary_download_enforces_declared_and_actual_size_limits() {
+        let fixture = LocalHttpFixture::start().await;
+        let client = update_http_client(Duration::from_secs(1)).unwrap();
+
+        fixture.push(
+            ScriptedHttpResponse::bytes(200, b"12345".to_vec()).with_header("Content-Length", 5),
+        );
+        assert!(stream_asset_at(&client, &fixture.url("/asset"), 4)
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("too large"));
+
+        fixture.push(ScriptedHttpResponse::chunked(
+            200,
+            vec![b"123".to_vec(), b"45".to_vec()],
+        ));
+        let asset = stream_asset_at(&client, &fixture.url("/asset"), 4)
+            .await
+            .unwrap();
+        assert!(read_asset(asset)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("exceeded max size"));
+    }
+
+    #[tokio::test]
+    async fn binary_download_timeout_is_bounded() {
+        let fixture = LocalHttpFixture::start().await;
+        fixture
+            .push(ScriptedHttpResponse::bytes(200, "late").with_delay(Duration::from_millis(200)));
+        let client = update_http_client(Duration::from_millis(25)).unwrap();
+
+        let error = stream_asset_at(&client, &fixture.url("/asset"), 1024)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("Failed to download update"), "{error}");
     }
 
     #[tokio::test]
