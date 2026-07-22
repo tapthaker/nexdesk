@@ -1,6 +1,7 @@
 mod app;
 mod certificates;
 pub mod edge_picker;
+mod flow;
 mod network;
 mod permissions;
 mod role;

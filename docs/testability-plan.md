@@ -259,7 +259,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 ### T4.3 — CLI and setup
 
 - [x] **T4.3.1** Add `assert_cmd` tests for help, invalid arguments, invalid configured roles/edges, and non-interactive errors.
-- [ ] **T4.3.2** Extract setup state transitions from terminal rendering/input.
+- [x] **T4.3.2** Extract setup state transitions from terminal rendering/input.
 - [ ] **T4.3.3** Add setup workflow tests for server/client roles, discovery/manual address, back navigation, and cancellation.
 - [ ] **T4.3.4** Add Ratatui buffer rendering tests for each setup screen.
 - [ ] **T4.3.5** Add service-install setup scenarios using fake service, trust, discovery, and pairing ports.
@@ -441,3 +441,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | T4.2.4 | Verified atomic executable replacement, final permissions, and temp-file cleanup in an isolated root. |
 | 2026-07-22 | this commit | T4.2.5 | Added a documented opt-in smoke test for live GitHub metadata and platform assets. |
 | 2026-07-22 | this commit | T4.3.1 | Added binary-level CLI coverage for help, argument/config validation, and non-interactive errors. |
+| 2026-07-22 | this commit | T4.3.2 | Moved semantic setup actions, navigation, and effects out of Crossterm input handling. |

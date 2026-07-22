@@ -16,113 +16,10 @@ use ratatui::{prelude::*, widgets::*};
 use crate::config::NexdeskConfig;
 use crate::net::discovery::{BrowseHandle, DiscoveredPeer};
 
+use super::flow::{advance_after_apply, reduce, SetupAction, SetupEffect, Step};
 use super::{certificates, network, permissions, role, screens, service, welcome};
 
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Step {
-    Welcome,
-    Role,
-    Network,
-    Screens,
-    Certificates,
-    Permissions,
-    Service,
-    Done,
-}
-
-impl Step {
-    fn next(self, role: Option<&str>) -> Self {
-        match self {
-            Step::Welcome => Step::Role,
-            Step::Role => match role {
-                Some("server") => Step::Screens,
-                _ => Step::Network,
-            },
-            Step::Network => Step::Certificates,
-            Step::Screens => Step::Certificates,
-            Step::Certificates => {
-                if cfg!(target_os = "macos") {
-                    Step::Permissions
-                } else {
-                    Step::Service
-                }
-            }
-            Step::Permissions => Step::Service,
-            Step::Service => Step::Done,
-            Step::Done => Step::Done,
-        }
-    }
-
-    fn prev(self, role: Option<&str>) -> Self {
-        match self {
-            Step::Welcome => Step::Welcome,
-            Step::Role => Step::Welcome,
-            Step::Network => Step::Role,
-            Step::Screens => Step::Role,
-            Step::Certificates => match role {
-                Some("server") => Step::Screens,
-                _ => Step::Network,
-            },
-            Step::Permissions => Step::Certificates,
-            Step::Service => {
-                if cfg!(target_os = "macos") {
-                    Step::Permissions
-                } else {
-                    Step::Certificates
-                }
-            }
-            Step::Done => Step::Service,
-        }
-    }
-
-    fn title(self) -> &'static str {
-        match self {
-            Step::Welcome => "Welcome",
-            Step::Role => "Role Selection",
-            Step::Network => "Network Configuration",
-            Step::Screens => "Screen Arrangement",
-            Step::Certificates => "Certificate Setup",
-            Step::Permissions => "Permissions",
-            Step::Service => "Install Service",
-            Step::Done => "Complete",
-        }
-    }
-
-    fn number(self, _role: Option<&str>) -> usize {
-        match self {
-            Step::Welcome => 1,
-            Step::Role => 2,
-            Step::Network => 3,
-            Step::Screens => 3,
-            Step::Certificates => 4,
-            Step::Permissions => 5,
-            Step::Service => {
-                if cfg!(target_os = "macos") {
-                    6
-                } else {
-                    5
-                }
-            }
-            Step::Done => {
-                if cfg!(target_os = "macos") {
-                    7
-                } else {
-                    6
-                }
-            }
-        }
-    }
-
-    fn total_steps() -> usize {
-        if cfg!(target_os = "macos") {
-            6
-        } else {
-            5
-        }
-    }
-}
 
 pub struct SetupState {
     pub step: Step,
@@ -283,13 +180,12 @@ pub async fn run() -> Result<()> {
                 .split(area);
 
             // Title bar
-            let role = state.config.role.as_deref();
             let title = if state.step == Step::Done {
                 " Nexdesk Setup - Complete ".to_string()
             } else {
                 format!(
                     " Nexdesk Setup - Step {}/{}: {} ",
-                    state.step.number(role),
+                    state.step.number(),
                     Step::total_steps(),
                     state.step.title()
                 )
@@ -334,88 +230,31 @@ pub async fn run() -> Result<()> {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Enter => {
-                        if state.step == Step::Done {
-                            break;
-                        }
-                        apply_step_with_terminal(&mut terminal, &mut state).await?;
-                        let role = state.config.role.as_deref().map(String::from);
-                        state.step = state.step.next(role.as_deref());
-                    }
-                    KeyCode::Right => {
-                        if state.step == Step::Screens {
-                            state.edge_selection = 1; // right
-                        } else {
-                            apply_step_with_terminal(&mut terminal, &mut state).await?;
-                            let role = state.config.role.as_deref().map(String::from);
-                            state.step = state.step.next(role.as_deref());
-                        }
-                    }
-                    KeyCode::Left => {
-                        if state.step == Step::Screens {
-                            state.edge_selection = 0; // left
-                        } else {
-                            let role = state.config.role.as_deref().map(String::from);
-                            state.step = state.step.prev(role.as_deref());
-                        }
-                    }
-                    KeyCode::Up => {
-                        match state.step {
-                            Step::Role => {
-                                state.role_selection = state.role_selection.saturating_sub(1);
-                            }
-                            Step::Network if state.use_discovery => {
-                                state.peer_selection = state.peer_selection.saturating_sub(1);
-                            }
-                            Step::Screens => {
-                                state.edge_selection = 2; // top
-                            }
-                            _ => {}
-                        }
-                    }
-                    KeyCode::Down => {
-                        match state.step {
-                            Step::Role => {
-                                state.role_selection = (state.role_selection + 1).min(1);
-                            }
-                            Step::Network
-                                if state.use_discovery && !state.discovered_peers.is_empty() =>
-                            {
-                                state.peer_selection = (state.peer_selection + 1)
-                                    .min(state.discovered_peers.len() - 1);
-                            }
-                            Step::Screens => {
-                                state.edge_selection = 3; // bottom
-                            }
-                            _ => {}
-                        }
-                    }
+                let action = match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => SetupAction::Quit,
+                    KeyCode::Enter => SetupAction::Next,
+                    KeyCode::Right => SetupAction::Right,
+                    KeyCode::Left => SetupAction::Left,
+                    KeyCode::Up => SetupAction::Up,
+                    KeyCode::Down => SetupAction::Down,
                     KeyCode::Char('r') | KeyCode::Char('R')
                         if state.step == Step::Network && state.use_discovery =>
                     {
-                        restart_peer_browsing(&mut state);
+                        SetupAction::RefreshDiscovery
                     }
-                    KeyCode::Char(c) => {
-                        if state.step == Step::Network && !state.use_discovery {
-                            state.manual_addr.push(c);
-                        }
+                    KeyCode::Char(character) => SetupAction::EnterCharacter(character),
+                    KeyCode::Backspace => SetupAction::DeleteCharacter,
+                    KeyCode::Tab => SetupAction::ToggleNetworkMode,
+                    _ => continue,
+                };
+                match reduce(&mut state, action) {
+                    SetupEffect::None => {}
+                    SetupEffect::Exit => break,
+                    SetupEffect::RefreshDiscovery => restart_peer_browsing(&mut state),
+                    SetupEffect::ApplyAndAdvance => {
+                        apply_step_with_terminal(&mut terminal, &mut state).await?;
+                        advance_after_apply(&mut state);
                     }
-                    KeyCode::Backspace => {
-                        if state.step == Step::Network && !state.use_discovery {
-                            state.manual_addr.pop();
-                        } else {
-                            let role = state.config.role.as_deref().map(String::from);
-                            state.step = state.step.prev(role.as_deref());
-                        }
-                    }
-                    KeyCode::Tab => {
-                        if state.step == Step::Network {
-                            state.use_discovery = !state.use_discovery;
-                        }
-                    }
-                    _ => {}
                 }
             }
         }
