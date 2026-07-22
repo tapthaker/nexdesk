@@ -878,7 +878,10 @@ async fn handle_server_connection(
     ));
     let clipboard_worker = clipboard.clone();
     let clipboard_peer = peer.clone();
-    let (clipboard_update_tx, mut clipboard_updates) = tokio::sync::mpsc::channel(8);
+    // A watch channel keeps only the newest peer clipboard while an OS command
+    // is in flight, preventing stale updates from queuing behind a slow owner.
+    let (clipboard_update_tx, mut clipboard_updates) =
+        tokio::sync::watch::channel(None::<protocol::ClipboardContent>);
     connection_tasks.spawn(async move {
         let interval = crate::clipboard::sync::ClipboardSync::poll_interval();
         loop {
@@ -898,15 +901,20 @@ async fn handle_server_connection(
                         }
                     }
                 }
-                Some(content) = clipboard_updates.recv() => {
-                    if let Err(error) = apply_clipboard_on_worker(
-                        clipboard_worker.clone(),
-                        content,
-                    ).await {
-                        warn!("Failed to apply clipboard update: {}", error);
+                result = clipboard_updates.changed() => {
+                    if result.is_err() {
+                        break;
+                    }
+                    let content = { clipboard_updates.borrow_and_update().clone() };
+                    if let Some(content) = content {
+                        if let Err(error) = apply_clipboard_on_worker(
+                            clipboard_worker.clone(),
+                            content,
+                        ).await {
+                            warn!("Failed to apply clipboard update: {}", error);
+                        }
                     }
                 }
-                else => break,
             }
         }
     });
@@ -1392,16 +1400,11 @@ async fn handle_server_connection(
                         });
                     }
                     Some(ServerTransportEvent::Clipboard(ServerClipboardEvent::TextChanged(text))) => {
-                        match clipboard_update_tx
-                            .try_send(protocol::ClipboardContent::Text(text))
+                        if clipboard_update_tx
+                            .send(Some(protocol::ClipboardContent::Text(text)))
+                            .is_err()
                         {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                warn!("Clipboard worker is busy; dropping peer update");
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                warn!("Clipboard worker stopped before peer update was applied");
-                            }
+                            warn!("Clipboard worker stopped before peer update was applied");
                         }
                     }
                     Some(ServerTransportEvent::Closed(channel)) => {
@@ -1917,7 +1920,10 @@ async fn run_client_session(
     let clipboard_sync = Arc::new(std::sync::Mutex::new(
         crate::clipboard::sync::ClipboardSync::new(clipboard_port.clone()),
     ));
-    let (clipboard_update_tx, mut clipboard_updates) = tokio::sync::mpsc::unbounded_channel();
+    // Coalesce peer clipboard updates while the platform clipboard command is
+    // running instead of replaying an unbounded backlog afterward.
+    let (clipboard_update_tx, mut clipboard_updates) =
+        tokio::sync::watch::channel(None::<protocol::ClipboardContent>);
     let clipboard_worker = clipboard_sync.clone();
     let clipboard_peer = peer.clone();
     let mut shutdown_rx1 = shutdown_tx.subscribe();
@@ -1939,12 +1945,18 @@ async fn run_client_session(
                         }
                     }
                 }
-                Some(content) = clipboard_updates.recv() => {
-                    if let Err(error) = apply_clipboard_on_worker(
-                        clipboard_worker.clone(),
-                        content,
-                    ).await {
-                        warn!("Failed to apply clipboard update: {}", error);
+                result = clipboard_updates.changed() => {
+                    if result.is_err() {
+                        break;
+                    }
+                    let content = { clipboard_updates.borrow_and_update().clone() };
+                    if let Some(content) = content {
+                        if let Err(error) = apply_clipboard_on_worker(
+                            clipboard_worker.clone(),
+                            content,
+                        ).await {
+                            warn!("Failed to apply clipboard update: {}", error);
+                        }
                     }
                 }
                 _ = shutdown_rx1.changed() => {
@@ -2219,7 +2231,7 @@ async fn run_client_session(
                     }
                     Some(ClientTransportEvent::Clipboard(ClientClipboardEvent::TextChanged(text))) => {
                         let content = protocol::ClipboardContent::Text(text);
-                        if clipboard_update_tx.send(content).is_err() {
+                        if clipboard_update_tx.send(Some(content)).is_err() {
                             warn!("Clipboard worker stopped before peer update was applied");
                         }
                     }

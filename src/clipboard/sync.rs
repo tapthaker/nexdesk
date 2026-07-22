@@ -8,6 +8,8 @@ use tracing::{debug, info, warn};
 use crate::net::protocol::{ClipboardContent, Message, MAX_CLIPBOARD_TEXT_BYTES};
 use crate::ports::Clipboard;
 
+const CLIPBOARD_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+
 fn clipboard_text_size_ok(text: &str) -> bool {
     text.len() <= MAX_CLIPBOARD_TEXT_BYTES
 }
@@ -103,6 +105,7 @@ fn read_text_with_runner(
     max_bytes: usize,
 ) -> Result<String> {
     let mut request = crate::ports::CommandRequest::new(program).args(args.iter().copied());
+    request.timeout = CLIPBOARD_COMMAND_TIMEOUT;
     request.max_stdout_bytes = max_bytes;
     let output = runner.run(&request)?;
     if output.stdout_truncated {
@@ -138,6 +141,7 @@ fn write_text_with_runner_options(
 ) -> Result<()> {
     let mut request = crate::ports::CommandRequest::new(program).args(args.iter().copied());
     request.stdin = text.as_bytes().to_vec();
+    request.timeout = CLIPBOARD_COMMAND_TIMEOUT;
     request.discard_output = discard_output;
     let output = runner.run(&request)?;
     if output.success {
@@ -470,6 +474,48 @@ mod tests {
     fn clipboard_size_limit_rejects_oversize() {
         let text = "a".repeat(MAX_CLIPBOARD_TEXT_BYTES + 1);
         assert!(!clipboard_text_size_ok(&text));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn platform_clipboard_commands_have_short_deadlines() {
+        use crate::ports::CommandOutput;
+        use crate::testing::{CommandObservation, ScriptedCommandRunner};
+
+        let runner = ScriptedCommandRunner::new();
+        for stdout in [b"clipboard".to_vec(), Vec::new()] {
+            runner.push_output(CommandOutput {
+                success: true,
+                code: Some(0),
+                signal: None,
+                stdout,
+                stderr: Vec::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            });
+        }
+
+        assert_eq!(
+            read_text_with_runner(&runner, "reader", &[], 1024).unwrap(),
+            "clipboard"
+        );
+        write_text_with_runner_options(&runner, "writer", &[], "text", true).unwrap();
+
+        let requests = runner
+            .observations()
+            .snapshot()
+            .into_iter()
+            .filter_map(|entry| match entry.event {
+                CommandObservation::Run(request) => Some(request),
+                CommandObservation::Failed(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request.timeout == CLIPBOARD_COMMAND_TIMEOUT));
+        assert!(!requests[0].discard_output);
+        assert!(requests[1].discard_output);
     }
 
     #[cfg(unix)]
