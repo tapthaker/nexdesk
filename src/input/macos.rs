@@ -205,11 +205,7 @@ impl MacOSInjector {
         };
         info!(
             "macOS injector: screen {}x{}, source_state={}, tap_location={}, post_mode={:?}",
-            screen_width,
-            screen_height,
-            source_state.0,
-            tap_location.0,
-            post_mode
+            screen_width, screen_height, source_state.0, tap_location.0, post_mode
         );
 
         Ok(Self {
