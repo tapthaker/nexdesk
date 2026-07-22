@@ -290,16 +290,25 @@ fn sync_directory(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::File::open(path)?.sync_all()
 }
 
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/tapthaker/nexdesk/releases/latest";
+
+fn update_http_client(timeout: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent("nexdesk")
+        .timeout(timeout)
+        .build()
+        .map_err(|e| eyre!("Failed to build HTTP client: {}", e))
+}
+
 /// Fetches the latest release tag from GitHub (e.g. "v0.1.8").
 pub async fn check_latest_version() -> Result<String> {
-    let client = reqwest::Client::builder()
-        .user_agent("nexdesk")
-        .timeout(UPDATE_HTTP_TIMEOUT)
-        .build()
-        .map_err(|e| eyre!("Failed to build HTTP client: {}", e))?;
+    let client = update_http_client(UPDATE_HTTP_TIMEOUT)?;
+    check_latest_version_at(&client, LATEST_RELEASE_URL).await
+}
 
+async fn check_latest_version_at(client: &reqwest::Client, url: &str) -> Result<String> {
     let mut resp = client
-        .get("https://api.github.com/repos/tapthaker/nexdesk/releases/latest")
+        .get(url)
         .send()
         .await
         .map_err(|e| eyre!("Failed to fetch latest release: {}", e))?;
@@ -386,6 +395,7 @@ pub async fn update_check_loop() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::update_http_fixture::{LocalHttpFixture, ScriptedHttpResponse};
 
     #[test]
     fn downloaded_size_accounting_rejects_overflow() {
@@ -423,5 +433,84 @@ mod tests {
     #[test]
     fn release_api_response_limit_is_small() {
         assert_eq!(MAX_RELEASE_API_RESPONSE_SIZE, 64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn release_lookup_rejects_http_statuses_and_malformed_json() {
+        let fixture = LocalHttpFixture::start().await;
+        let client = update_http_client(Duration::from_secs(1)).unwrap();
+        for status in [404, 500] {
+            fixture.push(ScriptedHttpResponse::bytes(status, "failure"));
+            let error = check_latest_version_at(&client, &fixture.url("/latest"))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("HTTP {status}")), "{error}");
+        }
+
+        fixture.push(ScriptedHttpResponse::bytes(200, "not json"));
+        assert!(check_latest_version_at(&client, &fixture.url("/latest"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to parse GitHub response"));
+    }
+
+    #[tokio::test]
+    async fn release_lookup_accepts_chunked_json() {
+        let fixture = LocalHttpFixture::start().await;
+        fixture.push(ScriptedHttpResponse::chunked(
+            200,
+            vec![b"{\"tag_".to_vec(), b"name\":\"v1.2.3\"}".to_vec()],
+        ));
+
+        let version = check_latest_version_at(
+            &update_http_client(Duration::from_secs(1)).unwrap(),
+            &fixture.url("/latest"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(version, "v1.2.3");
+    }
+
+    #[tokio::test]
+    async fn release_lookup_enforces_declared_and_streamed_size_limits() {
+        let fixture = LocalHttpFixture::start().await;
+        let client = update_http_client(Duration::from_secs(1)).unwrap();
+
+        fixture.push(
+            ScriptedHttpResponse::bytes(200, "{}")
+                .with_header("Content-Length", MAX_RELEASE_API_RESPONSE_SIZE + 1),
+        );
+        assert!(check_latest_version_at(&client, &fixture.url("/latest"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("response too large"));
+
+        fixture.push(ScriptedHttpResponse::chunked(
+            200,
+            vec![vec![b'x'; MAX_RELEASE_API_RESPONSE_SIZE as usize + 1]],
+        ));
+        assert!(check_latest_version_at(&client, &fixture.url("/latest"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("response exceeded max size"));
+    }
+
+    #[tokio::test]
+    async fn release_lookup_timeout_is_bounded() {
+        let fixture = LocalHttpFixture::start().await;
+        fixture.push(ScriptedHttpResponse::stalled());
+        let client = update_http_client(Duration::from_millis(25)).unwrap();
+
+        let error = check_latest_version_at(&client, &fixture.url("/latest"))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("Failed to fetch latest release"), "{error}");
     }
 }
