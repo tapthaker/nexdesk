@@ -522,6 +522,54 @@ impl ClientTransition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Clone, Debug)]
+    enum GeneratedClientEvent {
+        Message(Message),
+        Resize { width: u32, height: u32 },
+    }
+
+    fn direction_strategy() -> impl Strategy<Value = Direction> {
+        prop_oneof![
+            Just(Direction::Left),
+            Just(Direction::Right),
+            Just(Direction::Up),
+            Just(Direction::Down),
+        ]
+    }
+
+    fn client_event_strategy() -> impl Strategy<Value = GeneratedClientEvent> {
+        prop_oneof![
+            direction_strategy().prop_map(|direction| GeneratedClientEvent::Message(
+                Message::SwitchScreen { direction }
+            )),
+            (-10_000i32..=10_000, -10_000i32..=10_000)
+                .prop_map(|(x, y)| { GeneratedClientEvent::Message(Message::MouseMove { x, y }) }),
+            (0u8..=7, any::<bool>()).prop_map(|(button, pressed)| {
+                GeneratedClientEvent::Message(Message::MouseButton { button, pressed })
+            }),
+            (-100i16..=100, -100i16..=100).prop_map(|(dx, dy)| {
+                GeneratedClientEvent::Message(Message::MouseScroll {
+                    dx: f64::from(dx),
+                    dy: f64::from(dy),
+                    phase: crate::net::protocol::ScrollPhase::None,
+                })
+            }),
+            (0u32..=255, any::<bool>(), any::<u16>()).prop_map(|(keycode, pressed, modifiers)| {
+                GeneratedClientEvent::Message(Message::KeyEvent {
+                    keycode,
+                    pressed,
+                    modifiers,
+                })
+            }),
+            (1u32..=16_384, 1u32..=16_384)
+                .prop_map(|(width, height)| { GeneratedClientEvent::Resize { width, height } }),
+            any::<u64>().prop_map(
+                |timestamp| GeneratedClientEvent::Message(Message::Heartbeat { timestamp })
+            ),
+        ]
+    }
 
     fn server_screen() -> ScreenLayout {
         ScreenLayout {
@@ -998,6 +1046,64 @@ mod tests {
     }
 
     // ===== Client Tests =====
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn generated_client_sequences_preserve_cursor_and_input_safety(
+            initial_width in 1u32..=16_384,
+            initial_height in 1u32..=16_384,
+            events in prop::collection::vec(client_event_strategy(), 0..256),
+        ) {
+            let mut transition = ClientTransition::new(initial_width, initial_height);
+            let mut width = initial_width;
+            let mut height = initial_height;
+
+            for event in events {
+                match event {
+                    GeneratedClientEvent::Resize { width: next_width, height: next_height } => {
+                        transition.update_screen_size(next_width, next_height);
+                        width = next_width;
+                        height = next_height;
+                    }
+                    GeneratedClientEvent::Message(message) => {
+                        let was_active = transition.active;
+                        let is_press = matches!(
+                            &message,
+                            Message::KeyEvent { pressed: true, .. }
+                                | Message::MouseButton { pressed: true, .. }
+                        );
+                        let output = transition.handle(message);
+
+                        match output {
+                            ClientOutput::InjectMove { x, y } => {
+                                prop_assert!(was_active);
+                                prop_assert!((0..width as i32).contains(&x));
+                                prop_assert!((0..height as i32).contains(&y));
+                            }
+                            ClientOutput::SwitchBack { inject: Some((x, y)), .. } => {
+                                prop_assert!(was_active);
+                                prop_assert!((0..width as i32).contains(&x));
+                                prop_assert!((0..height as i32).contains(&y));
+                                prop_assert!(!transition.active);
+                            }
+                            ClientOutput::Forward(_) if is_press => {
+                                prop_assert!(was_active, "inactive client forwarded an input press");
+                            }
+                            ClientOutput::Activate => prop_assert!(transition.active),
+                            ClientOutput::Ignore
+                            | ClientOutput::Forward(_)
+                            | ClientOutput::SwitchBack { inject: None, .. } => {}
+                        }
+                    }
+                }
+
+                prop_assert!((0..width as i32).contains(&transition.cursor_x));
+                prop_assert!((0..height as i32).contains(&transition.cursor_y));
+            }
+        }
+    }
 
     #[test]
     fn client_inactive_ignores_mouse_move() {
