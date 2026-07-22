@@ -307,7 +307,7 @@ The first complete client/server rigs must cover these release-blocking invarian
 - [x] **A2** Client disconnect restores cursor visibility.
 - [x] **A3** Server disconnect releases all input grabs.
 - [x] **A4** Local session lock releases grabs before any network await.
-- [ ] **A5** Inactive client never injects key/button presses.
+- [x] **A5** Inactive client never injects key/button presses.
 - [ ] **A6** Switch-back races cannot leave synthetic input held.
 - [ ] **A7** Shutdown terminates all session-owned tasks.
 - [ ] **A8** Clipboard blocking cannot stall input/control processing.
@@ -470,3 +470,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | A2 | Reverified every client exit restores cursor visibility. |
 | 2026-07-22 | this commit | A3 | Reverified every server exit releases full and keyboard-only grabs. |
 | 2026-07-22 | this commit | A4 | Reverified lock handling in both capture modes releases local grabs before blocked network notification. |
+| 2026-07-22 | this commit | A5 | Reverified generated client sequences never forward input presses while inactive. |
