@@ -230,7 +230,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 - [x] **T3.4.1** Move file-transfer protocol flow onto reusable typed message streams independent of Quinn concrete stream types.
 - [x] **T3.4.2** Add deterministic transfer identifiers through injected entropy.
-- [ ] **T3.4.3** Add sender scenarios for mutation, truncation, growth, identity change, cancel, timeout, and mid-frame disconnect.
+- [x] **T3.4.3** Add sender scenarios for mutation, truncation, growth, identity change, cancel, timeout, and mid-frame disconnect.
 - [ ] **T3.4.4** Add receiver scenarios for malformed offers, offsets, duplicates, checksum errors, collisions, cancellation, timeout, and disk failure.
 - [ ] **T3.4.5** Add concurrent transfer limit and shutdown tests.
 - [ ] **T3.4.6** Add end-to-end in-memory file transfer tests using real temporary files.
@@ -320,7 +320,8 @@ The first complete client/server rigs must cover these release-blocking invarian
 
 | ID | Status | Finding | Planned test/fix |
 |---|---|---|---|
-| — | — | No implementation findings recorded yet. | — |
+| FT-1 | Fixed | The sender reopened offered paths and trusted stale sizes, allowing path replacement, mutation, truncation, or growth during transfer. | T3.4.3 pins open file identities, enforces offered sizes/metadata, cancels unsafe transfers, and covers each race. |
+| FT-2 | Fixed | File-transfer stream sends and offer responses had no bounded timeout. | T3.4.3 adds virtual-time-covered per-operation timeouts. |
 
 ## Progress log
 
@@ -419,3 +420,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | this commit | T3.3.6 | Killed timed-out command process groups and verified cleanup. |
 | 2026-07-22 | this commit | T3.4.1 | Moved file-transfer flow onto generic typed framed streams with in-memory coverage. |
 | 2026-07-22 | this commit | T3.4.2 | Injected transfer ID generation and verified deterministic IDs across outgoing messages. |
+| 2026-07-22 | this commit | T3.4.3 | Hardened and covered sender mutation races, cancellation, timeout, and disconnect behavior. |
