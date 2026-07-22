@@ -197,80 +197,86 @@ pub struct ExecutableUpdateInstaller;
 impl UpdateInstaller for ExecutableUpdateInstaller {
     fn install<'a>(&'a self, release: &'a Release, asset: ReleaseAsset) -> UpdateFuture<'a, ()> {
         Box::pin(async move {
-            if asset
-                .declared_size
-                .is_some_and(|length| length > MAX_UPDATE_SIZE)
-            {
-                return Err(eyre!(
-                    "Downloaded binary is too large: {} bytes (max {})",
-                    asset.declared_size.expect("declared size was checked"),
-                    MAX_UPDATE_SIZE
-                ));
-            }
             let exe_path = std::env::current_exe()
                 .map_err(|e| eyre!("Failed to get current exe path: {}", e))?;
-            let exe_dir = exe_path
-                .parent()
-                .ok_or_else(|| eyre!("Current exe has no parent directory"))?;
-            let (mut file, tmp_path) = create_update_temp_file(exe_dir)?;
-            let mut reader = asset.into_reader();
-            let mut buffer = vec![0u8; 64 * 1024];
-            let mut downloaded = 0u64;
-            loop {
-                let read = reader
-                    .read(&mut buffer)
-                    .await
-                    .map_err(|e| eyre!("Failed to read response body: {}", e))?;
-                if read == 0 {
-                    break;
-                }
-                downloaded = checked_downloaded_size(downloaded, read)?;
-                if downloaded > MAX_UPDATE_SIZE {
-                    return Err(eyre!(
-                        "Downloaded binary exceeded max size: {} bytes (max {})",
-                        downloaded,
-                        MAX_UPDATE_SIZE
-                    ));
-                }
-                file.write_all(&buffer[..read])
-                    .await
-                    .map_err(|e| eyre!("Failed to write temp file: {}", e))?;
-            }
-            file.flush()
-                .await
-                .map_err(|e| eyre!("Failed to flush temp file: {}", e))?;
-            file.sync_all()
-                .await
-                .map_err(|e| eyre!("Failed to sync temp update file: {}", e))?;
-            drop(file);
-            if downloaded == 0 {
-                return Err(eyre!("Downloaded binary is empty"));
-            }
-            info!("Downloaded {} bytes", downloaded);
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
-                    .map_err(|e| eyre!("Failed to set permissions: {}", e))?;
-                sync_file_path(&tmp_path)
-                    .map_err(|e| eyre!("Failed to sync executable permissions: {}", e))?;
-            }
-
-            tmp_path
-                .persist(&exe_path)
-                .map_err(|e| eyre!("Failed to replace executable: {}", e.error))?;
-            sync_directory(exe_dir).map_err(|e| {
-                eyre!(
-                    "Failed to sync executable directory after update ({}): {}",
-                    exe_dir.display(),
-                    e
-                )
-            })?;
-            info!("Successfully updated to {}", release.version);
-            Ok(())
+            install_asset_at(&exe_path, release, asset, MAX_UPDATE_SIZE).await
         })
     }
+}
+
+async fn install_asset_at(
+    exe_path: &Path,
+    release: &Release,
+    asset: ReleaseAsset,
+    max_size: u64,
+) -> Result<()> {
+    if asset.declared_size.is_some_and(|length| length > max_size) {
+        return Err(eyre!(
+            "Downloaded binary is too large: {} bytes (max {})",
+            asset.declared_size.expect("declared size was checked"),
+            max_size
+        ));
+    }
+    let exe_dir = exe_path
+        .parent()
+        .ok_or_else(|| eyre!("Current exe has no parent directory"))?;
+    let (mut file, tmp_path) = create_update_temp_file(exe_dir)?;
+    let mut reader = asset.into_reader();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut downloaded = 0u64;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|e| eyre!("Failed to read response body: {}", e))?;
+        if read == 0 {
+            break;
+        }
+        downloaded = checked_downloaded_size(downloaded, read)?;
+        if downloaded > max_size {
+            return Err(eyre!(
+                "Downloaded binary exceeded max size: {} bytes (max {})",
+                downloaded,
+                max_size
+            ));
+        }
+        file.write_all(&buffer[..read])
+            .await
+            .map_err(|e| eyre!("Failed to write temp file: {}", e))?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| eyre!("Failed to flush temp file: {}", e))?;
+    file.sync_all()
+        .await
+        .map_err(|e| eyre!("Failed to sync temp update file: {}", e))?;
+    drop(file);
+    if downloaded == 0 {
+        return Err(eyre!("Downloaded binary is empty"));
+    }
+    info!("Downloaded {} bytes", downloaded);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| eyre!("Failed to set permissions: {}", e))?;
+        sync_file_path(&tmp_path)
+            .map_err(|e| eyre!("Failed to sync executable permissions: {}", e))?;
+    }
+
+    tmp_path
+        .persist(exe_path)
+        .map_err(|e| eyre!("Failed to replace executable: {}", e.error))?;
+    sync_directory(exe_dir).map_err(|e| {
+        eyre!(
+            "Failed to sync executable directory after update ({}): {}",
+            exe_dir.display(),
+            e
+        )
+    })?;
+    info!("Successfully updated to {}", release.version);
+    Ok(())
 }
 
 /// Downloads the target version and atomically replaces the current executable.
@@ -419,6 +425,47 @@ mod tests {
     fn downloaded_size_accounting_rejects_overflow() {
         assert_eq!(checked_downloaded_size(10, 5).unwrap(), 15);
         assert!(checked_downloaded_size(u64::MAX, 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn installer_atomically_replaces_a_temporary_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("nexdesk");
+        std::fs::write(&executable, b"old executable").unwrap();
+        let replacement = b"new executable bytes".to_vec();
+
+        #[cfg(unix)]
+        let old_inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&executable).unwrap().ino()
+        };
+
+        install_asset_at(
+            &executable,
+            &Release::new("v9.9.9"),
+            ReleaseAsset::new(
+                Some(replacement.len() as u64),
+                Box::pin(std::io::Cursor::new(replacement.clone())),
+            ),
+            1024,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&executable).unwrap(), replacement);
+        let entries: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("nexdesk")]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let metadata = std::fs::metadata(&executable).unwrap();
+            assert_ne!(metadata.ino(), old_inode);
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
+        }
     }
 
     #[tokio::test]

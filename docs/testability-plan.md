@@ -253,7 +253,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T4.2.1** Add a local HTTP server fixture for the reqwest adapter only.
 - [x] **T4.2.2** Test release lookup statuses, malformed JSON, chunked bodies, size limits, and timeouts.
 - [x] **T4.2.3** Test binary download statuses, empty/truncated/chunked bodies, declared/actual size limits, and timeouts.
-- [ ] **T4.2.4** Test successful atomic installation in a temporary executable root.
+- [x] **T4.2.4** Test successful atomic installation in a temporary executable root.
 - [ ] **T4.2.5** Add an opt-in live GitHub contract smoke test that is excluded from normal CI.
 
 ### T4.3 — CLI and setup
@@ -438,3 +438,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | T4.2.1 | Added a scripted localhost HTTP fixture for reqwest adapter contract tests. |
 | 2026-07-22 | this commit | T4.2.2 | Covered release metadata statuses, JSON parsing, chunking, size bounds, and timeout. |
 | 2026-07-22 | this commit | T4.2.3 | Covered executable HTTP status, body framing, declared/actual limits, and timeout. |
+| 2026-07-22 | this commit | T4.2.4 | Verified atomic executable replacement, final permissions, and temp-file cleanup in an isolated root. |
