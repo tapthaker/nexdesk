@@ -244,7 +244,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T4.1.1** Create localhost Quinn test endpoints with ephemeral ports and temporary certificates.
 - [x] **T4.1.2** Test successful client/server handshake and all logical stream setup.
 - [x] **T4.1.3** Test invalid TLS identity, fingerprint mismatch, and untrusted pairing.
-- [ ] **T4.1.4** Test split frames, mid-frame closure, oversized frames, and malformed payloads.
+- [x] **T4.1.4** Test split frames, mid-frame closure, oversized frames, and malformed payloads.
 - [ ] **T4.1.5** Test control/input/clipboard independence under delay and closure.
 - [ ] **T4.1.6** Test graceful shutdown and verify endpoints/tasks become idle.
 
@@ -430,3 +430,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | T4.1.1 | Added ephemeral localhost Quinn endpoints backed by isolated temporary certificates. |
 | 2026-07-22 | this commit | T4.1.2 | Completed a real handshake and exchanged control, input, and clipboard traffic in both directions. |
 | 2026-07-22 | this commit | T4.1.3 | Rejected wrong TLS host identity, advertised fingerprint mismatch, and invalid untrusted-peer OTP. |
+| 2026-07-22 | this commit | T4.1.4 | Exercised byte-split, partial, oversized, and malformed frames over real Quinn streams. |

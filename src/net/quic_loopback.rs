@@ -435,4 +435,109 @@ mod tests {
         client.close(0u32.into(), b"pairing rejected");
         server.closed().await;
     }
+
+    #[tokio::test]
+    async fn framed_message_survives_single_byte_quic_splits() {
+        let fixture = QuicLoopback::new().unwrap();
+        let (server, client) = fixture.connect().await.unwrap();
+        let frame = protocol::encode(&protocol::Message::Heartbeat { timestamp: 99 }).unwrap();
+
+        let send = async {
+            let mut stream = server.open_uni().await?;
+            for byte in frame {
+                stream.write_all(&[byte]).await?;
+                tokio::task::yield_now().await;
+            }
+            stream.finish()?;
+            Ok::<(), color_eyre::Report>(())
+        };
+        let receive = async {
+            let mut stream = client.accept_uni().await?;
+            framing::recv_message(&mut stream).await
+        };
+        let ((), message) = tokio::try_join!(send, receive).unwrap();
+
+        assert!(matches!(
+            message,
+            Some(protocol::Message::Heartbeat { timestamp: 99 })
+        ));
+        client.close(0u32.into(), b"test complete");
+        server.closed().await;
+    }
+
+    #[tokio::test]
+    async fn quic_closure_mid_frame_is_not_a_clean_end_of_stream() {
+        let fixture = QuicLoopback::new().unwrap();
+        let (server, client) = fixture.connect().await.unwrap();
+
+        let send = async {
+            let mut stream = server.open_uni().await?;
+            stream.write_all(&10u32.to_be_bytes()).await?;
+            stream.write_all(&[1, 2, 3]).await?;
+            stream.finish()?;
+            Ok::<(), color_eyre::Report>(())
+        };
+        let receive = async {
+            let mut stream = client.accept_uni().await?;
+            framing::recv_message(&mut stream).await
+        };
+        let (send_result, result) = tokio::join!(send, receive);
+        send_result.unwrap();
+
+        assert!(result.unwrap_err().to_string().contains("mid-message body"));
+        client.close(0u32.into(), b"test complete");
+        server.closed().await;
+    }
+
+    #[tokio::test]
+    async fn oversized_quic_frame_is_rejected_before_its_body() {
+        let fixture = QuicLoopback::new().unwrap();
+        let (server, client) = fixture.connect().await.unwrap();
+
+        let send = async {
+            let mut stream = server.open_uni().await?;
+            stream
+                .write_all(&(protocol::MAX_MESSAGE_SIZE as u32 + 1).to_be_bytes())
+                .await?;
+            stream.finish()?;
+            Ok::<(), color_eyre::Report>(())
+        };
+        let receive = async {
+            let mut stream = client.accept_uni().await?;
+            framing::recv_message(&mut stream).await
+        };
+        let (send_result, result) = tokio::join!(send, receive);
+        send_result.unwrap();
+
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Message too large"));
+        client.close(0u32.into(), b"test complete");
+        server.closed().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_quic_payload_is_rejected_by_protocol_decode() {
+        let fixture = QuicLoopback::new().unwrap();
+        let (server, client) = fixture.connect().await.unwrap();
+
+        let send = async {
+            let mut stream = server.open_uni().await?;
+            stream.write_all(&4u32.to_be_bytes()).await?;
+            stream.write_all(&[0xff; 4]).await?;
+            stream.finish()?;
+            Ok::<(), color_eyre::Report>(())
+        };
+        let receive = async {
+            let mut stream = client.accept_uni().await?;
+            framing::recv_message(&mut stream).await
+        };
+        let (send_result, result) = tokio::join!(send, receive);
+        send_result.unwrap();
+
+        assert!(result.is_err());
+        client.close(0u32.into(), b"test complete");
+        server.closed().await;
+    }
 }
