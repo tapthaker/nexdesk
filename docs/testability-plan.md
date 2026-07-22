@@ -294,7 +294,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 ### T5.4 — Existing quality debt
 
 - [x] **T5.4.1** Resolve or explicitly annotate current dead-code warnings.
-- [ ] **T5.4.2** Resolve current strict-clippy findings without mixing behavior changes.
+- [x] **T5.4.2** Resolve current strict-clippy findings without mixing behavior changes.
 - [ ] **T5.4.3** Enable `cargo clippy --all-targets -- -D warnings` as a required check.
 
 ---
@@ -462,3 +462,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | T5.3.4 | Established 88.3%/64.2% line baselines and enforced conservative 85%/60% core/orchestration floors. |
 | 2026-07-22 | this commit | T5.3.5 | Required formatting, all-target tests, generated/scenario/QUIC suites, and safety-focused Clippy rules in CI. |
 | 2026-07-22 | this commit | T5.4.1 | Removed obsolete wrappers, used retained validation/mapping paths, and annotated intentional target/test adapters. |
+| 2026-07-22 | this commit | T5.4.2 | Resolved all strict Clippy findings with behavior-preserving simplifications and documented composition-boundary exceptions. |

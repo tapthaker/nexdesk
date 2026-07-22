@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
-use quinn::{Endpoint, RecvStream, SendStream};
+use quinn::Endpoint;
 use rand::Rng;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 use tokio::time::{self, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -1037,7 +1037,7 @@ async fn handle_server_connection(
 
                 // Log position every 500 polls (~1 second)
                 debug_counter += 1;
-                if debug_counter % 500 == 0 {
+                if debug_counter.is_multiple_of(500) {
                     let clamped_x = mx.clamp(0, sw as i32 - 1);
                     let clamped_y = my.clamp(0, sh as i32 - 1);
                     debug!("Mouse: ({}, {}) raw: ({}, {}) screen: {}x{}", clamped_x, clamped_y, mx, my, sw, sh);
@@ -1723,6 +1723,10 @@ async fn connect_with_cancellation(
     .await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "composition root wires explicit client capability ports"
+)]
 async fn connect_with_dependencies(
     addr: Option<&str>,
     expected_fingerprint: Option<String>,
@@ -1754,6 +1758,10 @@ async fn connect_with_dependencies(
 }
 
 /// Handle one established client connection, including handshake and session loops.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "session boundary receives explicit transport and platform capabilities"
+)]
 async fn run_client_session(
     connection: quinn::Connection,
     addr: SocketAddr,
@@ -2645,7 +2653,7 @@ mod input_coalescing_tests {
 mod lifecycle_tests {
     use super::*;
     use proptest::prelude::*;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 

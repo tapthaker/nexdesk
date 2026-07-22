@@ -20,6 +20,8 @@ enum PointerKind {
     Absolute { abs_x_range: f64, abs_y_range: f64 },
 }
 
+type PointerDevices = (Vec<(PathBuf, PointerKind)>, HashSet<PathBuf>);
+
 struct PointerDevice {
     device: Device,
     kind: PointerKind,
@@ -45,9 +47,7 @@ fn input_event_entries() -> Result<Vec<PathBuf>> {
 
 /// Find pointer devices: mice (REL_X/REL_Y) and touchpads (ABS_X/ABS_Y + BTN_TOUCH).
 /// Returns (path, kind) pairs and also collects the paths that were claimed as pointers.
-fn find_pointer_devices(
-    entries: &[PathBuf],
-) -> Result<(Vec<(PathBuf, PointerKind)>, HashSet<PathBuf>)> {
+fn find_pointer_devices(entries: &[PathBuf]) -> Result<PointerDevices> {
     let mut found = Vec::new();
     let mut claimed = HashSet::new();
 
@@ -75,7 +75,7 @@ fn find_pointer_devices(
             if axes.contains(AbsoluteAxisType::ABS_X) && axes.contains(AbsoluteAxisType::ABS_Y) {
                 let has_btn_touch = device
                     .supported_keys()
-                    .map_or(false, |k| k.contains(Key::BTN_TOUCH));
+                    .is_some_and(|k| k.contains(Key::BTN_TOUCH));
                 let name_lower = name.to_lowercase();
                 let name_match = name_lower.contains("trackpad") || name_lower.contains("touchpad");
 
@@ -128,7 +128,7 @@ fn find_pointer_devices(
 }
 
 fn has_keyboard_or_media_keys(device: &Device) -> bool {
-    device.supported_keys().map_or(false, |keys| {
+    device.supported_keys().is_some_and(|keys| {
         keys.contains(Key::KEY_A)
             || keys.contains(Key::KEY_LEFTMETA)
             || keys.contains(Key::KEY_RIGHTMETA)

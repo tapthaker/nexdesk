@@ -1,7 +1,7 @@
-/// Keycode translation between evdev (Linux) and macOS virtual keycodes.
-///
-/// Evdev keycodes follow linux/input-event-codes.h.
-/// macOS keycodes are CGKeyCode / kVK_* virtual key codes.
+//! Keycode translation between evdev (Linux) and macOS virtual keycodes.
+//!
+//! Evdev keycodes follow linux/input-event-codes.h.
+//! macOS keycodes are CGKeyCode / kVK_* virtual key codes.
 
 /// Sentinel value for unmapped keys.
 const NONE: u16 = 0xFFFF;

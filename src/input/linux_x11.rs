@@ -100,9 +100,7 @@ impl InputCapture for X11Capturer {
         let keymap = reply.keys;
 
         let mut events = Vec::new();
-        for byte_idx in 0..32 {
-            let old = self.prev_keymap[byte_idx];
-            let new = keymap[byte_idx];
+        for (byte_idx, (&old, &new)) in self.prev_keymap.iter().zip(&keymap).enumerate() {
             if old != new {
                 for bit in 0..8 {
                     let x_keycode = (byte_idx * 8 + bit) as u32;
@@ -134,28 +132,6 @@ impl InputCapture for X11Capturer {
 fn evdev_to_x11_keycode(evdev: u32) -> Option<u8> {
     let x11 = evdev.checked_add(8)?;
     u8::try_from(x11).ok().filter(|code| *code >= 8)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{evdev_to_x11_keycode, x11_to_evdev_keycode};
-
-    #[test]
-    fn evdev_to_x11_uses_standard_offset() {
-        assert_eq!(evdev_to_x11_keycode(57), Some(65)); // KEY_SPACE
-        assert_eq!(evdev_to_x11_keycode(164), Some(172)); // KEY_PLAYPAUSE
-    }
-
-    #[test]
-    fn x11_to_evdev_uses_standard_offset() {
-        assert_eq!(x11_to_evdev_keycode(65), Some(57)); // KEY_SPACE
-        assert_eq!(x11_to_evdev_keycode(172), Some(164)); // KEY_PLAYPAUSE
-    }
-
-    #[test]
-    fn invalid_x11_keycode_is_ignored() {
-        assert_eq!(x11_to_evdev_keycode(7), None);
-    }
 }
 
 /// X11-based input injector using XTest extension.
@@ -278,5 +254,27 @@ impl InputInjector for X11Injector {
             .reply()
             .wrap_err("Failed to query screen geometry")?;
         Ok((reply.width as u32, reply.height as u32))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{evdev_to_x11_keycode, x11_to_evdev_keycode};
+
+    #[test]
+    fn evdev_to_x11_uses_standard_offset() {
+        assert_eq!(evdev_to_x11_keycode(57), Some(65)); // KEY_SPACE
+        assert_eq!(evdev_to_x11_keycode(164), Some(172)); // KEY_PLAYPAUSE
+    }
+
+    #[test]
+    fn x11_to_evdev_uses_standard_offset() {
+        assert_eq!(x11_to_evdev_keycode(65), Some(57)); // KEY_SPACE
+        assert_eq!(x11_to_evdev_keycode(172), Some(164)); // KEY_PLAYPAUSE
+    }
+
+    #[test]
+    fn invalid_x11_keycode_is_ignored() {
+        assert_eq!(x11_to_evdev_keycode(7), None);
     }
 }

@@ -73,7 +73,7 @@ pub async fn advertise(port: u16) -> Result<()> {
         "unknown"
     };
 
-    let instance_name = format!("{hostname}");
+    let instance_name = hostname.to_string();
     let ip = local_ipv4().unwrap_or_default();
     let fingerprint = local_certificate_fingerprint()?;
     let service = ServiceInfo::new(
@@ -162,7 +162,7 @@ pub fn start_advertising(port: u16) -> Result<AdvertiseHandle> {
         "unknown"
     };
 
-    let instance_name = format!("{hostname}");
+    let instance_name = hostname.to_string();
     let ip = local_ipv4().unwrap_or_default();
     let fingerprint = local_certificate_fingerprint()?;
     let service = ServiceInfo::new(

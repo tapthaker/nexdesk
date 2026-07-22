@@ -130,7 +130,7 @@ impl ServerTransition {
             return None;
         };
 
-        if self.trigger_edge.map_or(true, |edge| edge == direction) {
+        if self.trigger_edge.is_none_or(|edge| edge == direction) {
             Some(direction)
         } else {
             None
@@ -290,7 +290,7 @@ impl ServerTransition {
 
         if !self.active {
             let at_edge = edge::detect_edge(clamped_x, clamped_y, sw, sh)
-                .filter(|d| self.trigger_edge.map_or(true, |e| *d == e));
+                .filter(|d| self.trigger_edge.is_none_or(|e| *d == e));
 
             if self.edge_cooldown > 0 {
                 self.edge_cooldown -= 1;

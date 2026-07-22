@@ -155,13 +155,8 @@ pub async fn run() -> Result<()> {
     let _tty_guard = {
         let stdin_fd = io::stdin().as_raw_fd();
         let flags = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
-        let need_reopen = if !io::stdin().is_terminal() {
-            true
-        } else if flags >= 0 && (flags & libc::O_ACCMODE == libc::O_RDONLY) {
-            true
-        } else {
-            false
-        };
+        let need_reopen =
+            !io::stdin().is_terminal() || flags >= 0 && (flags & libc::O_ACCMODE == libc::O_RDONLY);
         if need_reopen {
             // Try to get the actual PTY device path via ttyname on stdin,
             // stdout, or stderr. On macOS, kqueue returns EINVAL for /dev/tty
