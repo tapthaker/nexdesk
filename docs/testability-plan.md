@@ -233,7 +233,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T3.4.3** Add sender scenarios for mutation, truncation, growth, identity change, cancel, timeout, and mid-frame disconnect.
 - [x] **T3.4.4** Add receiver scenarios for malformed offers, offsets, duplicates, checksum errors, collisions, cancellation, timeout, and disk failure.
 - [x] **T3.4.5** Add concurrent transfer limit and shutdown tests.
-- [ ] **T3.4.6** Add end-to-end in-memory file transfer tests using real temporary files.
+- [x] **T3.4.6** Add end-to-end in-memory file transfer tests using real temporary files.
 
 ---
 
@@ -426,3 +426,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | T3.4.3 | Hardened and covered sender mutation races, cancellation, timeout, and disconnect behavior. |
 | 2026-07-22 | this commit | T3.4.4 | Rejected malformed receiver flows, unsafe destinations, checksum failures, stalls, and storage errors. |
 | 2026-07-22 | this commit | T3.4.5 | Bounded incoming transfer tasks and proved capacity recovery and joined shutdown. |
+| 2026-07-22 | this commit | T3.4.6 | Transferred empty, small, and multi-chunk real files end to end over in-memory streams. |

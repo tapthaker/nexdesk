@@ -581,6 +581,44 @@ mod tests {
         assert!(result.unwrap().is_empty());
     }
 
+    struct EndToEndTransferId;
+
+    impl crate::filetransfer::id::TransferIdSource for EndToEndTransferId {
+        fn next_transfer_id(&self) -> u64 {
+            9001
+        }
+    }
+
+    #[tokio::test]
+    async fn sender_and_receiver_transfer_real_files_over_memory_streams() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let small_path = source.path().join("small.txt");
+        let large_path = source.path().join("large.bin");
+        let empty_path = source.path().join("empty.txt");
+        let small = b"hello from nexdesk".to_vec();
+        let large: Vec<u8> = (0..super::super::CHUNK_SIZE + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        tokio::fs::write(&small_path, &small).await.unwrap();
+        tokio::fs::write(&large_path, &large).await.unwrap();
+        tokio::fs::write(&empty_path, []).await.unwrap();
+
+        let (mut receiver, mut sender) = memory_stream_pair();
+        let send = crate::filetransfer::send::send_files_over_stream(
+            &mut sender,
+            vec![small_path, large_path, empty_path],
+            &EndToEndTransferId,
+        );
+        let receive = receive_files_into(&mut receiver, destination.path());
+        let ((), output_paths) = tokio::try_join!(send, receive).unwrap();
+
+        assert_eq!(output_paths.len(), 3);
+        assert_eq!(tokio::fs::read(&output_paths[0]).await.unwrap(), small);
+        assert_eq!(tokio::fs::read(&output_paths[1]).await.unwrap(), large);
+        assert!(tokio::fs::read(&output_paths[2]).await.unwrap().is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn receiver_times_out_waiting_for_transfer_data() {
         let root = tempfile::tempdir().unwrap();
