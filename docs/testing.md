@@ -77,7 +77,13 @@ Generate an LCOV coverage report after installing [`cargo-llvm-cov`](https://git
 cargo llvm-cov --all-targets --lcov --output-path lcov.info
 ```
 
-CI stores `lcov.info` as the `coverage-lcov` artifact. Coverage is initially informational and has no required percentage threshold.
+CI stores `lcov.info` and `coverage-summary.md` as the `coverage-lcov` artifact. The job summary reports line and function coverage per core/orchestration module and grouped area totals. Generate the same summary locally with:
+
+```bash
+python scripts/coverage-summary.py lcov.info
+```
+
+Coverage is initially informational and has no required percentage threshold.
 
 Run the opt-in live GitHub update contract smoke test only when external network access is intended:
 

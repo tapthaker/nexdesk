@@ -96,11 +96,18 @@ jobs:
       - name: Generate LCOV report
         run: cargo llvm-cov --all-targets --lcov --output-path lcov.info
 
-      - name: Store coverage report
+      - name: Summarize core and orchestration coverage
+        run: |
+          python scripts/coverage-summary.py lcov.info | tee coverage-summary.md
+          cat coverage-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Store coverage reports
         uses: actions/upload-artifact@v4
         with:
           name: coverage-lcov
-          path: lcov.info
+          path: |
+            lcov.info
+            coverage-summary.md
           retention-days: 14
 
   macos:
