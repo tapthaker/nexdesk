@@ -42,6 +42,7 @@ pub enum ClientControlEvent {
     HeartbeatAcknowledged { timestamp: u64 },
     PeerScreenChanged(PeerScreen),
     WakeDisplay,
+    ReleaseControl,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,6 +109,7 @@ pub enum ServerControlCommand {
     AcknowledgeHeartbeat { timestamp: u64 },
     LocalScreenChanged(PeerScreen),
     WakePeerDisplay,
+    ReleasePeerControl,
 }
 
 #[derive(Clone, Debug, PartialEq)]

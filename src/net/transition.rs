@@ -452,6 +452,14 @@ impl ClientTransition {
         self.cursor_y = self.cursor_y.clamp(0, h as i32 - 1);
     }
 
+    /// Stop accepting remote input because the server reclaimed control.
+    pub fn release_control(&mut self) {
+        self.active = false;
+        self.first_move = false;
+        self.edge_dwell = 0;
+        self.switch_back_edge = None;
+    }
+
     pub fn handle(&mut self, message: Message) -> ClientOutput {
         match message {
             Message::SwitchScreen { direction } => {
@@ -1271,6 +1279,35 @@ mod tests {
                 prop_assert!((0..height as i32).contains(&transition.cursor_y));
             }
         }
+    }
+
+    #[test]
+    fn client_forced_release_stops_remote_input() {
+        let mut transition = ClientTransition::new(1920, 1080);
+        assert!(matches!(
+            transition.handle(Message::SwitchScreen {
+                direction: Direction::Right,
+            }),
+            ClientOutput::Activate
+        ));
+
+        transition.release_control();
+
+        assert!(matches!(
+            transition.handle(Message::MouseButton {
+                button: 0,
+                pressed: true,
+            }),
+            ClientOutput::Ignore
+        ));
+        assert!(matches!(
+            transition.handle(Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            }),
+            ClientOutput::Ignore
+        ));
     }
 
     #[test]

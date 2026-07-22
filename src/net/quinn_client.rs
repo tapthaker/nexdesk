@@ -165,6 +165,7 @@ fn map_control_message(message: Message) -> std::result::Result<ClientTransportE
             height: screen.height,
         }),
         Message::WakeDisplay => ClientControlEvent::WakeDisplay,
+        Message::ReleaseControl => ClientControlEvent::ReleaseControl,
         other => return Err(unexpected_message(ClientChannel::Control, &other)),
     };
     Ok(ClientTransportEvent::Control(event))
@@ -271,6 +272,10 @@ mod tests {
         assert_eq!(
             map_control_message(Message::Heartbeat { timestamp: 7 }).unwrap(),
             ClientTransportEvent::Control(ClientControlEvent::Heartbeat { timestamp: 7 })
+        );
+        assert_eq!(
+            map_control_message(Message::ReleaseControl).unwrap(),
+            ClientTransportEvent::Control(ClientControlEvent::ReleaseControl)
         );
         assert_eq!(
             map_input_message(Message::MouseButton {

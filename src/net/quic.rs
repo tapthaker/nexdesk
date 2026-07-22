@@ -419,6 +419,17 @@ fn restore_client_input_state(
     }
 }
 
+fn release_client_control(
+    transition: &mut ClientTransition,
+    injector: &mut dyn InputInjector,
+    display_control: &dyn DisplaySessionControl,
+    injected_keys: &mut HashSet<u32>,
+    injected_buttons: &mut HashSet<u8>,
+) {
+    transition.release_control();
+    restore_client_input_state(injector, display_control, injected_keys, injected_buttons);
+}
+
 async fn terminate_server_tasks(tasks: &mut tokio::task::JoinSet<()>) {
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
@@ -1448,6 +1459,12 @@ async fn handle_server_connection(
                                     send_message_uni(&mut sender, &msg).await.ok();
                                 }
                             }
+                            if let Err(error) = peer
+                                .send_control(ServerControlCommand::ReleasePeerControl)
+                                .await
+                            {
+                                warn!("Failed to tell peer that the server reclaimed control: {}", error);
+                            }
                         },
                     )
                     .await;
@@ -2235,6 +2252,18 @@ async fn run_client_session(
                     Some(ClientTransportEvent::Control(ClientControlEvent::WakeDisplay)) => {
                         debug!("Peer user active — keeping this system awake");
                         display_control.wake_display().ok();
+                    }
+                    Some(ClientTransportEvent::Control(ClientControlEvent::ReleaseControl)) => {
+                        info!("Server reclaimed input control");
+                        pending_mouse_move = None;
+                        activation_started = None;
+                        release_client_control(
+                            &mut transition,
+                            &mut *injector,
+                            display_control,
+                            &mut injected_keys,
+                            &mut injected_buttons,
+                        );
                     }
                     Some(ClientTransportEvent::Clipboard(ClientClipboardEvent::TextChanged(text))) => {
                         let content = protocol::ClipboardContent::Text(text);
@@ -3248,6 +3277,54 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn server_lock_release_reclaims_client_input_and_cursor() {
+        let rig = crate::testing::ClientRig::new();
+        let mut transition = ClientTransition::new(1920, 1080);
+        assert!(matches!(
+            transition.handle(Message::SwitchScreen {
+                direction: protocol::Direction::Right,
+            }),
+            ClientOutput::Activate
+        ));
+        let mut injector = rig.injector_factory.create().unwrap();
+        injector.set_cursor_visible(false).unwrap();
+        injector
+            .inject(&Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            })
+            .unwrap();
+        injector
+            .inject(&Message::MouseButton {
+                button: 0,
+                pressed: true,
+            })
+            .unwrap();
+        let mut keys = HashSet::from([30]);
+        let mut buttons = HashSet::from([0]);
+
+        release_client_control(
+            &mut transition,
+            &mut *injector,
+            &rig.display,
+            &mut keys,
+            &mut buttons,
+        );
+
+        rig.assert_pressed_inputs(&[], &[]);
+        rig.assert_cursor_visible(true);
+        assert!(matches!(
+            transition.handle(Message::KeyEvent {
+                keycode: 31,
+                pressed: true,
+                modifiers: 0,
+            }),
+            ClientOutput::Ignore
+        ));
+    }
+
+    #[test]
     fn injected_input_cleanup_uses_display_control_port() {
         let mut injector = crate::testing::RecordingInjector::new((1920, 1080));
         let display = crate::testing::FakeDisplaySessionControl::new();
@@ -3663,6 +3740,8 @@ mod lifecycle_tests {
             let messages = transition.deactivate_for_shortcut();
             rig.peer
                 .succeed_next_send(crate::testing::ServerSendOperation::Input);
+            rig.peer
+                .succeed_next_send(crate::testing::ServerSendOperation::Control);
             notify_after_local_input_release(
                 || {
                     if layer_shell {
@@ -3671,7 +3750,12 @@ mod lifecycle_tests {
                         capture.set_grab(false).unwrap();
                     }
                 },
-                send_server_input_messages(&rig.peer, messages),
+                async {
+                    send_server_input_messages(&rig.peer, messages).await?;
+                    rig.peer
+                        .send_control(ServerControlCommand::ReleasePeerControl)
+                        .await
+                },
             )
             .await
             .unwrap();
@@ -3689,13 +3773,16 @@ mod lifecycle_tests {
                 ]
             };
             rig.assert_grab_history(&expected);
-            rig.assert_outbound_peer_messages(&[crate::testing::ServerPeerObservation::InputSend(
-                ServerInputCommand::KeyChanged {
+            rig.assert_outbound_peer_messages(&[
+                crate::testing::ServerPeerObservation::InputSend(ServerInputCommand::KeyChanged {
                     keycode: 30,
                     pressed: false,
                     modifiers: 0,
-                },
-            )]);
+                }),
+                crate::testing::ServerPeerObservation::ControlSend(
+                    ServerControlCommand::ReleasePeerControl,
+                ),
+            ]);
         }
     }
 

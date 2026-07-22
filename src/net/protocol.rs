@@ -133,10 +133,13 @@ pub enum Message {
 
     // Peer user activity: ask the OS to treat the display/session as active.
     WakeDisplay,
+
+    // Server-side session lock or policy release: return control to the server.
+    ReleaseControl,
 }
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Build version string burned in at compile time (e.g. "v0.1.2" or "v0.1.2-3-gabcdef").
 pub const BUILD_VERSION: &str = env!("NEXDESK_VERSION");
@@ -171,6 +174,7 @@ pub fn message_summary(msg: &Message) -> String {
         Message::FileTransferDone { .. } => "FileTransferDone".into(),
         Message::FileTransferCancel { .. } => "FileTransferCancel".into(),
         Message::WakeDisplay => "WakeDisplay".into(),
+        Message::ReleaseControl => "ReleaseControl".into(),
     }
 }
 

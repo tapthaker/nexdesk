@@ -197,6 +197,7 @@ fn control_command_message(command: ServerControlCommand) -> Message {
             },
         },
         ServerControlCommand::WakePeerDisplay => Message::WakeDisplay,
+        ServerControlCommand::ReleasePeerControl => Message::ReleaseControl,
     }
 }
 
@@ -311,6 +312,10 @@ mod tests {
         assert!(matches!(
             control_command_message(ServerControlCommand::WakePeerDisplay),
             Message::WakeDisplay
+        ));
+        assert!(matches!(
+            control_command_message(ServerControlCommand::ReleasePeerControl),
+            Message::ReleaseControl
         ));
     }
 
