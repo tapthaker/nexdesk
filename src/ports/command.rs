@@ -10,6 +10,10 @@ pub struct CommandRequest {
     pub timeout: Duration,
     pub max_stdout_bytes: usize,
     pub max_stderr_bytes: usize,
+    /// Send stdout and stderr to /dev/null instead of piping them back.
+    /// Required for commands such as wl-copy and xclip whose daemonized
+    /// clipboard owner can inherit output descriptors after the parent exits.
+    pub discard_output: bool,
 }
 
 impl CommandRequest {
@@ -21,6 +25,7 @@ impl CommandRequest {
             timeout: Duration::from_secs(10),
             max_stdout_bytes: 64 * 1024,
             max_stderr_bytes: 64 * 1024,
+            discard_output: false,
         }
     }
 
@@ -72,6 +77,7 @@ mod tests {
         let request = CommandRequest::new("true");
         assert_eq!(request.timeout, Duration::from_secs(10));
         assert_eq!(request.max_stdout_bytes, 64 * 1024);
+        assert!(!request.discard_output);
         assert!(runner.run(&request).unwrap().success);
     }
 }

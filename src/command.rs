@@ -39,11 +39,12 @@ pub fn run_checked(
 impl CommandRunner for RealCommandRunner {
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput> {
         let mut command = Command::new(&request.program);
-        command
-            .args(&request.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        command.args(&request.args).stdin(Stdio::piped());
+        if request.discard_output {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        } else {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -186,5 +187,22 @@ mod tests {
             .unwrap();
         let process_exists = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!process_exists, "timed-out child process {pid} survived");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discarded_output_does_not_wait_for_descriptors_inherited_by_a_daemon() {
+        let mut request = CommandRequest::new("sh").args(["-c", "sleep 1 &"]);
+        request.discard_output = true;
+        let started = Instant::now();
+
+        let output = RealCommandRunner.run(&request).unwrap();
+
+        assert!(output.success);
+        assert!(output.stdout.is_empty() && output.stderr.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "runner waited for daemonized descendants"
+        );
     }
 }
