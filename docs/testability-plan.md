@@ -305,7 +305,7 @@ The first complete client/server rigs must cover these release-blocking invarian
 
 - [x] **A1** Client disconnect releases all tracked keys and buttons.
 - [x] **A2** Client disconnect restores cursor visibility.
-- [ ] **A3** Server disconnect releases all input grabs.
+- [x] **A3** Server disconnect releases all input grabs.
 - [ ] **A4** Local session lock releases grabs before any network await.
 - [ ] **A5** Inactive client never injects key/button presses.
 - [ ] **A6** Switch-back races cannot leave synthetic input held.
@@ -468,3 +468,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | A12 | Proved reconnect backoff uses virtual time alongside existing virtual-time discovery and file-transfer timeout coverage. |
 | 2026-07-22 | this commit | A1 | Reverified disconnect cleanup for tracked client keys and buttons. |
 | 2026-07-22 | this commit | A2 | Reverified every client exit restores cursor visibility. |
+| 2026-07-22 | this commit | A3 | Reverified every server exit releases full and keyboard-only grabs. |
