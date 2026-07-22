@@ -1004,7 +1004,9 @@ async fn handle_server_connection(
     info!("Screen size: {}x{}", screen_w, screen_h);
 
     let mut poll_interval = time::interval(MOUSE_POLL_INTERVAL);
+    poll_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut layer_shell_key_poll_interval = time::interval(MOUSE_POLL_INTERVAL);
+    layer_shell_key_poll_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut pointer_send_interval = time::interval(POINTER_FRAME_INTERVAL);
     pointer_send_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut pending_layer_shell_motion = (0.0f64, 0.0f64);
@@ -3653,6 +3655,64 @@ mod lifecycle_tests {
             crate::testing::ServerPeerObservation::InputSend(ServerInputCommand::KeyChanged {
                 keycode: 56,
                 pressed: false,
+                modifiers: 0,
+            }),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn held_server_key_repeats_over_the_peer_input_channel() {
+        let rig = crate::testing::ServerRig::new();
+        let mut transition = ServerTransition::new(
+            None,
+            ScreenLayout {
+                width: 2560,
+                height: 1440,
+            },
+        );
+        transition.activate_instant(protocol::Direction::Right);
+
+        let mut key_messages = Vec::new();
+        if let ServerOutput::Forward { messages } =
+            transition.poll_active_keys(vec![Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            }])
+        {
+            key_messages.extend(messages);
+        }
+        for _ in 0..300 {
+            if let ServerOutput::Forward { messages } = transition.poll_active_keys(Vec::new()) {
+                key_messages.extend(messages);
+            }
+            if key_messages.len() >= 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            key_messages.len(),
+            2,
+            "expected initial and repeat key-downs"
+        );
+
+        for _ in &key_messages {
+            rig.peer
+                .succeed_next_send(crate::testing::ServerSendOperation::Input);
+        }
+        send_server_input_messages(&rig.peer, key_messages)
+            .await
+            .unwrap();
+
+        rig.assert_outbound_peer_messages(&[
+            crate::testing::ServerPeerObservation::InputSend(ServerInputCommand::KeyChanged {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            }),
+            crate::testing::ServerPeerObservation::InputSend(ServerInputCommand::KeyChanged {
+                keycode: 30,
+                pressed: true,
                 modifiers: 0,
             }),
         ]);

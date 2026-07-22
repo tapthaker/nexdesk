@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::cursor::edge;
 use crate::net::protocol::{Direction, Message, ScreenLayout};
@@ -10,10 +10,17 @@ const SERVER_EDGE_COOLDOWN: u32 = 125;
 const INSET: i32 = 20;
 const CLIENT_EDGE_DWELL: u32 = 8;
 
-// Do not synthesize keyboard repeat in nexdesk. The client OS will repeat
-// naturally after a forwarded key-down. Synthesizing repeat here is dangerous:
-// if the Linux capturer misses a key-up during a switch-back/grab transition,
-// the stale pressed key becomes an endless stream of key-downs on the client.
+/// Polls before the first repeat (~500ms at the 2ms server polling interval).
+const KEY_REPEAT_DELAY: u32 = 250;
+/// Polls between repeats (~30ms, or approximately 33 repeats per second).
+const KEY_REPEAT_INTERVAL: u32 = 15;
+
+fn key_repeats(keycode: u32) -> bool {
+    !matches!(
+        keycode,
+        29 | 42 | 54 | 56 | 58 | 97 | 100 | 125 | 126 // Ctrl, Shift, Alt, Caps Lock, Meta
+    )
+}
 
 // Evdev keycodes for the safety escape combo (Ctrl+Alt+Escape)
 const KEY_ESC: u32 = 1;
@@ -60,6 +67,7 @@ pub struct ServerTransition {
     edge_dwell: u32,
     pressed_keys: HashSet<u32>,
     pressed_buttons: HashSet<u8>,
+    repeat_polls: BTreeMap<u32, u32>,
 }
 
 impl ServerTransition {
@@ -75,6 +83,7 @@ impl ServerTransition {
             edge_dwell: 0,
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
+            repeat_polls: BTreeMap::new(),
         }
     }
 
@@ -146,6 +155,7 @@ impl ServerTransition {
     }
 
     pub fn release_remote_inputs(&mut self) -> Vec<Message> {
+        self.repeat_polls.clear();
         let mut keys: Vec<u32> = self.pressed_keys.drain().collect();
         keys.sort_unstable();
         let mut buttons: Vec<u8> = self.pressed_buttons.drain().collect();
@@ -175,6 +185,7 @@ impl ServerTransition {
         self.edge_dwell = 0;
         self.edge_cooldown = 0;
         self.pressed_buttons.clear();
+        self.repeat_polls.clear();
 
         let pw = self.peer_screen.width as i32;
         let ph = self.peer_screen.height as i32;
@@ -201,8 +212,32 @@ impl ServerTransition {
     }
 
     fn push_key_events(&mut self, key_events: Vec<Message>, messages: &mut Vec<Message>) {
-        // No synthetic repeats. Forward only real press/release transitions.
+        for event in &key_events {
+            if let Message::KeyEvent {
+                keycode, pressed, ..
+            } = event
+            {
+                if *pressed && key_repeats(*keycode) {
+                    self.repeat_polls.entry(*keycode).or_insert(0);
+                } else {
+                    self.repeat_polls.remove(keycode);
+                }
+            }
+        }
         messages.extend(key_events);
+
+        for (&keycode, polls) in &mut self.repeat_polls {
+            *polls = polls.saturating_add(1);
+            if *polls >= KEY_REPEAT_DELAY
+                && (*polls - KEY_REPEAT_DELAY).is_multiple_of(KEY_REPEAT_INTERVAL)
+            {
+                messages.push(Message::KeyEvent {
+                    keycode,
+                    pressed: true,
+                    modifiers: 0,
+                });
+            }
+        }
     }
 
     pub fn poll_active_keys(&mut self, key_events: Vec<Message>) -> ServerOutput {
@@ -359,7 +394,7 @@ impl ServerTransition {
                 self.last_buttons = buttons;
             }
 
-            // Keyboard events: forward originals and synthesize repeats.
+            // Keyboard events: forward physical transitions and synthesize repeat presses.
             self.push_key_events(key_events, &mut messages);
 
             ServerOutput::Forward { messages }
@@ -383,6 +418,7 @@ impl ServerTransition {
 
     pub fn deactivate(&mut self) {
         self.active = false;
+        self.repeat_polls.clear();
     }
 
     pub fn deactivate_for_shortcut(&mut self) -> Vec<Message> {
@@ -950,6 +986,32 @@ mod tests {
                     m,
                     Message::KeyEvent { keycode: 115, pressed: true, .. }
                 ))
+        ));
+    }
+
+    #[test]
+    fn server_active_key_polling_repeats_held_keys() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        activate_server(&mut st);
+        st.poll_active_keys(vec![Message::KeyEvent {
+            keycode: 30,
+            pressed: true,
+            modifiers: 0,
+        }]);
+
+        for _ in 0..KEY_REPEAT_DELAY - 2 {
+            let output = st.poll_active_keys(Vec::new());
+            assert!(matches!(output, ServerOutput::Forward { messages } if messages.is_empty()));
+        }
+
+        assert!(matches!(
+            st.poll_active_keys(Vec::new()),
+            ServerOutput::Forward { messages }
+                if matches!(messages.as_slice(), [Message::KeyEvent {
+                    keycode: 30,
+                    pressed: true,
+                    modifiers: 0,
+                }])
         ));
     }
 
@@ -1605,35 +1667,68 @@ mod tests {
     // ===== Key Repeat Tests =====
 
     #[test]
-    fn server_does_not_synthesize_key_repeat() {
+    fn server_repeats_held_non_modifier_keys_after_delay() {
         let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
         activate_server(&mut st);
 
-        // Press a non-modifier key (KEY_A = 30)
-        let key = vec![Message::KeyEvent {
-            keycode: 30,
-            pressed: true,
-            modifiers: 0,
-        }];
-        st.poll(1919, 500, 1920, 1080, 0, key);
+        let first = st.poll(
+            1919,
+            500,
+            1920,
+            1080,
+            0,
+            vec![Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            }],
+        );
+        assert!(matches!(
+            first,
+            ServerOutput::Forward { messages }
+                if messages.iter().filter(|message| matches!(
+                    message,
+                    Message::KeyEvent { keycode: 30, pressed: true, .. }
+                )).count() == 1
+        ));
 
-        // Holding the key without new physical events must not generate more
-        // key-down messages. The client OS handles natural key repeat.
-        for _ in 0..500 {
-            let out = st.poll(1919, 500, 1920, 1080, 0, vec![]);
-            if let ServerOutput::Forward { messages } = out {
-                assert!(
-                    !messages.iter().any(|m| matches!(
-                        m,
-                        Message::KeyEvent {
-                            keycode: 30,
-                            pressed: true,
-                            ..
-                        }
-                    )),
-                    "server must not synthesize repeat key-downs"
-                );
-            }
+        for _ in 0..KEY_REPEAT_DELAY - 2 {
+            let output = st.poll(1919, 500, 1920, 1080, 0, vec![]);
+            assert!(matches!(output, ServerOutput::Forward { messages } if messages.is_empty()));
+        }
+
+        let repeat = st.poll(1919, 500, 1920, 1080, 0, vec![]);
+        assert!(matches!(
+            repeat,
+            ServerOutput::Forward { messages }
+                if matches!(messages.as_slice(), [Message::KeyEvent {
+                    keycode: 30,
+                    pressed: true,
+                    modifiers: 0,
+                }])
+        ));
+    }
+
+    #[test]
+    fn server_does_not_repeat_modifier_keys() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        activate_server(&mut st);
+        st.poll(
+            1919,
+            500,
+            1920,
+            1080,
+            0,
+            vec![Message::KeyEvent {
+                keycode: KEY_LEFTSHIFT,
+                pressed: true,
+                modifiers: 0,
+            }],
+        );
+
+        for _ in 0..KEY_REPEAT_DELAY + KEY_REPEAT_INTERVAL {
+            let output = st.poll(1919, 500, 1920, 1080, 0, vec![]);
+            assert!(matches!(output, ServerOutput::Forward { messages } if messages.is_empty()));
         }
     }
 
@@ -1663,6 +1758,11 @@ mod tests {
                     Message::KeyEvent { keycode: 30, pressed: false, .. }
                 ))
         ));
+
+        for _ in 0..KEY_REPEAT_DELAY + KEY_REPEAT_INTERVAL {
+            let output = st.poll(1919, 500, 1920, 1080, 0, vec![]);
+            assert!(matches!(output, ServerOutput::Forward { messages } if messages.is_empty()));
+        }
     }
 
     // ===== activate_instant Tests =====

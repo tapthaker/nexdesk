@@ -330,6 +330,7 @@ The first complete client/server rigs must cover these release-blocking invarian
 | SETUP-1 | Fixed | Setup finalization directly invoked pairing and service installation, preventing isolated ordering and failure scenarios. | T4.3.5 adds semantic setup ports and injects trust, persistence roots, pairing, and service installation. |
 | QUALITY-1 | Fixed | Retired wrappers and Linux builds of target-specific/test adapters produced unclassified dead-code warnings. | T5.4.1 removes obsolete code, uses retained helpers in production, gates target-specific mappings, and documents intentional retained adapters. |
 | LOCK-1 | Fixed | Locking the server released its local grab but left the client transition active, so input control did not return cleanly to the server. | Protocol v5 adds an explicit server-to-client control release that restores the client cursor and injected input state after the local grab is released. |
+| INPUT-1 | Fixed | A held server key produced only one synthetic key-down, and injected client input did not receive operating-system key repeat. | Server transitions now generate deterministic delayed repeats for non-modifier keys, stop on key-up, and clear repeat state during every control-release path. |
 
 ## Progress log
 
