@@ -35,6 +35,16 @@ fn normalize_config_edge(edge: &str) -> String {
     edge.trim().to_ascii_lowercase()
 }
 
+fn validate_configured_role(role: Option<&str>) -> Result<()> {
+    match role {
+        None | Some("server" | "client") => Ok(()),
+        Some(role) => Err(eyre!(
+            "Invalid configured role {:?}. Run `nexdesk setup` to select server or client.",
+            status::terminal_safe(role, status::MAX_STATUS_DISPLAY_BYTES)
+        )),
+    }
+}
+
 fn direction_from_config_edge(edge: &str) -> Option<net::protocol::Direction> {
     match normalize_config_edge(edge).as_str() {
         "left" => Some(net::protocol::Direction::Left),
@@ -84,6 +94,7 @@ pub async fn run(cli: Cli) -> Result<RunOutcome> {
                 direction_from_cli_edge(edge)
             } else {
                 let cfg = config::NexdeskConfig::load()?;
+                validate_configured_role(cfg.role.as_deref())?;
                 if let Some(ref edge_str) = cfg.switch_edge {
                     direction_from_config_edge_or_error(edge_str)?
                 } else {
