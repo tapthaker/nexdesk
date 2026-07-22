@@ -17,3 +17,10 @@ path = "fuzz_targets/protocol_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "framed_chunks"
+path = "fuzz_targets/framed_chunks.rs"
+test = false
+doc = false
+bench = false
