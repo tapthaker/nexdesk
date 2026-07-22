@@ -39,12 +39,7 @@ pub mod wayland_layer_shell {
             keycode: u32,
             pressed: bool,
         },
-        KeyModifiers {
-            depressed: u32,
-            latched: u32,
-            locked: u32,
-            group: u32,
-        },
+        KeyModifiers,
     }
 
     #[derive(Debug)]
