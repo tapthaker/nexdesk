@@ -304,7 +304,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 The first complete client/server rigs must cover these release-blocking invariants:
 
 - [x] **A1** Client disconnect releases all tracked keys and buttons.
-- [ ] **A2** Client disconnect restores cursor visibility.
+- [x] **A2** Client disconnect restores cursor visibility.
 - [ ] **A3** Server disconnect releases all input grabs.
 - [ ] **A4** Local session lock releases grabs before any network await.
 - [ ] **A5** Inactive client never injects key/button presses.
@@ -467,3 +467,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | A11 | Proved the shared outbound framing path rejects semantically invalid messages before writing any bytes. |
 | 2026-07-22 | this commit | A12 | Proved reconnect backoff uses virtual time alongside existing virtual-time discovery and file-transfer timeout coverage. |
 | 2026-07-22 | this commit | A1 | Reverified disconnect cleanup for tracked client keys and buttons. |
+| 2026-07-22 | this commit | A2 | Reverified every client exit restores cursor visibility. |
