@@ -6,6 +6,7 @@ use quinn::{Connection, Endpoint};
 use rustls::pki_types::CertificateDer;
 
 use super::tls;
+use super::{framing, protocol, quinn_client, quinn_server};
 
 pub(super) struct QuicLoopback {
     _certificate_root: tempfile::TempDir,
@@ -71,11 +72,101 @@ impl QuicLoopback {
         let (server, client) = tokio::try_join!(server, client)?;
         Ok((server, client))
     }
+
+    pub(super) async fn connect_peer_links(
+        &self,
+    ) -> Result<(
+        Connection,
+        Connection,
+        quinn_server::QuinnServerPeerLink,
+        quinn_client::QuinnClientPeerLink,
+    )> {
+        let (server_connection, client_connection) = self.connect().await?;
+        let fingerprint = self.certificate_fingerprint();
+
+        let server_handshake = async {
+            let (mut send, mut recv) = server_connection.open_bi().await?;
+            framing::send_message(
+                &mut send,
+                &protocol::Message::Hello {
+                    version: protocol::PROTOCOL_VERSION,
+                    hostname: "loopback-server".to_string(),
+                    screen: protocol::ScreenLayout {
+                        width: 1920,
+                        height: 1080,
+                    },
+                    fingerprint,
+                    build_version: Some(protocol::local_build_version()),
+                },
+            )
+            .await?;
+            match framing::recv_message(&mut recv).await? {
+                Some(protocol::Message::HelloAck { accepted: true, .. }) => {}
+                other => return Err(eyre!("Expected accepted HelloAck, got {other:?}")),
+            }
+            framing::send_message(
+                &mut send,
+                &protocol::Message::PairingResult { success: true },
+            )
+            .await?;
+            Ok::<_, color_eyre::Report>((send, recv))
+        };
+        let client_handshake = async {
+            let (mut send, mut recv) = client_connection.accept_bi().await?;
+            match framing::recv_message(&mut recv).await? {
+                Some(protocol::Message::Hello {
+                    version,
+                    fingerprint,
+                    ..
+                }) if version == protocol::PROTOCOL_VERSION
+                    && fingerprint == tls::peer_fingerprint(&client_connection).unwrap() => {}
+                other => return Err(eyre!("Expected valid Hello, got {other:?}")),
+            }
+            framing::send_message(
+                &mut send,
+                &protocol::Message::HelloAck {
+                    accepted: true,
+                    otp: None,
+                    screen: Some(protocol::ScreenLayout {
+                        width: 1280,
+                        height: 720,
+                    }),
+                    build_version: Some(protocol::local_build_version()),
+                },
+            )
+            .await?;
+            match framing::recv_message(&mut recv).await? {
+                Some(protocol::Message::PairingResult { success: true }) => {}
+                other => return Err(eyre!("Expected successful PairingResult, got {other:?}")),
+            }
+            Ok::<_, color_eyre::Report>((send, recv))
+        };
+        let ((server_send, server_recv), (client_send, client_recv)) =
+            tokio::try_join!(server_handshake, client_handshake)?;
+
+        let server_link =
+            quinn_server::QuinnServerPeerLink::open(&server_connection, server_send, server_recv);
+        let client_link =
+            quinn_client::QuinnClientPeerLink::open(&client_connection, client_send, client_recv);
+        let (server_link, client_link) = tokio::try_join!(server_link, client_link)?;
+        Ok((
+            server_connection,
+            client_connection,
+            server_link,
+            client_link,
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::{
+        ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand, ClientControlEvent,
+        ClientInputEvent, ClientPeerLink, ClientTransportEvent, ServerClipboardCommand,
+        ServerClipboardEvent, ServerControlCommand, ServerControlEvent, ServerInputCommand,
+        ServerPeerLink, ServerTransportEvent,
+    };
 
     #[tokio::test]
     async fn fixture_connects_ephemeral_endpoints_with_temporary_identity() {
@@ -95,5 +186,76 @@ mod tests {
 
         client.close(0u32.into(), b"test complete");
         server.closed().await;
+    }
+
+    #[tokio::test]
+    async fn successful_handshake_opens_every_logical_stream() {
+        let fixture = QuicLoopback::new().unwrap();
+        let (server_connection, client_connection, server, client) =
+            fixture.connect_peer_links().await.unwrap();
+
+        server
+            .send_control(ServerControlCommand::AcknowledgeHeartbeat { timestamp: 11 })
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next_event().await,
+            Some(ClientTransportEvent::Control(
+                ClientControlEvent::HeartbeatAcknowledged { timestamp: 11 }
+            ))
+        );
+
+        server
+            .send_input(ServerInputCommand::MouseMoved { x: 10, y: -4 })
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next_event().await,
+            Some(ClientTransportEvent::Input(ClientInputEvent::MouseMoved {
+                x: 10,
+                y: -4,
+            }))
+        );
+
+        server
+            .send_clipboard(ServerClipboardCommand::SetPeerText(
+                "server text".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next_event().await,
+            Some(ClientTransportEvent::Clipboard(
+                ClientClipboardEvent::TextChanged("server text".to_string())
+            ))
+        );
+
+        client
+            .send_control(ClientControlCommand::Heartbeat { timestamp: 22 })
+            .await
+            .unwrap();
+        assert_eq!(
+            server.next_event().await,
+            Some(ServerTransportEvent::Control(
+                ServerControlEvent::Heartbeat { timestamp: 22 }
+            ))
+        );
+
+        client
+            .send_clipboard(ClientClipboardCommand::SetPeerText(
+                "client text".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            server.next_event().await,
+            Some(ServerTransportEvent::Clipboard(
+                ServerClipboardEvent::TextChanged("client text".to_string())
+            ))
+        );
+
+        server.shutdown().await;
+        client_connection.close(0u32.into(), b"test complete");
+        server_connection.closed().await;
     }
 }
