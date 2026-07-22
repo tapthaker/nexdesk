@@ -348,6 +348,55 @@ mod tests {
     }
 
     #[test]
+    fn two_peers_exchange_changes_without_echo_or_duplicate_sends() {
+        let server_clipboard = Arc::new(crate::testing::MemoryClipboard::new());
+        let client_clipboard = Arc::new(crate::testing::MemoryClipboard::new());
+        let mut server = ClipboardSync::new(server_clipboard.clone());
+        let mut client = ClipboardSync::new(client_clipboard.clone());
+
+        server_clipboard.set_text(Some("from server".to_string()));
+        let Some(Message::ClipboardUpdate { content }) = server.poll_change().unwrap() else {
+            panic!("server change should produce a clipboard update");
+        };
+        client.apply_update(&content).unwrap();
+        assert_eq!(
+            client_clipboard.read_text().unwrap().as_deref(),
+            Some("from server")
+        );
+        assert!(server.poll_change().unwrap().is_none());
+        assert!(client.poll_change().unwrap().is_none());
+
+        client_clipboard.set_text(Some("from client".to_string()));
+        let Some(Message::ClipboardUpdate { content }) = client.poll_change().unwrap() else {
+            panic!("client change should produce a clipboard update");
+        };
+        server.apply_update(&content).unwrap();
+        assert_eq!(
+            server_clipboard.read_text().unwrap().as_deref(),
+            Some("from client")
+        );
+        assert!(client.poll_change().unwrap().is_none());
+        assert!(server.poll_change().unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_text_is_a_syncable_clipboard_change() {
+        let clipboard = Arc::new(crate::testing::MemoryClipboard::new());
+        clipboard.set_text(Some("initial".to_string()));
+        let mut sync = ClipboardSync::new(clipboard.clone());
+        assert!(sync.poll_change().unwrap().is_some());
+
+        clipboard.set_text(Some(String::new()));
+        assert!(matches!(
+            sync.poll_change().unwrap(),
+            Some(Message::ClipboardUpdate {
+                content: ClipboardContent::Text(text),
+            }) if text.is_empty()
+        ));
+        assert!(sync.poll_change().unwrap().is_none());
+    }
+
+    #[test]
     fn peer_update_is_applied_without_echoing_it_back() {
         let clipboard = Arc::new(crate::testing::MemoryClipboard::new());
         let mut sync = ClipboardSync::new(clipboard.clone());
