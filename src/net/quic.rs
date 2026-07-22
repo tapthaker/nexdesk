@@ -2340,8 +2340,9 @@ async fn run_client_session(
     // Signal clipboard tasks to shut down
     shutdown_tx.send(true).ok();
 
-    // Closing the connection releases transport waits. Abort any task still
-    // waiting on a blocking adapter, then join every connection-owned task.
+    // Stop and join transport readers, then close the connection to release
+    // any remaining transport waits. Abort blocking adapter tasks afterward.
+    peer.shutdown().await;
     connection.close(0u32.into(), b"disconnected");
     let mut session_tasks = vec![clipboard_task, file_acceptor_task, peer_reader_task];
     session_tasks.append(&mut file_send_tasks);

@@ -203,6 +203,8 @@ pub trait ClientPeerLink: Send + Sync {
     fn send_control(&self, command: ClientControlCommand) -> TransportFuture<'_, Result<()>>;
 
     fn send_clipboard(&self, command: ClientClipboardCommand) -> TransportFuture<'_, Result<()>>;
+
+    fn shutdown(&self) -> TransportFuture<'_, ()>;
 }
 
 /// Post-handshake server transport boundary.
@@ -238,6 +240,10 @@ mod tests {
             _command: ClientClipboardCommand,
         ) -> TransportFuture<'_, Result<()>> {
             Box::pin(async { Ok(()) })
+        }
+
+        fn shutdown(&self) -> TransportFuture<'_, ()> {
+            Box::pin(async {})
         }
     }
 

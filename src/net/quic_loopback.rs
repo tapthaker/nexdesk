@@ -1,5 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use quinn::{Connection, Endpoint};
@@ -633,7 +634,31 @@ mod tests {
         );
 
         server.shutdown().await;
+        client.shutdown().await;
         client_connection.close(0u32.into(), b"test complete");
         server_connection.closed().await;
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_joins_readers_and_leaves_endpoints_idle() {
+        let fixture = QuicLoopback::new().unwrap();
+        let (server_connection, client_connection, server, client) =
+            fixture.connect_peer_links().await.unwrap();
+
+        server.shutdown().await;
+        client.shutdown().await;
+        assert!(server.reader_tasks_are_idle().await);
+        assert!(client.reader_tasks_are_idle().await);
+
+        client_connection.close(0u32.into(), b"graceful shutdown");
+        server_connection.closed().await;
+        drop(server_connection);
+        drop(client_connection);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(fixture.server.wait_idle(), fixture.client.wait_idle());
+        })
+        .await
+        .expect("loopback endpoints did not become idle");
     }
 }

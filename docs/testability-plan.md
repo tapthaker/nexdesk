@@ -246,7 +246,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T4.1.3** Test invalid TLS identity, fingerprint mismatch, and untrusted pairing.
 - [x] **T4.1.4** Test split frames, mid-frame closure, oversized frames, and malformed payloads.
 - [x] **T4.1.5** Test control/input/clipboard independence under delay and closure.
-- [ ] **T4.1.6** Test graceful shutdown and verify endpoints/tasks become idle.
+- [x] **T4.1.6** Test graceful shutdown and verify endpoints/tasks become idle.
 
 ### T4.2 — HTTP/update adapter contracts
 
@@ -325,6 +325,7 @@ The first complete client/server rigs must cover these release-blocking invarian
 | FT-3 | Fixed | The receiver trusted unsafe names, offsets, duplicate data, declared sizes, and checksums and could overwrite an existing destination. | T3.4.4 validates every offer and message transition, uses create-new output semantics, and cancels invalid transfers. |
 | FT-4 | Fixed | A stalled sender could leave a receiver waiting forever. | T3.4.4 adds a virtual-time-covered receive timeout. |
 | FT-5 | Fixed | Each accepted file-transfer stream spawned an unbounded background task. | T3.4.5 bounds each connection to four transfers and aborts and joins all transfer tasks on shutdown. |
+| QUIC-1 | Fixed | Client Quinn channel readers were detached and could not be explicitly joined during shutdown. | T4.1.6 adds client peer-link shutdown, supervises all readers, and verifies both endpoints become idle. |
 
 ## Progress log
 
@@ -432,3 +433,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | T4.1.3 | Rejected wrong TLS host identity, advertised fingerprint mismatch, and invalid untrusted-peer OTP. |
 | 2026-07-22 | this commit | T4.1.4 | Exercised byte-split, partial, oversized, and malformed frames over real Quinn streams. |
 | 2026-07-22 | this commit | T4.1.5 | Proved input and clipboard progress while control is delayed and after its receive stream closes. |
+| 2026-07-22 | this commit | T4.1.6 | Joined client/server Quinn readers and verified graceful endpoint idleness. |

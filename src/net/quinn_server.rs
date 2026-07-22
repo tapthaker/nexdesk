@@ -68,6 +68,11 @@ impl QuinnServerPeerLink {
         self.control_send.lock().await.finish()?;
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) async fn reader_tasks_are_idle(&self) -> bool {
+        self.tasks.lock().await.is_none()
+    }
 }
 
 impl ServerPeerLink for QuinnServerPeerLink {
