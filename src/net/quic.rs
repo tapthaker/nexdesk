@@ -274,6 +274,21 @@ fn require_layer_shell_event(
     event.ok_or_else(|| eyre!("layer-shell capture stopped"))
 }
 
+fn validate_discovered_fingerprint(expected: Option<&str>, actual: &str) -> Result<String> {
+    let actual = actual.to_uppercase();
+    if let Some(expected) = expected {
+        let expected = expected.to_uppercase();
+        if expected != actual {
+            return Err(eyre!(
+                "Discovered server fingerprint mismatch: expected {}, received {}",
+                expected,
+                actual
+            ));
+        }
+    }
+    Ok(actual)
+}
+
 fn inject_with_timing(
     injector: &mut dyn InputInjector,
     msg: &Message,
@@ -2399,8 +2414,8 @@ pub async fn ping(addr: &str) -> Result<()> {
     Ok(())
 }
 
-/// Pair with a server once, storing its fingerprint if the OTP succeeds.
-pub async fn pair(addr: &str) -> Result<()> {
+/// Pair with a server once, verifying its advertised identity before storing trust.
+pub async fn pair(addr: &str, expected_fingerprint: Option<&str>) -> Result<String> {
     let addr = resolve_addr(addr)?;
     let endpoint = make_client_endpoint()?;
 
@@ -2410,7 +2425,7 @@ pub async fn pair(addr: &str) -> Result<()> {
     let (mut send, mut recv) = connection.accept_bi().await?;
     let hello = recv_message(&mut recv).await?;
 
-    match hello {
+    let paired_fingerprint = match hello {
         Some(Message::Hello {
             version,
             hostname,
@@ -2423,6 +2438,8 @@ pub async fn pair(addr: &str) -> Result<()> {
                 "Server: {} (proto v{}, build {}, screen: {}x{})",
                 hostname, version, server_ver, screen.width, screen.height
             );
+            let verified_fingerprint =
+                validate_discovered_fingerprint(expected_fingerprint, &fingerprint)?;
 
             let otp = if tls::is_fingerprint_trusted(&fingerprint) {
                 info!("Server fingerprint already trusted");
@@ -2453,16 +2470,17 @@ pub async fn pair(addr: &str) -> Result<()> {
                     return Err(eyre!("Expected PairingResult, got: {:?}", other));
                 }
             }
+            verified_fingerprint
         }
         other => {
             return Err(eyre!("Expected Hello, got: {:?}", other));
         }
-    }
+    };
 
     connection.close(0u32.into(), b"paired");
     endpoint.wait_idle().await;
 
-    Ok(())
+    Ok(paired_fingerprint)
 }
 
 fn resolve_addr(addr: &str) -> Result<SocketAddr> {
@@ -2891,6 +2909,16 @@ mod lifecycle_tests {
             poll.await.unwrap().unwrap(),
             Some(Message::ClipboardUpdate { .. })
         ));
+    }
+
+    #[test]
+    fn discovered_fingerprint_must_match_the_connected_certificate() {
+        assert_eq!(
+            validate_discovered_fingerprint(Some("aa:bb"), "AA:BB").unwrap(),
+            "AA:BB"
+        );
+        let error = validate_discovered_fingerprint(Some("AA:BB"), "CC:DD").unwrap_err();
+        assert!(error.to_string().contains("expected AA:BB, received CC:DD"));
     }
 
     #[test]

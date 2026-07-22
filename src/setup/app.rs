@@ -4,7 +4,7 @@ use std::io::IsTerminal;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{eyre, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -413,6 +413,34 @@ async fn apply_step_with_terminal(
     result
 }
 
+fn apply_network_selection(state: &mut SetupState) -> Result<()> {
+    if state.use_discovery {
+        let peer = state
+            .discovered_peers
+            .get(state.peer_selection)
+            .ok_or_else(|| eyre!("Select a discovered server before continuing"))?;
+        state.config.server_addr = Some(peer.addr.to_string());
+        state.config.server_fingerprint = Some(peer.fingerprint.clone());
+    } else if state.manual_addr.is_empty() {
+        return Err(eyre!("Enter a server address before continuing"));
+    } else {
+        state.config.server_addr = Some(state.manual_addr.clone());
+        state.config.server_fingerprint = None;
+    }
+    Ok(())
+}
+
+fn service_arguments(state: &SetupState) -> Vec<String> {
+    match state.config.role.as_deref() {
+        Some("server") => vec!["serve".to_string()],
+        _ if state.use_discovery => vec!["connect".to_string()],
+        _ => match &state.config.server_addr {
+            Some(addr) => vec!["connect".to_string(), addr.clone()],
+            None => vec!["connect".to_string()],
+        },
+    }
+}
+
 async fn apply_step(state: &mut SetupState) -> Result<()> {
     match state.step {
         Step::Role => {
@@ -441,15 +469,7 @@ async fn apply_step(state: &mut SetupState) -> Result<()> {
                 }
             }
         }
-        Step::Network => {
-            if state.use_discovery {
-                if let Some(peer) = state.discovered_peers.get(state.peer_selection) {
-                    state.config.server_addr = Some(peer.addr.to_string());
-                }
-            } else if !state.manual_addr.is_empty() {
-                state.config.server_addr = Some(state.manual_addr.clone());
-            }
-        }
+        Step::Network => apply_network_selection(state)?,
         Step::Screens => {
             let edge = match state.edge_selection {
                 0 => "left",
@@ -465,24 +485,27 @@ async fn apply_step(state: &mut SetupState) -> Result<()> {
             state.fingerprint = Some(crate::net::tls::fingerprint(&cert));
         }
         Step::Service => {
-            let args: Vec<&str> = match state.config.role.as_deref() {
-                Some("server") => vec!["serve"],
-                _ => match &state.config.server_addr {
-                    Some(addr) => vec!["connect", addr],
-                    None => vec!["connect"],
-                },
-            };
             if state.config.role.as_deref() != Some("server") {
-                if let Some(addr) = state.config.server_addr.as_deref() {
-                    crate::net::quic::pair(addr).await?;
-                }
+                let addr = state
+                    .config
+                    .server_addr
+                    .as_deref()
+                    .ok_or_else(|| eyre!("No server selected"))?;
+                let fingerprint =
+                    crate::net::quic::pair(addr, state.config.server_fingerprint.as_deref())
+                        .await?;
+                state.config.server_fingerprint = Some(fingerprint);
             }
+            // The daemon starts immediately during installation, so persist its
+            // fingerprint target before allowing the service manager to launch it.
+            state.config.save()?;
+            let arguments = service_arguments(state);
+            let args = arguments.iter().map(String::as_str).collect::<Vec<_>>();
             if let Err(e) = crate::daemon::install_service(&args) {
                 tracing::warn!("Failed to install service: {}", e);
             } else {
                 state.service_installed = true;
             }
-            state.config.save()?;
         }
         _ => {}
     }
@@ -507,4 +530,66 @@ fn render_done(frame: &mut Frame, area: Rect) {
     let paragraph =
         Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(" Done "));
     frame.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> SetupState {
+        SetupState {
+            step: Step::Network,
+            config: NexdeskConfig::default(),
+            role_selection: 1,
+            edge_selection: 1,
+            discovered_peers: Vec::new(),
+            peer_selection: 0,
+            manual_addr: String::new(),
+            use_discovery: true,
+            service_installed: false,
+            fingerprint: None,
+            accessibility_granted: true,
+            accessibility_prompted: false,
+            peer_receiver: None,
+            _browse_handle: None,
+        }
+    }
+
+    #[test]
+    fn discovery_selection_persists_identity_but_service_rediscovers_address() {
+        let mut state = state();
+        state.discovered_peers.push(DiscoveredPeer {
+            name: "desk".to_string(),
+            platform: "linux".to_string(),
+            addr: "192.0.2.10:4242".parse().unwrap(),
+            fingerprint: "AA:BB:CC".to_string(),
+        });
+
+        apply_network_selection(&mut state).unwrap();
+
+        assert_eq!(state.config.server_addr.as_deref(), Some("192.0.2.10:4242"));
+        assert_eq!(state.config.server_fingerprint.as_deref(), Some("AA:BB:CC"));
+        assert_eq!(service_arguments(&state), ["connect"]);
+    }
+
+    #[test]
+    fn manual_selection_pins_address_and_clears_discovered_identity() {
+        let mut state = state();
+        state.use_discovery = false;
+        state.manual_addr = "192.0.2.20:4242".to_string();
+        state.config.server_fingerprint = Some("OLD:FINGERPRINT".to_string());
+
+        apply_network_selection(&mut state).unwrap();
+
+        assert_eq!(state.config.server_fingerprint, None);
+        assert_eq!(service_arguments(&state), ["connect", "192.0.2.20:4242"]);
+    }
+
+    #[test]
+    fn network_selection_requires_a_peer_or_manual_address() {
+        let mut state = state();
+        assert!(apply_network_selection(&mut state).is_err());
+        state.use_discovery = false;
+        assert!(apply_network_selection(&mut state).is_err());
+    }
 }
