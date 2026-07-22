@@ -289,19 +289,6 @@ impl PeerDiscovery for MdnsDiscovery {
     }
 }
 
-/// Discover the nexdesk server with the expected certificate fingerprint.
-/// Returns its current socket address or an error if none is found within `timeout`.
-pub async fn discover_one(expected_fingerprint: &str, timeout: Duration) -> Result<SocketAddr> {
-    crate::app::resolve_peer_with_retry(
-        &MdnsDiscovery,
-        expected_fingerprint,
-        timeout,
-        3,
-        &crate::app::CancellationToken::new(),
-    )
-    .await
-}
-
 async fn discover_one_attempt(expected_fingerprint: &str, timeout: Duration) -> Result<SocketAddr> {
     let expected_fingerprint = expected_fingerprint.to_uppercase();
     let mdns = ServiceDaemon::new()?;

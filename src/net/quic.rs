@@ -35,10 +35,10 @@ use crate::net::update::{ExecutableUpdateInstaller, GithubReleaseRepository};
 use crate::ports::{
     ClientChannel, ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand,
     ClientControlEvent, ClientInputEvent, ClientPeerLink, ClientTransportEvent, Clipboard,
-    DisplaySessionControl, LocalSessionLockSource, PairingPrompt, PeerDirection, PeerScreen,
-    PeerScrollPhase, Release, ReleaseRepository, ServerClipboardCommand, ServerClipboardEvent,
-    ServerControlCommand, ServerControlEvent, ServerInputCommand, ServerPeerLink,
-    ServerTransportEvent, StatusSink, TrustStore, UpdateInstaller,
+    DisplaySessionControl, LocalSessionLockSource, PairingPrompt, PeerDirection, PeerDiscovery,
+    PeerScreen, PeerScrollPhase, Release, ReleaseRepository, ServerClipboardCommand,
+    ServerClipboardEvent, ServerControlCommand, ServerControlEvent, ServerInputCommand,
+    ServerPeerLink, ServerTransportEvent, StatusSink, TrustStore, UpdateInstaller,
 };
 use crate::status::{self, FileStatusSink, RuntimeStatus};
 
@@ -1554,9 +1554,39 @@ trait ClientReconnectDriver {
     fn record_disconnected(&mut self, _addr: SocketAddr) {}
 }
 
-struct ProductionClientDriver {
+struct ClientTargetResolver {
     explicit_addr: Option<String>,
     expected_fingerprint: Option<String>,
+    discovery: Arc<dyn PeerDiscovery>,
+    discovery_timeout: Duration,
+    discovery_attempts: u32,
+}
+
+impl ClientTargetResolver {
+    async fn resolve(&self) -> Result<SocketAddr> {
+        match self.explicit_addr.clone() {
+            Some(addr) => tokio::task::spawn_blocking(move || resolve_addr(&addr))
+                .await
+                .wrap_err("Address resolution task failed")?,
+            None => {
+                let fingerprint = self.expected_fingerprint.as_deref().ok_or_else(|| {
+                    eyre!("No server fingerprint configured; run `nexdesk setup`")
+                })?;
+                crate::app::resolve_peer_with_retry(
+                    self.discovery.as_ref(),
+                    fingerprint,
+                    self.discovery_timeout,
+                    self.discovery_attempts,
+                    &CancellationToken::new(),
+                )
+                .await
+            }
+        }
+    }
+}
+
+struct ProductionClientDriver {
+    target_resolver: ClientTargetResolver,
     injector_factory: Arc<dyn InputInjectorFactory>,
     display_control: Arc<dyn DisplaySessionControl>,
     trust_store: Arc<dyn TrustStore>,
@@ -1577,17 +1607,7 @@ impl ClientReconnectDriver for ProductionClientDriver {
     type Connected = ConnectedClient;
 
     async fn resolve_target(&mut self) -> Result<SocketAddr> {
-        match self.explicit_addr.clone() {
-            Some(addr) => tokio::task::spawn_blocking(move || resolve_addr(&addr))
-                .await
-                .wrap_err("Address resolution task failed")?,
-            None => {
-                let fingerprint = self.expected_fingerprint.as_deref().ok_or_else(|| {
-                    eyre!("No server fingerprint configured; run `nexdesk setup`")
-                })?;
-                discovery::discover_one(fingerprint, Duration::from_secs(10)).await
-            }
-        }
+        self.target_resolver.resolve().await
     }
 
     async fn connect_target(&mut self, addr: SocketAddr) -> Result<Self::Connected> {
@@ -1730,6 +1750,7 @@ async fn connect_with_cancellation(
         addr,
         expected_fingerprint,
         cancellation,
+        Arc::new(discovery::MdnsDiscovery),
         Arc::new(PlatformInputInjectorFactory),
         Arc::new(PlatformDisplaySessionControl),
         Arc::new(ConfigTrustStore),
@@ -1750,6 +1771,7 @@ async fn connect_with_dependencies(
     addr: Option<&str>,
     expected_fingerprint: Option<String>,
     cancellation: CancellationToken,
+    discovery: Arc<dyn PeerDiscovery>,
     injector_factory: Arc<dyn InputInjectorFactory>,
     display_control: Arc<dyn DisplaySessionControl>,
     trust_store: Arc<dyn TrustStore>,
@@ -1762,8 +1784,13 @@ async fn connect_with_dependencies(
     let explicit_addr = explicit_connect_addr_arg(addr)?;
     let _idle_sleep_inhibitor = display_control.inhibit_idle_sleep()?;
     let mut driver = ProductionClientDriver {
-        explicit_addr,
-        expected_fingerprint,
+        target_resolver: ClientTargetResolver {
+            explicit_addr,
+            expected_fingerprint,
+            discovery,
+            discovery_timeout: Duration::from_secs(10),
+            discovery_attempts: 3,
+        },
         injector_factory,
         display_control,
         trust_store,
@@ -3068,8 +3095,7 @@ mod lifecycle_tests {
     }
 
     struct FingerprintRediscoveryDriver {
-        discovery: crate::testing::ScriptedDiscovery,
-        expected_fingerprint: String,
+        target_resolver: ClientTargetResolver,
         connected_addrs: Vec<SocketAddr>,
         session_exits: VecDeque<SessionExit>,
     }
@@ -3078,12 +3104,7 @@ mod lifecycle_tests {
         type Connected = SocketAddr;
 
         async fn resolve_target(&mut self) -> Result<SocketAddr> {
-            crate::ports::PeerDiscovery::resolve_one(
-                &self.discovery,
-                &self.expected_fingerprint,
-                Duration::from_secs(1),
-            )
-            .await
+            self.target_resolver.resolve().await
         }
 
         async fn connect_target(&mut self, addr: SocketAddr) -> Result<Self::Connected> {
@@ -3099,7 +3120,7 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn reconnect_rediscovery_follows_fingerprint_to_changed_address_scenario() {
+    async fn reconnect_rediscovery_follows_fingerprint_to_changed_address() {
         const FINGERPRINT: &str = "AA:BB:CC";
         let old_addr = "192.0.2.10:4242".parse().unwrap();
         let new_addr = "192.0.2.77:4242".parse().unwrap();
@@ -3110,8 +3131,13 @@ mod lifecycle_tests {
         discovery.resolve_to("aa:bb:cc", new_addr);
 
         let mut driver = FingerprintRediscoveryDriver {
-            discovery: discovery.clone(),
-            expected_fingerprint: FINGERPRINT.to_string(),
+            target_resolver: ClientTargetResolver {
+                explicit_addr: None,
+                expected_fingerprint: Some(FINGERPRINT.to_string()),
+                discovery: Arc::new(discovery.clone()),
+                discovery_timeout: Duration::from_secs(1),
+                discovery_attempts: 1,
+            },
             connected_addrs: Vec::new(),
             session_exits: VecDeque::from([SessionExit::Disconnected, SessionExit::Cancelled]),
         };
