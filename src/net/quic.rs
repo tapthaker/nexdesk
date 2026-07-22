@@ -716,7 +716,10 @@ fn validate_listen_port(port: u16) -> Result<()> {
 }
 
 /// Run a QUIC server that captures local mouse and sends events to clients.
-pub async fn serve(port: u16, trigger_edge: Option<crate::net::protocol::Direction>) -> Result<()> {
+pub async fn serve(
+    port: u16,
+    trigger_edge: Option<crate::net::protocol::Direction>,
+) -> Result<SessionExit> {
     serve_with_dependencies(
         port,
         trigger_edge,
@@ -733,7 +736,7 @@ async fn serve_with_dependencies(
     capture_factory: Arc<dyn InputCaptureFactory>,
     lock_source: Arc<dyn LocalSessionLockSource>,
     display_control: Arc<dyn DisplaySessionControl>,
-) -> Result<()> {
+) -> Result<SessionExit> {
     validate_listen_port(port)?;
     let server_config = tls::server_config()?;
     let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
@@ -755,10 +758,21 @@ async fn serve_with_dependencies(
     let otp = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000u32));
     println!("\n  Pairing code: {}\n", otp);
 
-    // Periodically check for new releases and self-update
-    tokio::spawn(crate::net::update::update_check_loop());
+    // Periodically check for new releases. Successful installation returns
+    // typed restart intent instead of exiting below the composition root.
+    let update_check = crate::net::update::update_check_loop();
+    tokio::pin!(update_check);
 
-    while let Some(incoming) = endpoint.accept().await {
+    loop {
+        let incoming = tokio::select! {
+            reason = &mut update_check => {
+                return Ok(SessionExit::RestartRequested(reason));
+            }
+            incoming = endpoint.accept() => match incoming {
+                Some(incoming) => incoming,
+                None => return Ok(SessionExit::Disconnected),
+            },
+        };
         let connection = match incoming.await {
             Ok(connection) => connection,
             Err(e) => {
@@ -791,8 +805,6 @@ async fn serve_with_dependencies(
             }
         });
     }
-
-    Ok(())
 }
 
 async fn handle_server_connection(

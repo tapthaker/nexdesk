@@ -331,6 +331,7 @@ The first complete client/server rigs must cover these release-blocking invarian
 | QUALITY-1 | Fixed | Retired wrappers and Linux builds of target-specific/test adapters produced unclassified dead-code warnings. | T5.4.1 removes obsolete code, uses retained helpers in production, gates target-specific mappings, and documents intentional retained adapters. |
 | LOCK-1 | Fixed | Locking the server released its local grab but left the client transition active, so input control did not return cleanly to the server. | Protocol v5 adds an explicit server-to-client control release that restores the client cursor and injected input state after the local grab is released. |
 | INPUT-1 | Fixed | A held server key produced only one synthetic key-down, and injected client input did not receive operating-system key repeat. | Server transitions now generate deterministic delayed repeats for non-modifier keys, stop on key-up, and clear repeat state during every control-release path. |
+| UPDATE-2 | Fixed | The server updater replaced its executable and called `process::exit` from a detached task, so restart intent and the supervised service handoff could not be tested together. | Server update polling now returns typed restart intent to the composition root; tests verify exact-version installation and systemd/launchd restart contracts. |
 
 ## Progress log
 

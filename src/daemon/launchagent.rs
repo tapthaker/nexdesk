@@ -325,6 +325,11 @@ mod tests {
                 .count(),
             10
         );
-        assert!(plist.is_file());
+        let content = std::fs::read_to_string(&plist).unwrap();
+        assert!(content.contains("<key>KeepAlive</key>\n    <true/>"));
+        assert!(content.contains(&format!(
+            "<string>{}</string>",
+            std::env::current_exe().unwrap().display()
+        )));
     }
 }

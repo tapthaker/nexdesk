@@ -9,8 +9,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+pub use crate::app::is_release_version;
 use crate::app::MAX_RELEASE_VERSION_BYTES;
-pub use crate::app::{is_newer, is_release_version};
+use crate::app::{
+    execute_update, RestartReason, UpdateExecution, UpdatePolicy, UpdateRejection, UpdateSource,
+};
 use crate::ports::{Release, ReleaseAsset, ReleaseRepository, UpdateFuture, UpdateInstaller};
 
 const MAX_UPDATE_SIZE: u64 = 100 * 1024 * 1024;
@@ -279,14 +282,6 @@ async fn install_asset_at(
     Ok(())
 }
 
-/// Downloads the target version and atomically replaces the current executable.
-pub async fn self_update(target_version: &str) -> Result<()> {
-    let release = Release::new(target_version);
-    let repository = GithubReleaseRepository;
-    let asset = repository.stream_asset(&release).await?;
-    ExecutableUpdateInstaller.install(&release, asset).await
-}
-
 fn create_update_temp_file(dir: &Path) -> Result<(tokio::fs::File, tempfile::TempPath)> {
     let mut tmp_file = tempfile::Builder::new()
         .prefix(".nexdesk-update.")
@@ -377,39 +372,49 @@ async fn check_latest_version_at(client: &reqwest::Client, url: &str) -> Result<
     Ok(tag.to_string())
 }
 
+async fn check_server_update(
+    current_version: &str,
+    repository: &dyn ReleaseRepository,
+    installer: &dyn UpdateInstaller,
+) -> Result<UpdateExecution> {
+    let release = repository.latest_release().await?;
+    execute_update(
+        &UpdatePolicy::new(current_version),
+        release,
+        UpdateSource::TrustedRepository,
+        repository,
+        installer,
+    )
+    .await
+}
+
 /// Periodically checks for new releases and self-updates. The first check runs
 /// immediately so a restarted or manually installed stale daemon does not wait
-/// 30 minutes. A successful update exits so the service manager restarts the
-/// new binary.
-pub async fn update_check_loop() {
+/// 30 minutes. A successful update returns restart intent to the composition
+/// root so the service manager can start the newly installed binary.
+pub async fn update_check_loop() -> RestartReason {
     use crate::net::protocol::BUILD_VERSION;
-    use std::time::Duration;
 
     if !is_release_version(BUILD_VERSION) {
         info!("Dev build ({}), skipping update checks", BUILD_VERSION);
-        return;
+        return std::future::pending().await;
     }
 
+    let repository = GithubReleaseRepository;
+    let installer = ExecutableUpdateInstaller;
     loop {
-        match check_latest_version().await {
-            Ok(latest) if latest == BUILD_VERSION => {
+        match check_server_update(BUILD_VERSION, &repository, &installer).await {
+            Ok(UpdateExecution::RestartRequested(reason)) => {
+                info!(?reason, "Server update installed; requesting restart");
+                return reason;
+            }
+            Ok(UpdateExecution::Ignored(UpdateRejection::NotNewer)) => {
                 info!("Up to date ({})", BUILD_VERSION);
             }
-            Ok(latest) if is_release_version(&latest) && is_newer(&latest, BUILD_VERSION) => {
-                info!(
-                    "New version available: {} (current: {})",
-                    latest, BUILD_VERSION
-                );
-                match self_update(&latest).await {
-                    Ok(()) => {
-                        info!("Updated to {}. Exiting for restart...", latest);
-                        std::process::exit(0);
-                    }
-                    Err(e) => warn!("Self-update to {} failed: {}", latest, e),
-                }
+            Ok(UpdateExecution::Ignored(reason)) => {
+                warn!(?reason, "Ignoring invalid server update candidate");
             }
-            Ok(_) => {}
-            Err(e) => warn!("Update check failed: {}", e),
+            Err(error) => warn!("Update check failed: {}", error),
         }
 
         tokio::time::sleep(Duration::from_secs(30 * 60)).await;
@@ -420,6 +425,55 @@ pub async fn update_check_loop() {
 mod tests {
     use super::*;
     use crate::net::update_http_fixture::{LocalHttpFixture, ScriptedHttpResponse};
+    use crate::testing::{
+        AssetStreamStep, FakeUpdateInstaller, ScriptedReleaseRepository, UpdateObservation,
+    };
+
+    #[tokio::test]
+    async fn server_update_installs_latest_version_and_requests_restart() {
+        let repository = ScriptedReleaseRepository::new();
+        let installer = FakeUpdateInstaller::new();
+        repository.push_latest_release("v1.2.4");
+        repository.push_asset("v1.2.4", Some(3), [AssetStreamStep::bytes(b"bin")]);
+        installer.succeed_next();
+
+        let outcome = check_server_update("v1.2.3", &repository, &installer)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UpdateExecution::RestartRequested(RestartReason::UpdateInstalled {
+                version: "v1.2.4".to_string(),
+            })
+        );
+        assert_eq!(installer.installed_updates()[0].version, "v1.2.4");
+        let observations = repository.observations().snapshot();
+        assert!(observations.iter().any(|entry| matches!(
+            &entry.event,
+            UpdateObservation::LatestReleaseReturned { version } if version == "v1.2.4"
+        )));
+        assert!(observations.iter().any(|entry| matches!(
+            &entry.event,
+            UpdateObservation::AssetRequested { version } if version == "v1.2.4"
+        )));
+    }
+
+    #[tokio::test]
+    async fn current_server_version_does_not_download_or_restart() {
+        let repository = ScriptedReleaseRepository::new();
+        let installer = FakeUpdateInstaller::new();
+        repository.push_latest_release("v1.2.3");
+
+        assert_eq!(
+            check_server_update("v1.2.3", &repository, &installer)
+                .await
+                .unwrap(),
+            UpdateExecution::Ignored(UpdateRejection::NotNewer)
+        );
+        assert_eq!(repository.remaining_asset_actions(), 0);
+        assert!(installer.installed_updates().is_empty());
+    }
 
     #[tokio::test]
     #[ignore = "requires live access to the GitHub API and release assets"]

@@ -121,7 +121,7 @@ pub async fn run(cli: Cli) -> Result<RunOutcome> {
                 }
             };
             input::ensure_accessibility()?;
-            net::quic::serve(port, Some(dir)).await?;
+            return run_outcome_from_session_exit(net::quic::serve(port, Some(dir)).await?);
         }
         Command::Connect { addr } => {
             input::ensure_accessibility()?;
