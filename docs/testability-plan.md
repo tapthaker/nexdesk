@@ -232,7 +232,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T3.4.2** Add deterministic transfer identifiers through injected entropy.
 - [x] **T3.4.3** Add sender scenarios for mutation, truncation, growth, identity change, cancel, timeout, and mid-frame disconnect.
 - [x] **T3.4.4** Add receiver scenarios for malformed offers, offsets, duplicates, checksum errors, collisions, cancellation, timeout, and disk failure.
-- [ ] **T3.4.5** Add concurrent transfer limit and shutdown tests.
+- [x] **T3.4.5** Add concurrent transfer limit and shutdown tests.
 - [ ] **T3.4.6** Add end-to-end in-memory file transfer tests using real temporary files.
 
 ---
@@ -324,6 +324,7 @@ The first complete client/server rigs must cover these release-blocking invarian
 | FT-2 | Fixed | File-transfer stream sends and offer responses had no bounded timeout. | T3.4.3 adds virtual-time-covered per-operation timeouts. |
 | FT-3 | Fixed | The receiver trusted unsafe names, offsets, duplicate data, declared sizes, and checksums and could overwrite an existing destination. | T3.4.4 validates every offer and message transition, uses create-new output semantics, and cancels invalid transfers. |
 | FT-4 | Fixed | A stalled sender could leave a receiver waiting forever. | T3.4.4 adds a virtual-time-covered receive timeout. |
+| FT-5 | Fixed | Each accepted file-transfer stream spawned an unbounded background task. | T3.4.5 bounds each connection to four transfers and aborts and joins all transfer tasks on shutdown. |
 
 ## Progress log
 
@@ -424,3 +425,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | T3.4.2 | Injected transfer ID generation and verified deterministic IDs across outgoing messages. |
 | 2026-07-22 | this commit | T3.4.3 | Hardened and covered sender mutation races, cancellation, timeout, and disconnect behavior. |
 | 2026-07-22 | this commit | T3.4.4 | Rejected malformed receiver flows, unsafe destinations, checksum failures, stalls, and storage errors. |
+| 2026-07-22 | this commit | T3.4.5 | Bounded incoming transfer tasks and proved capacity recovery and joined shutdown. |

@@ -958,12 +958,12 @@ async fn handle_server_connection(
     // Spawn file transfer acceptor (receives files from client via new bi-streams)
     let ft_conn = connection.clone();
     connection_tasks.spawn(async move {
-        let mut transfers = tokio::task::JoinSet::new();
+        let mut transfers = crate::filetransfer::supervisor::TransferTaskSet::default();
         loop {
             tokio::select! {
                 result = ft_conn.accept_bi() => match result {
                 Ok((send, recv)) => {
-                    transfers.spawn(async move {
+                    if !transfers.try_spawn(async move {
                         match crate::filetransfer::recv::receive_files(send, recv).await {
                             Ok(paths) if !paths.is_empty() => {
                                 info!("Received {} file(s) from client", paths.len());
@@ -976,15 +976,16 @@ async fn handle_server_connection(
                             Ok(_) => {}
                             Err(e) => warn!("File transfer receive error: {}", e),
                         }
-                    });
+                    }) {
+                        warn!("Rejecting file transfer: concurrent transfer limit reached");
+                    }
                 }
                 Err(_) => break,
                 },
-                Some(_) = transfers.join_next(), if !transfers.is_empty() => {}
+                _ = transfers.join_next(), if !transfers.is_empty() => {}
             }
         }
-        transfers.abort_all();
-        while transfers.join_next().await.is_some() {}
+        transfers.shutdown().await;
     });
 
     info!("Server ready. Move mouse to screen edge to start sharing.");
@@ -1971,14 +1972,14 @@ async fn run_client_session(
     let receive_clipboard = clipboard_port.clone();
     let mut shutdown_rx3 = shutdown_tx.subscribe();
     let file_acceptor_task = tokio::spawn(async move {
-        let mut transfer_tasks = tokio::task::JoinSet::new();
+        let mut transfer_tasks = crate::filetransfer::supervisor::TransferTaskSet::default();
         loop {
             tokio::select! {
                 result = ft_conn.accept_bi() => {
                     match result {
                         Ok((send, recv)) => {
                             let receive_clipboard = receive_clipboard.clone();
-                            transfer_tasks.spawn(async move {
+                            if !transfer_tasks.try_spawn(async move {
                                 match crate::filetransfer::recv::receive_files(send, recv).await {
                                     Ok(paths) if !paths.is_empty() => {
                                         info!("Received {} file(s) from server", paths.len());
@@ -1991,7 +1992,9 @@ async fn run_client_session(
                                         warn!("File transfer receive error: {}", e);
                                     }
                                 }
-                            });
+                            }) {
+                                warn!("Rejecting file transfer: concurrent transfer limit reached");
+                            }
                         }
                         Err(_) => break,
                     }
@@ -2002,8 +2005,7 @@ async fn run_client_session(
                 }
             }
         }
-        transfer_tasks.abort_all();
-        while transfer_tasks.join_next().await.is_some() {}
+        transfer_tasks.shutdown().await;
     });
 
     info!("Client ready. Waiting for server to share mouse...");
