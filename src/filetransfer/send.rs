@@ -2,11 +2,17 @@ use std::path::PathBuf;
 
 use color_eyre::eyre::Result;
 use ring::digest;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tracing::{debug, info, warn};
 
-use crate::net::framing;
-use crate::net::protocol::{self, FileInfo, Message};
+use super::stream::{FileTransferMessage, FileTransferMessageStream};
+use crate::net::protocol::FileInfo;
+
+struct PreparedTransfer {
+    files: Vec<PathBuf>,
+    file_infos: Vec<FileInfo>,
+    total_size: u64,
+}
 
 /// Send files over a dedicated QUIC bi-stream.
 ///
@@ -14,11 +20,27 @@ use crate::net::protocol::{self, FileInfo, Message};
 /// waits for `FileTransferAccept`, then streams file data in 64 KiB chunks
 /// with SHA-256 checksums per file.
 pub async fn send_files(connection: &quinn::Connection, files: Vec<PathBuf>) -> Result<()> {
-    // Gather file metadata
+    let Some(transfer) = prepare_transfer(files).await? else {
+        return Ok(());
+    };
+
+    let (send, recv) = connection.open_bi().await?;
+    let mut stream = FileTransferMessageStream::new(send, recv);
+    send_prepared(&mut stream, transfer).await?;
+
+    // Gracefully close the Quinn send side after the protocol-independent flow.
+    let (mut send, _) = stream.into_inner();
+    send.finish().ok();
+    Ok(())
+}
+
+async fn prepare_transfer(files: Vec<PathBuf>) -> Result<Option<PreparedTransfer>> {
+    let mut regular_files = Vec::new();
     let mut file_infos = Vec::new();
     let mut total_size = 0u64;
-    for path in &files {
-        let metadata = tokio::fs::metadata(path).await?;
+
+    for path in files {
+        let metadata = tokio::fs::metadata(&path).await?;
         if !metadata.is_file() {
             debug!("Skipping non-file: {}", path.display());
             continue;
@@ -30,17 +52,35 @@ pub async fn send_files(connection: &quinn::Connection, files: Vec<PathBuf>) -> 
             .into_owned();
         let size = metadata.len();
         total_size += size;
+        regular_files.push(path);
         file_infos.push(FileInfo { name, size });
     }
 
-    // Filter to only regular files
-    let files: Vec<PathBuf> = files.into_iter().filter(|p| p.is_file()).collect();
-
-    if files.is_empty() {
+    if regular_files.is_empty() {
         debug!("No regular files to transfer");
-        return Ok(());
+        return Ok(None);
     }
 
+    Ok(Some(PreparedTransfer {
+        files: regular_files,
+        file_infos,
+        total_size,
+    }))
+}
+
+async fn send_prepared<W, R>(
+    stream: &mut FileTransferMessageStream<W, R>,
+    transfer: PreparedTransfer,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let PreparedTransfer {
+        files,
+        file_infos,
+        total_size,
+    } = transfer;
     let transfer_id: u64 = rand::random();
 
     info!(
@@ -50,23 +90,19 @@ pub async fn send_files(connection: &quinn::Connection, files: Vec<PathBuf>) -> 
         total_size
     );
 
-    // Open a dedicated bi-stream for this transfer
-    let (mut send, mut recv) = connection.open_bi().await?;
+    stream
+        .send(FileTransferMessage::Offer {
+            transfer_id,
+            files: file_infos,
+            total_size,
+        })
+        .await?;
 
-    // Send offer
-    let offer = Message::FileTransferOffer {
-        transfer_id,
-        files: file_infos,
-        total_size,
-    };
-    send_msg(&mut send, &offer).await?;
-
-    // Wait for accept
-    match recv_msg(&mut recv).await? {
-        Some(Message::FileTransferAccept { transfer_id: tid }) if tid == transfer_id => {
+    match stream.receive().await? {
+        Some(FileTransferMessage::Accept { transfer_id: tid }) if tid == transfer_id => {
             debug!("Transfer {} accepted by peer", transfer_id);
         }
-        Some(Message::FileTransferCancel { .. }) => {
+        Some(FileTransferMessage::Cancel { .. }) => {
             info!("Transfer {} cancelled by peer", transfer_id);
             return Ok(());
         }
@@ -76,7 +112,6 @@ pub async fn send_files(connection: &quinn::Connection, files: Vec<PathBuf>) -> 
         }
     }
 
-    // Stream each file
     for (file_index, path) in files.iter().enumerate() {
         let mut file = tokio::fs::File::open(path).await?;
         let mut offset = 0u64;
@@ -90,29 +125,30 @@ pub async fn send_files(connection: &quinn::Connection, files: Vec<PathBuf>) -> 
             }
             ctx.update(&buf[..n]);
 
-            let chunk = Message::FileTransferChunk {
-                transfer_id,
-                file_index: file_index as u32,
-                offset,
-                data: buf[..n].to_vec(),
-            };
-            send_msg(&mut send, &chunk).await?;
+            stream
+                .send(FileTransferMessage::Chunk {
+                    transfer_id,
+                    file_index: file_index as u32,
+                    offset,
+                    data: buf[..n].to_vec(),
+                })
+                .await?;
             offset += n as u64;
         }
 
-        let hash = ctx.finish();
-        let checksum = hash
+        let checksum = ctx
+            .finish()
             .as_ref()
             .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>();
-
-        let complete = Message::FileTransferComplete {
-            transfer_id,
-            file_index: file_index as u32,
-            checksum,
-        };
-        send_msg(&mut send, &complete).await?;
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        stream
+            .send(FileTransferMessage::Complete {
+                transfer_id,
+                file_index: file_index as u32,
+                checksum,
+            })
+            .await?;
         debug!(
             "File {}/{} sent: {} ({} bytes)",
             file_index + 1,
@@ -122,22 +158,9 @@ pub async fn send_files(connection: &quinn::Connection, files: Vec<PathBuf>) -> 
         );
     }
 
-    // Signal transfer complete
-    let done = Message::FileTransferDone { transfer_id };
-    send_msg(&mut send, &done).await?;
-
+    stream
+        .send(FileTransferMessage::Done { transfer_id })
+        .await?;
     info!("File transfer {} complete", transfer_id);
-
-    // Gracefully close the send side
-    send.finish().ok();
-
     Ok(())
-}
-
-async fn send_msg(send: &mut quinn::SendStream, msg: &Message) -> Result<()> {
-    framing::send_message(send, msg).await
-}
-
-async fn recv_msg(recv: &mut quinn::RecvStream) -> Result<Option<Message>> {
-    framing::recv_message(recv).await
 }

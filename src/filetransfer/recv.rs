@@ -2,24 +2,32 @@ use std::path::PathBuf;
 
 use color_eyre::eyre::{eyre, Result};
 use ring::digest;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
-use crate::net::framing;
-use crate::net::protocol::{self, Message};
+use super::stream::{FileTransferMessage, FileTransferMessageStream};
 
 /// Receive files over a dedicated QUIC bi-stream.
 ///
-/// Reads a `FileTransferOffer` from the stream, sends `FileTransferAccept`,
-/// then receives chunks and writes them to a staging directory.
-/// Returns the list of received file paths.
+/// Adapts the Quinn stream halves to the protocol-independent typed message
+/// flow and returns the list of received file paths.
 pub async fn receive_files(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
 ) -> Result<Vec<PathBuf>> {
-    // Read the offer
-    let (transfer_id, files, total_size) = match recv_msg(&mut recv).await? {
-        Some(Message::FileTransferOffer {
+    let mut stream = FileTransferMessageStream::new(send, recv);
+    receive_files_over_stream(&mut stream).await
+}
+
+pub(crate) async fn receive_files_over_stream<W, R>(
+    stream: &mut FileTransferMessageStream<W, R>,
+) -> Result<Vec<PathBuf>>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let (transfer_id, files, total_size) = match stream.receive().await? {
+        Some(FileTransferMessage::Offer {
             transfer_id,
             files,
             total_size,
@@ -36,30 +44,24 @@ pub async fn receive_files(
         total_size
     );
 
-    // Accept the transfer
-    let accept = Message::FileTransferAccept { transfer_id };
-    send_msg(&mut send, &accept).await?;
+    stream
+        .send(FileTransferMessage::Accept { transfer_id })
+        .await?;
 
-    // Create staging directory
     let staging_dir = tempfile::Builder::new().prefix("nexdesk-").tempdir()?;
-
-    // Pre-create output paths and hasher contexts
-    let mut output_paths: Vec<PathBuf> = Vec::new();
-    for file_info in &files {
-        let path = staging_dir.path().join(&file_info.name);
-        output_paths.push(path);
-    }
-
+    let output_paths: Vec<PathBuf> = files
+        .iter()
+        .map(|file_info| staging_dir.path().join(&file_info.name))
+        .collect();
     let mut open_files: Vec<Option<tokio::fs::File>> = (0..files.len()).map(|_| None).collect();
     let mut hashers: Vec<Option<digest::Context>> = files
         .iter()
         .map(|_| Some(digest::Context::new(&digest::SHA256)))
         .collect();
 
-    // Receive chunks
     loop {
-        match recv_msg(&mut recv).await? {
-            Some(Message::FileTransferChunk {
+        match stream.receive().await? {
+            Some(FileTransferMessage::Chunk {
                 transfer_id: tid,
                 file_index,
                 data,
@@ -74,20 +76,17 @@ pub async fn receive_files(
                     continue;
                 }
 
-                // Open file on first chunk
                 if open_files[idx].is_none() {
-                    let file = tokio::fs::File::create(&output_paths[idx]).await?;
-                    open_files[idx] = Some(file);
+                    open_files[idx] = Some(tokio::fs::File::create(&output_paths[idx]).await?);
                 }
-
-                if let Some(ref mut file) = open_files[idx] {
+                if let Some(file) = &mut open_files[idx] {
                     file.write_all(&data).await?;
                 }
-                if let Some(ref mut ctx) = hashers[idx] {
+                if let Some(ctx) = &mut hashers[idx] {
                     ctx.update(&data);
                 }
             }
-            Some(Message::FileTransferComplete {
+            Some(FileTransferMessage::Complete {
                 transfer_id: tid,
                 file_index,
                 checksum,
@@ -100,16 +99,16 @@ pub async fn receive_files(
                     continue;
                 }
 
-                // Flush and close the file
                 if let Some(mut file) = open_files[idx].take() {
                     file.flush().await.ok();
                 }
-
-                // Verify checksum
                 if let Some(ctx) = hashers[idx].take() {
-                    let hash = ctx.finish();
-                    let computed: String =
-                        hash.as_ref().iter().map(|b| format!("{:02x}", b)).collect();
+                    let computed: String = ctx
+                        .finish()
+                        .as_ref()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect();
                     if computed != checksum {
                         warn!(
                             "Checksum mismatch for file {} ({}): expected {}, got {}",
@@ -120,7 +119,7 @@ pub async fn receive_files(
                     }
                 }
             }
-            Some(Message::FileTransferDone { transfer_id: tid }) => {
+            Some(FileTransferMessage::Done { transfer_id: tid }) => {
                 if tid != transfer_id {
                     continue;
                 }
@@ -131,7 +130,7 @@ pub async fn receive_files(
                 );
                 break;
             }
-            Some(Message::FileTransferCancel { transfer_id: tid }) => {
+            Some(FileTransferMessage::Cancel { transfer_id: tid }) => {
                 if tid != transfer_id {
                     continue;
                 }
@@ -148,16 +147,6 @@ pub async fn receive_files(
         }
     }
 
-    // Prevent the staging directory from being deleted on drop
     let _staging_path = staging_dir.keep();
-
     Ok(output_paths)
-}
-
-async fn send_msg(send: &mut quinn::SendStream, msg: &Message) -> Result<()> {
-    framing::send_message(send, msg).await
-}
-
-async fn recv_msg(recv: &mut quinn::RecvStream) -> Result<Option<Message>> {
-    framing::recv_message(recv).await
 }
