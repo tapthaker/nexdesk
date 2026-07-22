@@ -312,7 +312,7 @@ The first complete client/server rigs must cover these release-blocking invarian
 - [x] **A7** Shutdown terminates all session-owned tasks.
 - [x] **A8** Clipboard blocking cannot stall input/control processing.
 - [x] **A9** Untrusted peers cannot trigger an update.
-- [ ] **A10** Successful updates request restart; failed updates do not.
+- [x] **A10** Successful updates request restart; failed updates do not.
 - [x] **A11** Every outbound protocol message passes semantic validation.
 - [x] **A12** Reconnect/discovery/file-transfer timeouts run under virtual time.
 
@@ -475,3 +475,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | A7 | Reverified client, server, and real Quinn shutdown joins every session-owned task. |
 | 2026-07-22 | this commit | A8 | Reverified blocked clipboard work leaves current-thread session processing responsive. |
 | 2026-07-22 | this commit | A9 | Reverified untrusted update sources never invoke asset download or installation. |
+| 2026-07-22 | this commit | A10 | Reverified successful installation records restart intent while download and installation failures do not. |
