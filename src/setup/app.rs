@@ -437,6 +437,90 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn server_setup_workflow_selects_role_edge_and_certificate_step() {
+        let mut state = state();
+        state.step = Step::Welcome;
+        state.role_selection = 0;
+
+        assert_eq!(
+            reduce(&mut state, SetupAction::Next),
+            SetupEffect::ApplyAndAdvance
+        );
+        apply_step(&mut state).await.unwrap();
+        advance_after_apply(&mut state);
+        assert_eq!(state.step, Step::Role);
+
+        apply_step(&mut state).await.unwrap();
+        advance_after_apply(&mut state);
+        assert_eq!(state.config.role.as_deref(), Some("server"));
+        assert_eq!(state.step, Step::Screens);
+
+        reduce(&mut state, SetupAction::Down);
+        apply_step(&mut state).await.unwrap();
+        advance_after_apply(&mut state);
+        assert_eq!(state.config.switch_edge.as_deref(), Some("bottom"));
+        assert_eq!(state.step, Step::Certificates);
+    }
+
+    #[test]
+    fn discovered_client_workflow_selects_identity_and_supports_back_navigation() {
+        let mut state = state();
+        state.config.role = Some("client".to_string());
+        state.discovered_peers.extend([
+            DiscoveredPeer {
+                name: "first".to_string(),
+                platform: "linux".to_string(),
+                addr: "192.0.2.10:4242".parse().unwrap(),
+                fingerprint: "AA:AA".to_string(),
+            },
+            DiscoveredPeer {
+                name: "second".to_string(),
+                platform: "macos".to_string(),
+                addr: "192.0.2.20:4242".parse().unwrap(),
+                fingerprint: "BB:BB".to_string(),
+            },
+        ]);
+
+        reduce(&mut state, SetupAction::Down);
+        assert_eq!(state.peer_selection, 1);
+        apply_network_selection(&mut state).unwrap();
+        advance_after_apply(&mut state);
+        assert_eq!(state.step, Step::Certificates);
+        assert_eq!(state.config.server_fingerprint.as_deref(), Some("BB:BB"));
+
+        reduce(&mut state, SetupAction::DeleteCharacter);
+        assert_eq!(state.step, Step::Network);
+    }
+
+    #[test]
+    fn manual_client_workflow_edits_and_pins_the_address() {
+        let mut state = state();
+        state.config.role = Some("client".to_string());
+        reduce(&mut state, SetupAction::ToggleNetworkMode);
+        for character in "192.0.2.30:4243x".chars() {
+            reduce(&mut state, SetupAction::EnterCharacter(character));
+        }
+        reduce(&mut state, SetupAction::DeleteCharacter);
+
+        apply_network_selection(&mut state).unwrap();
+        advance_after_apply(&mut state);
+        assert_eq!(state.step, Step::Certificates);
+        assert_eq!(state.config.server_addr.as_deref(), Some("192.0.2.30:4243"));
+        assert_eq!(state.config.server_fingerprint, None);
+    }
+
+    #[test]
+    fn setup_cancellation_exits_without_mutating_progress() {
+        let mut state = state();
+        state.step = Step::Role;
+        let role_selection = state.role_selection;
+
+        assert_eq!(reduce(&mut state, SetupAction::Quit), SetupEffect::Exit);
+        assert_eq!(state.step, Step::Role);
+        assert_eq!(state.role_selection, role_selection);
+    }
+
     #[test]
     fn empty_discovery_refreshes_on_a_bounded_interval() {
         let mut state = state();
