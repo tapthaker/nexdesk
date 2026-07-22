@@ -496,6 +496,69 @@ mod tests {
         assert!(checked_downloaded_size(u64::MAX, 1).is_err());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervised_restart_launches_the_replacement_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("nexdesk");
+        std::fs::write(
+            &executable,
+            b"#!/bin/sh\nprintf 'v1.2.3\\n'\nread stopped\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut old_process = tokio::process::Command::new(&executable)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut old_stdout = BufReader::new(old_process.stdout.take().unwrap());
+        let mut running_version = String::new();
+        old_stdout.read_line(&mut running_version).await.unwrap();
+        assert_eq!(running_version.trim(), "v1.2.3");
+
+        let replacement = b"#!/bin/sh\nprintf 'v1.2.4\\n'\n".to_vec();
+        install_asset_at(
+            &executable,
+            &Release::new("v1.2.4"),
+            ReleaseAsset::new(
+                Some(replacement.len() as u64),
+                Box::pin(std::io::Cursor::new(replacement)),
+            ),
+            1024,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            old_process.try_wait().unwrap().is_none(),
+            "replacing the path must not pretend the old process changed version"
+        );
+        old_process
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"stop\n")
+            .await
+            .unwrap();
+        assert!(old_process.wait().await.unwrap().success());
+
+        let restarted = tokio::process::Command::new(&executable)
+            .output()
+            .await
+            .unwrap();
+        assert!(restarted.status.success());
+        assert_eq!(
+            String::from_utf8(restarted.stdout).unwrap().trim(),
+            "v1.2.4"
+        );
+    }
+
     #[tokio::test]
     async fn installer_atomically_replaces_a_temporary_executable() {
         let root = tempfile::tempdir().unwrap();
