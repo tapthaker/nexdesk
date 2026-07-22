@@ -311,7 +311,7 @@ The first complete client/server rigs must cover these release-blocking invarian
 - [x] **A6** Switch-back races cannot leave synthetic input held.
 - [x] **A7** Shutdown terminates all session-owned tasks.
 - [x] **A8** Clipboard blocking cannot stall input/control processing.
-- [ ] **A9** Untrusted peers cannot trigger an update.
+- [x] **A9** Untrusted peers cannot trigger an update.
 - [ ] **A10** Successful updates request restart; failed updates do not.
 - [x] **A11** Every outbound protocol message passes semantic validation.
 - [x] **A12** Reconnect/discovery/file-transfer timeouts run under virtual time.
@@ -474,3 +474,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | A6 | Reverified late switch-back releases and generated sessions leave no synthetic input held. |
 | 2026-07-22 | this commit | A7 | Reverified client, server, and real Quinn shutdown joins every session-owned task. |
 | 2026-07-22 | this commit | A8 | Reverified blocked clipboard work leaves current-thread session processing responsive. |
+| 2026-07-22 | this commit | A9 | Reverified untrusted update sources never invoke asset download or installation. |
