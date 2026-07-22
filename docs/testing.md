@@ -59,6 +59,16 @@ cargo test net::transition::tests::server_switch_back_releases_held_keys
 
 The normal suite includes generated transition and client/server session properties. Proptest shrinks failures and writes replay seeds under `proptest-regressions/`; commit each generated seed with its fix so the minimized case remains in every subsequent run.
 
+Run a bounded fuzz target after installing nightly Rust and `cargo-fuzz`:
+
+```bash
+cargo +nightly fuzz run protocol_decode -- -max_total_time=60 -timeout=10
+cargo +nightly fuzz run framed_chunks -- -max_total_time=60 -timeout=10
+cargo +nightly fuzz run file_transfer_sequence -- -max_total_time=60 -timeout=10
+```
+
+Scheduled CI runs each target for two minutes and retains any files under `fuzz/artifacts/<target>` for 30 days. Reproduce and minimize a retained crash before committing it to the target's corpus with its fix.
+
 Generate an LCOV coverage report after installing [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov):
 
 ```bash
