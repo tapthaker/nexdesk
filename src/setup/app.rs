@@ -13,8 +13,10 @@ use crossterm::{
 };
 use ratatui::{prelude::*, widgets::*};
 
-use crate::config::NexdeskConfig;
+use crate::config::{NexdeskConfig, PersistenceRoots};
 use crate::net::discovery::{BrowseHandle, DiscoveredPeer};
+use crate::net::tls::ConfigTrustStore;
+use crate::ports::{SetupPairing, SetupServiceInstaller, TrustStore};
 
 use super::flow::{advance_after_apply, reduce, SetupAction, SetupEffect, Step};
 use super::{certificates, network, permissions, role, screens, service, welcome};
@@ -316,6 +318,29 @@ fn apply_network_selection(state: &mut SetupState) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ProductionSetupPairing;
+
+impl SetupPairing for ProductionSetupPairing {
+    fn pair<'a>(
+        &'a self,
+        address: &'a str,
+        expected_fingerprint: Option<&'a str>,
+    ) -> crate::ports::SetupFuture<'a, Result<String>> {
+        Box::pin(crate::net::quic::pair(address, expected_fingerprint))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ProductionSetupServiceInstaller;
+
+impl SetupServiceInstaller for ProductionSetupServiceInstaller {
+    fn install(&self, arguments: &[String]) -> Result<()> {
+        let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        crate::daemon::install_service(&arguments)
+    }
+}
+
 fn service_arguments(state: &SetupState) -> Vec<String> {
     match state.config.role.as_deref() {
         Some("server") => vec!["serve".to_string()],
@@ -325,6 +350,38 @@ fn service_arguments(state: &SetupState) -> Vec<String> {
             None => vec!["connect".to_string()],
         },
     }
+}
+
+async fn install_service_step(
+    state: &mut SetupState,
+    roots: &PersistenceRoots,
+    pairing: &dyn SetupPairing,
+    trust: &dyn TrustStore,
+    service: &dyn SetupServiceInstaller,
+) -> Result<()> {
+    if state.config.role.as_deref() != Some("server") {
+        let address = state
+            .config
+            .server_addr
+            .as_deref()
+            .ok_or_else(|| eyre!("No server selected"))?;
+        let fingerprint = pairing
+            .pair(address, state.config.server_fingerprint.as_deref())
+            .await?;
+        trust.trust(&fingerprint)?;
+        state.config.server_fingerprint = Some(fingerprint);
+    }
+
+    // Persist the identity before installation because production service
+    // managers start the daemon immediately.
+    state.config.save_to(roots)?;
+    let arguments = service_arguments(state);
+    if let Err(error) = service.install(&arguments) {
+        tracing::warn!("Failed to install service: {}", error);
+    } else {
+        state.service_installed = true;
+    }
+    Ok(())
 }
 
 async fn apply_step(state: &mut SetupState) -> Result<()> {
@@ -366,27 +423,14 @@ async fn apply_step(state: &mut SetupState) -> Result<()> {
             state.fingerprint = Some(crate::net::tls::fingerprint(&cert));
         }
         Step::Service => {
-            if state.config.role.as_deref() != Some("server") {
-                let addr = state
-                    .config
-                    .server_addr
-                    .as_deref()
-                    .ok_or_else(|| eyre!("No server selected"))?;
-                let fingerprint =
-                    crate::net::quic::pair(addr, state.config.server_fingerprint.as_deref())
-                        .await?;
-                state.config.server_fingerprint = Some(fingerprint);
-            }
-            // The daemon starts immediately during installation, so persist its
-            // fingerprint target before allowing the service manager to launch it.
-            state.config.save()?;
-            let arguments = service_arguments(state);
-            let args = arguments.iter().map(String::as_str).collect::<Vec<_>>();
-            if let Err(e) = crate::daemon::install_service(&args) {
-                tracing::warn!("Failed to install service: {}", e);
-            } else {
-                state.service_installed = true;
-            }
+            install_service_step(
+                state,
+                &PersistenceRoots::production()?,
+                &ProductionSetupPairing,
+                &ConfigTrustStore,
+                &ProductionSetupServiceInstaller,
+            )
+            .await?;
         }
         _ => {}
     }
@@ -416,6 +460,66 @@ fn render_done(frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::{DiscoveryEvent, PeerDiscovery};
+    use crate::testing::{MemoryTrustStore, ScriptedDiscovery};
+
+    struct FakeSetupPairing {
+        result: String,
+        calls: std::sync::Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl FakeSetupPairing {
+        fn new(result: &str) -> Self {
+            Self {
+                result: result.to_string(),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, Option<String>)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl SetupPairing for FakeSetupPairing {
+        fn pair<'a>(
+            &'a self,
+            address: &'a str,
+            expected_fingerprint: Option<&'a str>,
+        ) -> crate::ports::SetupFuture<'a, Result<String>> {
+            self.calls.lock().unwrap().push((
+                address.to_string(),
+                expected_fingerprint.map(str::to_string),
+            ));
+            let result = self.result.clone();
+            Box::pin(async move { Ok(result) })
+        }
+    }
+
+    struct RecordingSetupService {
+        roots: PersistenceRoots,
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+        persisted_fingerprints: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    impl RecordingSetupService {
+        fn new(roots: PersistenceRoots) -> Self {
+            Self {
+                roots,
+                calls: std::sync::Mutex::new(Vec::new()),
+                persisted_fingerprints: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SetupServiceInstaller for RecordingSetupService {
+        fn install(&self, arguments: &[String]) -> Result<()> {
+            self.calls.lock().unwrap().push(arguments.to_vec());
+            let persisted = NexdeskConfig::load_from(&self.roots)?.server_fingerprint;
+            self.persisted_fingerprints.lock().unwrap().push(persisted);
+            Ok(())
+        }
+    }
 
     fn state() -> SetupState {
         SetupState {
@@ -435,6 +539,70 @@ mod tests {
             _browse_handle: None,
             discovery_started_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn discovered_client_install_uses_fake_discovery_pairing_trust_and_service() {
+        let discovery = ScriptedDiscovery::new();
+        discovery.push_peer(DiscoveredPeer {
+            name: "server".to_string(),
+            platform: "linux".to_string(),
+            addr: "192.0.2.40:4242".parse().unwrap(),
+            fingerprint: "AA:BB:CC".to_string(),
+        });
+        let mut browse = discovery.browse().await.unwrap();
+        let Some(DiscoveryEvent::Found(peer)) = browse.next_event().await.unwrap() else {
+            panic!("scripted discovery did not return a peer");
+        };
+
+        let mut state = state();
+        state.config.role = Some("client".to_string());
+        merge_discovered_peer(&mut state.discovered_peers, peer);
+        apply_network_selection(&mut state).unwrap();
+        state.step = Step::Service;
+
+        let root = tempfile::tempdir().unwrap();
+        let roots = PersistenceRoots::from_config_root(root.path());
+        let pairing = FakeSetupPairing::new("AA:BB:CC");
+        let trust = MemoryTrustStore::new();
+        let service = RecordingSetupService::new(roots.clone());
+        install_service_step(&mut state, &roots, &pairing, &trust, &service)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pairing.calls(),
+            vec![("192.0.2.40:4242".to_string(), Some("AA:BB:CC".to_string()))]
+        );
+        assert!(trust.is_trusted("AA:BB:CC").unwrap());
+        assert_eq!(service.calls.lock().unwrap().as_slice(), &[vec!["connect"]]);
+        assert_eq!(
+            service.persisted_fingerprints.lock().unwrap().as_slice(),
+            &[Some("AA:BB:CC".to_string())]
+        );
+        assert!(state.service_installed);
+    }
+
+    #[tokio::test]
+    async fn server_install_skips_pairing_and_installs_serve_service() {
+        let mut state = state();
+        state.step = Step::Service;
+        state.config.role = Some("server".to_string());
+        state.config.switch_edge = Some("right".to_string());
+        let root = tempfile::tempdir().unwrap();
+        let roots = PersistenceRoots::from_config_root(root.path());
+        let pairing = FakeSetupPairing::new("UNUSED");
+        let trust = MemoryTrustStore::new();
+        let service = RecordingSetupService::new(roots.clone());
+
+        install_service_step(&mut state, &roots, &pairing, &trust, &service)
+            .await
+            .unwrap();
+
+        assert!(pairing.calls().is_empty());
+        assert!(trust.observations().is_empty());
+        assert_eq!(service.calls.lock().unwrap().as_slice(), &[vec!["serve"]]);
+        assert!(state.service_installed);
     }
 
     fn rendered_setup(state: &SetupState) -> String {

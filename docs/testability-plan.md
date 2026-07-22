@@ -262,7 +262,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T4.3.2** Extract setup state transitions from terminal rendering/input.
 - [x] **T4.3.3** Add setup workflow tests for server/client roles, discovery/manual address, back navigation, and cancellation.
 - [x] **T4.3.4** Add Ratatui buffer rendering tests for each setup screen.
-- [ ] **T4.3.5** Add service-install setup scenarios using fake service, trust, discovery, and pairing ports.
+- [x] **T4.3.5** Add service-install setup scenarios using fake service, trust, discovery, and pairing ports.
 
 ---
 
@@ -327,6 +327,7 @@ The first complete client/server rigs must cover these release-blocking invarian
 | FT-5 | Fixed | Each accepted file-transfer stream spawned an unbounded background task. | T3.4.5 bounds each connection to four transfers and aborts and joins all transfer tasks on shutdown. |
 | QUIC-1 | Fixed | Client Quinn channel readers were detached and could not be explicitly joined during shutdown. | T4.1.6 adds client peer-link shutdown, supervises all readers, and verifies both endpoints become idle. |
 | UPDATE-1 | Fixed | Undeclared oversized update bodies were bounded only later by the installer, not while the HTTP adapter streamed them. | T4.2.3 enforces the actual-byte limit in the response pump and propagates a reader error. |
+| SETUP-1 | Fixed | Setup finalization directly invoked pairing and service installation, preventing isolated ordering and failure scenarios. | T4.3.5 adds semantic setup ports and injects trust, persistence roots, pairing, and service installation. |
 
 ## Progress log
 
@@ -444,3 +445,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | T4.3.2 | Moved semantic setup actions, navigation, and effects out of Crossterm input handling. |
 | 2026-07-22 | this commit | T4.3.3 | Covered server/client workflows, discovered/manual selection, back navigation, and cancellation. |
 | 2026-07-22 | this commit | T4.3.4 | Rendered every setup step through the production layout into Ratatui test buffers. |
+| 2026-07-22 | this commit | T4.3.5 | Tested service finalization with fake discovery, pairing, trust, service, and isolated persistence. |
