@@ -65,6 +65,14 @@ cargo llvm-cov --all-targets --lcov --output-path lcov.info
 
 CI stores `lcov.info` as the `coverage-lcov` artifact. Coverage is initially informational and has no required percentage threshold.
 
+Run the opt-in live GitHub update contract smoke test only when external network access is intended:
+
+```bash
+cargo test live_github_update_contract_smoke -- --ignored --nocapture
+```
+
+This test checks the latest-release response and begins streaming the matching platform asset. It is ignored by normal local and CI test runs.
+
 ## Current baseline
 
 At the start of the testability project on 2026-07-19:

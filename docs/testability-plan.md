@@ -254,7 +254,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T4.2.2** Test release lookup statuses, malformed JSON, chunked bodies, size limits, and timeouts.
 - [x] **T4.2.3** Test binary download statuses, empty/truncated/chunked bodies, declared/actual size limits, and timeouts.
 - [x] **T4.2.4** Test successful atomic installation in a temporary executable root.
-- [ ] **T4.2.5** Add an opt-in live GitHub contract smoke test that is excluded from normal CI.
+- [x] **T4.2.5** Add an opt-in live GitHub contract smoke test that is excluded from normal CI.
 
 ### T4.3 — CLI and setup
 
@@ -439,3 +439,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | T4.2.2 | Covered release metadata statuses, JSON parsing, chunking, size bounds, and timeout. |
 | 2026-07-22 | this commit | T4.2.3 | Covered executable HTTP status, body framing, declared/actual limits, and timeout. |
 | 2026-07-22 | this commit | T4.2.4 | Verified atomic executable replacement, final permissions, and temp-file cleanup in an isolated root. |
+| 2026-07-22 | this commit | T4.2.5 | Added a documented opt-in smoke test for live GitHub metadata and platform assets. |

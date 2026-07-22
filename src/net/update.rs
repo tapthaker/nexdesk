@@ -421,6 +421,21 @@ mod tests {
     use super::*;
     use crate::net::update_http_fixture::{LocalHttpFixture, ScriptedHttpResponse};
 
+    #[tokio::test]
+    #[ignore = "requires live access to the GitHub API and release assets"]
+    async fn live_github_update_contract_smoke() {
+        let repository = GithubReleaseRepository;
+        let release = repository.latest_release().await.unwrap();
+        assert!(is_release_version(&release.version));
+
+        let asset = repository.stream_asset(&release).await.unwrap();
+        assert!(asset.declared_size.is_none_or(|size| size > 0));
+        let mut reader = asset.into_reader();
+        let mut prefix = [0u8; 16];
+        let read = reader.read(&mut prefix).await.unwrap();
+        assert!(read > 0, "live release asset was empty");
+    }
+
     #[test]
     fn downloaded_size_accounting_rejects_overflow() {
         assert_eq!(checked_downloaded_size(10, 5).unwrap(), 15);
