@@ -289,7 +289,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 - [x] **T5.3.2** Add tests that kill high-value surviving mutants. No tests were needed because T5.3.1 had no surviving mutants.
 - [x] **T5.3.3** Establish per-module coverage visibility for core and orchestration code.
 - [x] **T5.3.4** Introduce a coverage threshold only after deterministic suites stabilize.
-- [ ] **T5.3.5** Make formatting, tests, selected clippy rules, and deterministic scenario suites required CI checks.
+- [x] **T5.3.5** Make formatting, tests, selected clippy rules, and deterministic scenario suites required CI checks.
 
 ### T5.4 — Existing quality debt
 
@@ -459,3 +459,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | T5.3.2 | Confirmed no high-value surviving mutants required follow-up tests. |
 | 2026-07-22 | this commit | T5.3.3 | Added tested LCOV summaries for each core/orchestration module and CI job-summary visibility. |
 | 2026-07-22 | this commit | T5.3.4 | Established 88.3%/64.2% line baselines and enforced conservative 85%/60% core/orchestration floors. |
+| 2026-07-22 | this commit | T5.3.5 | Required formatting, all-target tests, generated/scenario/QUIC suites, and safety-focused Clippy rules in CI. |

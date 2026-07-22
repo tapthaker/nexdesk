@@ -43,11 +43,24 @@ Run the target platform's complete unit-test suite:
 cargo test --all-targets
 ```
 
-Run advisory linting:
+Run the selected required lint rules:
 
 ```bash
-cargo clippy --all-targets
+cargo clippy --all-targets -- \
+  -D clippy::await_holding_lock \
+  -D clippy::let_underscore_future \
+  -D clippy::zombie_processes \
+  -D clippy::suspicious_open_options \
+  -D clippy::ineffective_open_options
 ```
+
+Run the explicit deterministic scenario gate:
+
+```bash
+scripts/test-deterministic.sh
+```
+
+A broad `cargo clippy --all-targets` run remains useful for advisory quality findings until T5.4 resolves the existing warning baseline.
 
 Before committing a change, run the narrowest relevant test command while developing, followed by formatting and `cargo test --all-targets` when the change can affect shared behavior.
 
