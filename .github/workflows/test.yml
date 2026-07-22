@@ -45,7 +45,7 @@ jobs:
         run: scripts/test-deterministic.sh
 
   clippy:
-    name: Required selected clippy rules
+    name: Strict clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -67,14 +67,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run selected required clippy rules
-        run: |
-          cargo clippy --all-targets -- \
-            -D clippy::await_holding_lock \
-            -D clippy::let_underscore_future \
-            -D clippy::zombie_processes \
-            -D clippy::suspicious_open_options \
-            -D clippy::ineffective_open_options
+      - name: Run strict clippy
+        run: cargo clippy --all-targets -- -D warnings
 
   coverage:
     name: Linux coverage

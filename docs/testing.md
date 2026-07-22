@@ -43,15 +43,10 @@ Run the target platform's complete unit-test suite:
 cargo test --all-targets
 ```
 
-Run the selected required lint rules:
+Run the required strict lint gate:
 
 ```bash
-cargo clippy --all-targets -- \
-  -D clippy::await_holding_lock \
-  -D clippy::let_underscore_future \
-  -D clippy::zombie_processes \
-  -D clippy::suspicious_open_options \
-  -D clippy::ineffective_open_options
+cargo clippy --all-targets -- -D warnings
 ```
 
 Run the explicit deterministic scenario gate:
@@ -59,8 +54,6 @@ Run the explicit deterministic scenario gate:
 ```bash
 scripts/test-deterministic.sh
 ```
-
-A broad `cargo clippy --all-targets` run remains useful for advisory quality findings until T5.4 resolves the existing warning baseline.
 
 Before committing a change, run the narrowest relevant test command while developing, followed by formatting and `cargo test --all-targets` when the change can affect shared behavior.
 
@@ -121,13 +114,7 @@ At the start of the testability project on 2026-07-19:
 - The source contains additional target-gated macOS tests that do not run on Linux.
 - There are no tests in a top-level `tests/` integration-test directory yet.
 - `cargo clippy --all-targets` succeeds with warnings.
-- Strict clippy is not yet a passing gate:
-
-  ```bash
-  cargo clippy --all-targets -- -D warnings
-  ```
-
-  Current findings include dead code in target-specific input mappings, unused Wayland event fields, type-complexity suggestions, collapsible matches, items placed after test modules, and other style findings. These are existing quality debt tracked separately in Phase 5 of the testability plan; structural test work should not silently mix in unrelated lint cleanup.
+- Strict Clippy was initially non-passing because of dead code, target-specific imports, type complexity, and style findings. Phase 5 resolved or explicitly annotated that baseline, and `cargo clippy --all-targets -- -D warnings` is now required.
 
 ## Platform coverage rules
 
