@@ -161,6 +161,10 @@ impl QuicLoopback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{
+        complete_client_pairing, decide_server_handshake, validate_client_server_hello,
+        HandshakeMessage, PairingDecision, ServerHandshakeDecision, ServerHelloAck,
+    };
     use crate::ports::{
         ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand, ClientControlEvent,
         ClientInputEvent, ClientPeerLink, ClientTransportEvent, ServerClipboardCommand,
@@ -257,5 +261,178 @@ mod tests {
         server.shutdown().await;
         client_connection.close(0u32.into(), b"test complete");
         server_connection.closed().await;
+    }
+
+    #[tokio::test]
+    async fn strict_tls_rejects_an_invalid_server_identity() {
+        let fixture = QuicLoopback::new().unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(fixture.certificate.clone()).unwrap();
+        let client_crypto = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
+        ));
+        let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        endpoint.set_default_client_config(client_config);
+
+        let server = async {
+            fixture
+                .server
+                .accept()
+                .await
+                .expect("incoming connection")
+                .await
+        };
+        let client = endpoint
+            .connect(fixture.server_addr(), "wrong-server-name")
+            .unwrap();
+        let (server_result, client_result) = tokio::join!(server, client);
+
+        assert!(server_result.is_err());
+        assert!(client_result.is_err());
+        endpoint.close(0u32.into(), b"test complete");
+    }
+
+    #[tokio::test]
+    async fn advertised_fingerprint_must_match_real_tls_identity() {
+        let fixture = QuicLoopback::new().unwrap();
+        let (server, client) = fixture.connect().await.unwrap();
+
+        let server_hello = async {
+            let (mut send, _recv) = server.open_bi().await?;
+            framing::send_message(
+                &mut send,
+                &protocol::Message::Hello {
+                    version: protocol::PROTOCOL_VERSION,
+                    hostname: "impostor".to_string(),
+                    screen: protocol::ScreenLayout {
+                        width: 1920,
+                        height: 1080,
+                    },
+                    fingerprint: "00:11:22".to_string(),
+                    build_version: None,
+                },
+            )
+            .await
+        };
+        let client_validation = async {
+            let (_send, mut recv) = client.accept_bi().await?;
+            let Some(protocol::Message::Hello {
+                version,
+                fingerprint,
+                screen,
+                ..
+            }) = framing::recv_message(&mut recv).await?
+            else {
+                return Err(eyre!("expected Hello"));
+            };
+            validate_client_server_hello(
+                version,
+                protocol::PROTOCOL_VERSION,
+                &fingerprint,
+                &tls::peer_fingerprint(&client).unwrap(),
+                screen.width,
+                screen.height,
+            )
+        };
+        let (send_result, validation_result) = tokio::join!(server_hello, client_validation);
+
+        send_result.unwrap();
+        assert!(validation_result
+            .unwrap_err()
+            .to_string()
+            .contains("fingerprint mismatch"));
+        client.close(0u32.into(), b"fingerprint mismatch");
+        server.closed().await;
+    }
+
+    #[tokio::test]
+    async fn untrusted_peer_with_wrong_otp_is_rejected_on_wire() {
+        let fixture = QuicLoopback::new().unwrap();
+        let (server, client) = fixture.connect().await.unwrap();
+        let fingerprint = fixture.certificate_fingerprint();
+
+        let server_handshake = async {
+            let (mut send, mut recv) = server.open_bi().await?;
+            framing::send_message(
+                &mut send,
+                &protocol::Message::Hello {
+                    version: protocol::PROTOCOL_VERSION,
+                    hostname: "loopback-server".to_string(),
+                    screen: protocol::ScreenLayout {
+                        width: 1920,
+                        height: 1080,
+                    },
+                    fingerprint,
+                    build_version: Some(protocol::local_build_version()),
+                },
+            )
+            .await?;
+            let response = match framing::recv_message(&mut recv).await? {
+                Some(protocol::Message::HelloAck {
+                    accepted,
+                    otp,
+                    screen,
+                    build_version,
+                }) => HandshakeMessage::Expected(ServerHelloAck {
+                    accepted,
+                    otp,
+                    screen: screen.map(|screen| crate::ports::PeerScreen {
+                        width: screen.width,
+                        height: screen.height,
+                    }),
+                    build_version,
+                }),
+                other => HandshakeMessage::Unexpected(format!("{other:?}")),
+            };
+            let decision = decide_server_handshake("123456", "v1", response);
+            assert!(matches!(
+                decision,
+                ServerHandshakeDecision::Reject {
+                    pairing_result: Some(false),
+                    ..
+                }
+            ));
+            framing::send_message(
+                &mut send,
+                &protocol::Message::PairingResult { success: false },
+            )
+            .await
+        };
+        let client_handshake = async {
+            let (mut send, mut recv) = client.accept_bi().await?;
+            assert!(matches!(
+                framing::recv_message(&mut recv).await?,
+                Some(protocol::Message::Hello { .. })
+            ));
+            framing::send_message(
+                &mut send,
+                &protocol::Message::HelloAck {
+                    accepted: true,
+                    otp: Some("000000".to_string()),
+                    screen: None,
+                    build_version: Some("v1".to_string()),
+                },
+            )
+            .await?;
+            let result = match framing::recv_message(&mut recv).await? {
+                Some(protocol::Message::PairingResult { success }) => {
+                    HandshakeMessage::Expected(success)
+                }
+                other => HandshakeMessage::Unexpected(format!("{other:?}")),
+            };
+            complete_client_pairing(PairingDecision::PromptForOtp, result)
+        };
+        let (server_result, client_result) = tokio::join!(server_handshake, client_handshake);
+
+        server_result.unwrap();
+        assert_eq!(
+            client_result.unwrap_err().to_string(),
+            "Pairing failed: invalid code"
+        );
+        client.close(0u32.into(), b"pairing rejected");
+        server.closed().await;
     }
 }
