@@ -2691,6 +2691,54 @@ mod lifecycle_tests {
         ]
     }
 
+    #[derive(Clone, Debug)]
+    enum GeneratedServerSessionEvent {
+        Poll {
+            x: i32,
+            y: i32,
+            buttons: u8,
+            keys: Vec<Message>,
+        },
+        Activate(PeerDirection),
+        SwitchBack(PeerDirection),
+        Resize {
+            width: u32,
+            height: u32,
+        },
+    }
+
+    fn generated_key_strategy() -> impl Strategy<Value = Message> {
+        (0u32..=255, any::<bool>(), any::<u16>()).prop_map(|(keycode, pressed, modifiers)| {
+            Message::KeyEvent {
+                keycode,
+                pressed,
+                modifiers,
+            }
+        })
+    }
+
+    fn server_session_event_strategy() -> impl Strategy<Value = GeneratedServerSessionEvent> {
+        prop_oneof![
+            (
+                -100i32..=2_100,
+                -100i32..=1_200,
+                0u8..=7,
+                prop::collection::vec(generated_key_strategy(), 0..5),
+            )
+                .prop_map(|(x, y, buttons, keys)| GeneratedServerSessionEvent::Poll {
+                    x,
+                    y,
+                    buttons,
+                    keys,
+                }),
+            peer_direction_strategy().prop_map(GeneratedServerSessionEvent::Activate),
+            peer_direction_strategy().prop_map(GeneratedServerSessionEvent::SwitchBack),
+            (1u32..=16_384, 1u32..=16_384).prop_map(|(width, height)| {
+                GeneratedServerSessionEvent::Resize { width, height }
+            }),
+        ]
+    }
+
     async fn run_generated_client_session(
         rig: &crate::testing::ClientRig,
         events: Vec<ClientInputEvent>,
@@ -2769,6 +2817,100 @@ mod lifecycle_tests {
         rig.peer.shutdown().await;
     }
 
+    async fn send_generated_server_messages(
+        rig: &crate::testing::ServerRig,
+        messages: Vec<Message>,
+    ) {
+        for _ in &messages {
+            rig.peer
+                .succeed_next_send(crate::testing::ServerSendOperation::Input);
+        }
+        send_server_input_messages(&rig.peer, messages)
+            .await
+            .unwrap();
+    }
+
+    async fn run_generated_server_session(
+        rig: &crate::testing::ServerRig,
+        events: Vec<GeneratedServerSessionEvent>,
+    ) {
+        let mut capture = rig.capture.clone();
+        let mut transition = ServerTransition::new(
+            None,
+            ScreenLayout {
+                width: 1920,
+                height: 1080,
+            },
+        );
+
+        for event in events {
+            match event {
+                GeneratedServerSessionEvent::Poll {
+                    x,
+                    y,
+                    buttons,
+                    keys,
+                } => match transition.poll(x, y, 1920, 1080, buttons, keys) {
+                    ServerOutput::Idle => {}
+                    ServerOutput::Activate { messages, grab } => {
+                        capture.set_grab(grab).unwrap();
+                        send_generated_server_messages(rig, messages).await;
+                    }
+                    ServerOutput::Forward { messages } => {
+                        send_generated_server_messages(rig, messages).await;
+                    }
+                    ServerOutput::ShortcutRelease { messages }
+                    | ServerOutput::ForceRelease { messages } => {
+                        capture.set_grab(false).unwrap();
+                        send_generated_server_messages(rig, messages).await;
+                    }
+                },
+                GeneratedServerSessionEvent::Activate(direction) => {
+                    if !transition.is_active() {
+                        capture.set_grab(true).unwrap();
+                        let messages = transition.activate_instant(protocol_direction(direction));
+                        send_generated_server_messages(rig, messages).await;
+                    }
+                }
+                GeneratedServerSessionEvent::SwitchBack(direction) => {
+                    rig.peer.push_event(ServerTransportEvent::Control(
+                        ServerControlEvent::SwitchBackRequested { direction },
+                    ));
+                    let event = rig.peer.next_event().await.unwrap();
+                    assert!(matches!(
+                        event,
+                        ServerTransportEvent::Control(
+                            ServerControlEvent::SwitchBackRequested { .. }
+                        )
+                    ));
+                    let messages = transition.on_switch_back();
+                    capture.set_grab(false).unwrap();
+                    send_generated_server_messages(rig, messages).await;
+                }
+                GeneratedServerSessionEvent::Resize { width, height } => {
+                    rig.peer.push_event(ServerTransportEvent::Control(
+                        ServerControlEvent::PeerScreenChanged(PeerScreen { width, height }),
+                    ));
+                    let event = rig.peer.next_event().await.unwrap();
+                    let ServerTransportEvent::Control(ServerControlEvent::PeerScreenChanged(
+                        screen,
+                    )) = event
+                    else {
+                        panic!("unexpected generated server event: {event:?}");
+                    };
+                    transition.update_peer_screen(ScreenLayout {
+                        width: screen.width,
+                        height: screen.height,
+                    });
+                }
+            }
+        }
+
+        let releases = restore_server_input_state(&mut capture, false, &mut transition);
+        send_generated_server_messages(rig, releases).await;
+        rig.peer.shutdown().await;
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
 
@@ -2786,6 +2928,54 @@ mod lifecycle_tests {
                 rig.assert_pressed_inputs(&[], &[]);
                 rig.assert_cursor_visible(true);
                 assert_eq!(rig.peer.pending_events(), 0);
+                rig.assert_tasks_completed();
+            });
+        }
+
+        #[test]
+        fn generated_server_sessions_release_grabs_inputs_and_tasks(
+            events in prop::collection::vec(server_session_event_strategy(), 0..96),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let rig = crate::testing::ServerRig::new();
+                run_generated_server_session(&rig, events).await;
+
+                let mut remote_keys = HashSet::new();
+                let mut remote_buttons = HashSet::new();
+                for observation in rig.peer.observations().snapshot() {
+                    if let crate::testing::ServerPeerObservation::InputSend(command) = observation.event {
+                        match command {
+                            ServerInputCommand::KeyChanged { keycode, pressed, .. } => {
+                                if pressed {
+                                    remote_keys.insert(keycode);
+                                } else {
+                                    remote_keys.remove(&keycode);
+                                }
+                            }
+                            ServerInputCommand::MouseButtonChanged { button, pressed } => {
+                                if pressed {
+                                    remote_buttons.insert(button);
+                                } else {
+                                    remote_buttons.remove(&button);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                assert!(remote_keys.is_empty(), "server exit left remote keys held");
+                assert!(remote_buttons.is_empty(), "server exit left remote buttons held");
+                assert!(matches!(
+                    rig.capture.grab_history().last(),
+                    Some(crate::testing::GrabChange::All(false))
+                ));
+                assert_eq!(rig.peer.pending_events(), 0);
+                assert!(rig.peer.is_shutdown());
                 rig.assert_tasks_completed();
             });
         }
