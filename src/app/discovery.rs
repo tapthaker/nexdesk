@@ -128,6 +128,7 @@ mod tests {
                 name: "desk".to_string(),
                 platform: platform.to_string(),
                 addr,
+                fingerprint: "AA:BB".to_string(),
             }));
         }
         assert_eq!(peers.peers().len(), 1);

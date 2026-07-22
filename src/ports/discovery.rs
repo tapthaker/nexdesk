@@ -12,6 +12,8 @@ pub struct DiscoveredPeer {
     pub name: String,
     pub platform: String,
     pub addr: SocketAddr,
+    /// Certificate identity used to match a peer across address changes.
+    pub fingerprint: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

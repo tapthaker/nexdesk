@@ -39,6 +39,26 @@ fn preferred_service_addr(info: &ServiceInfo) -> Option<SocketAddr> {
     preferred_addr(info.get_addresses().iter().copied(), info.get_port())
 }
 
+fn local_certificate_fingerprint() -> Result<String> {
+    let (certificate, _) = crate::net::tls::load_or_generate_certs()?;
+    Ok(crate::net::tls::fingerprint(&certificate))
+}
+
+fn discovered_peer(info: &ServiceInfo) -> Option<DiscoveredPeer> {
+    Some(DiscoveredPeer {
+        name: info
+            .get_property_val_str("hostname")
+            .unwrap_or("unknown")
+            .to_string(),
+        platform: info
+            .get_property_val_str("platform")
+            .unwrap_or("unknown")
+            .to_string(),
+        addr: preferred_service_addr(info)?,
+        fingerprint: info.get_property_val_str("fingerprint")?.to_uppercase(),
+    })
+}
+
 /// Advertise this machine on the local network via mDNS.
 pub async fn advertise(port: u16) -> Result<()> {
     let mdns = ServiceDaemon::new()?;
@@ -55,6 +75,7 @@ pub async fn advertise(port: u16) -> Result<()> {
 
     let instance_name = format!("{hostname}");
     let ip = local_ipv4().unwrap_or_default();
+    let fingerprint = local_certificate_fingerprint()?;
     let service = ServiceInfo::new(
         SERVICE_TYPE,
         &instance_name,
@@ -65,6 +86,7 @@ pub async fn advertise(port: u16) -> Result<()> {
             ("hostname", hostname.as_str()),
             ("platform", platform),
             ("version", crate::net::protocol::BUILD_VERSION),
+            ("fingerprint", fingerprint.as_str()),
         ]
         .as_slice(),
     )?;
@@ -100,8 +122,11 @@ pub async fn discover() -> Result<()> {
             }
             event = browse.next_event() => match event? {
                 Some(DiscoveryEvent::Found(peer)) => println!(
-                    "  Found peer: {} ({})\n    Selected: {}\n",
-                    peer.name, peer.platform, peer.addr,
+                    "  Found peer: {} ({})\n    Selected: {}\n    Fingerprint: {}\n",
+                    peer.name,
+                    peer.platform,
+                    peer.addr,
+                    peer.fingerprint,
                 ),
                 Some(DiscoveryEvent::Removed(name)) => println!("  Peer left: {}\n", name),
                 None => break,
@@ -139,6 +164,7 @@ pub fn start_advertising(port: u16) -> Result<AdvertiseHandle> {
 
     let instance_name = format!("{hostname}");
     let ip = local_ipv4().unwrap_or_default();
+    let fingerprint = local_certificate_fingerprint()?;
     let service = ServiceInfo::new(
         SERVICE_TYPE,
         &instance_name,
@@ -149,6 +175,7 @@ pub fn start_advertising(port: u16) -> Result<AdvertiseHandle> {
             ("hostname", hostname.as_str()),
             ("platform", platform),
             ("version", crate::net::protocol::BUILD_VERSION),
+            ("fingerprint", fingerprint.as_str()),
         ]
         .as_slice(),
     )?;
@@ -186,20 +213,8 @@ pub fn start_browsing() -> Result<(std::sync::mpsc::Receiver<DiscoveredPeer>, Br
     std::thread::spawn(move || loop {
         match receiver.recv() {
             Ok(ServiceEvent::ServiceResolved(info)) => {
-                let name = info
-                    .get_property_val_str("hostname")
-                    .unwrap_or("unknown")
-                    .to_string();
-                let platform = info
-                    .get_property_val_str("platform")
-                    .unwrap_or("unknown")
-                    .to_string();
-                if let Some(addr) = preferred_service_addr(&info) {
-                    let _ = tx.send(DiscoveredPeer {
-                        name,
-                        platform,
-                        addr,
-                    });
+                if let Some(peer) = discovered_peer(&info) {
+                    let _ = tx.send(peer);
                 }
             }
             Ok(_) => {}
@@ -239,20 +254,10 @@ impl PeerDiscovery for MdnsDiscovery {
             std::thread::spawn(move || loop {
                 let event = match receiver.recv() {
                     Ok(ServiceEvent::ServiceResolved(info)) => {
-                        let Some(addr) = preferred_service_addr(&info) else {
+                        let Some(peer) = discovered_peer(&info) else {
                             continue;
                         };
-                        Ok(DiscoveryEvent::Found(DiscoveredPeer {
-                            name: info
-                                .get_property_val_str("hostname")
-                                .unwrap_or("unknown")
-                                .to_string(),
-                            platform: info
-                                .get_property_val_str("platform")
-                                .unwrap_or("unknown")
-                                .to_string(),
-                            addr,
-                        }))
+                        Ok(DiscoveryEvent::Found(peer))
                     }
                     Ok(ServiceEvent::ServiceRemoved(_, name)) => Ok(DiscoveryEvent::Removed(name)),
                     Ok(_) => continue,
@@ -298,10 +303,9 @@ async fn discover_one_attempt(timeout: Duration) -> Result<SocketAddr> {
         tokio::task::spawn_blocking(move || loop {
             match receiver.recv() {
                 Ok(ServiceEvent::ServiceResolved(info)) => {
-                    if let Some(addr) = preferred_service_addr(&info) {
-                        let hostname = info.get_property_val_str("hostname").unwrap_or("unknown");
-                        info!("Discovered server '{}' at {}", hostname, addr);
-                        return Ok(addr);
+                    if let Some(peer) = discovered_peer(&info) {
+                        info!("Discovered server '{}' at {}", peer.name, peer.addr);
+                        return Ok(peer.addr);
                     }
                 }
                 Ok(_) => {}
@@ -341,6 +345,38 @@ mod tests {
             preferred_addr([loopback], 4242).unwrap(),
             "127.0.0.1:4242".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn discovered_peer_requires_and_normalizes_certificate_fingerprint() {
+        let properties = [
+            ("hostname", "desk"),
+            ("platform", "linux"),
+            ("fingerprint", "aa:bb:cc"),
+        ];
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            "desk",
+            "desk.local.",
+            "192.0.2.1",
+            4242,
+            properties.as_slice(),
+        )
+        .unwrap();
+        let peer = discovered_peer(&info).unwrap();
+        assert_eq!(peer.fingerprint, "AA:BB:CC");
+        assert_eq!(peer.addr, "192.0.2.1:4242".parse().unwrap());
+
+        let legacy = ServiceInfo::new(
+            SERVICE_TYPE,
+            "legacy",
+            "legacy.local.",
+            "192.0.2.2",
+            4242,
+            [("hostname", "legacy"), ("platform", "linux")].as_slice(),
+        )
+        .unwrap();
+        assert!(discovered_peer(&legacy).is_none());
     }
 
     #[test]

@@ -216,6 +216,7 @@ mod tests {
             name: "desk".to_string(),
             platform: "linux".to_string(),
             addr: "192.0.2.1:4242".parse().unwrap(),
+            fingerprint: "AA:BB".to_string(),
         }
     }
 

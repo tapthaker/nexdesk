@@ -26,4 +26,5 @@ async fn real_mdns_adapter_discovers_local_advertisement() {
     .expect("local advertisement was not discovered");
 
     assert_eq!(peer.addr.port(), PORT);
+    assert!(!peer.fingerprint.is_empty());
 }
