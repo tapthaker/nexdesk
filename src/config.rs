@@ -64,8 +64,12 @@ pub struct NexdeskConfig {
     /// Role: "server" or "client"
     pub role: Option<String>,
 
-    /// Server address (for client mode)
+    /// Last selected server address (for pairing and manual client mode)
     pub server_addr: Option<String>,
+
+    /// Certificate identity of the selected server.
+    #[serde(default)]
+    pub server_fingerprint: Option<String>,
 
     /// Screen edge that triggers switching (e.g. "right", "left")
     pub switch_edge: Option<String>,
@@ -154,6 +158,7 @@ impl NexdeskConfig {
             port: 4242,
             role: None,
             server_addr: None,
+            server_fingerprint: None,
             switch_edge: None,
             trusted_fingerprints: Vec::new(),
         }
@@ -163,6 +168,20 @@ impl NexdeskConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configs_without_a_server_fingerprint_require_setup_migration() {
+        let legacy = r#"
+hostname = "client"
+port = 4242
+role = "client"
+server_addr = "192.0.2.1:4242"
+trusted_fingerprints = []
+"#;
+        let config: NexdeskConfig = toml::from_str(legacy).unwrap();
+
+        assert_eq!(config.server_fingerprint, None);
+    }
 
     #[test]
     fn persistence_roots_keep_config_certificates_and_status_in_temp_root() {

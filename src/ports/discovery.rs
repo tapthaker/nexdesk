@@ -31,7 +31,11 @@ pub trait DiscoveryBrowse: Send {
 pub trait PeerDiscovery: Send + Sync {
     fn browse(&self) -> DiscoveryFuture<'_, Result<Box<dyn DiscoveryBrowse>>>;
 
-    fn resolve_one(&self, timeout: Duration) -> DiscoveryFuture<'_, Result<SocketAddr>>;
+    fn resolve_one(
+        &self,
+        expected_fingerprint: &str,
+        timeout: Duration,
+    ) -> DiscoveryFuture<'_, Result<SocketAddr>>;
 }
 
 #[cfg(test)]
@@ -53,7 +57,11 @@ mod tests {
             Box::pin(async { Ok(Box::new(EmptyBrowse) as Box<dyn DiscoveryBrowse>) })
         }
 
-        fn resolve_one(&self, _timeout: Duration) -> DiscoveryFuture<'_, Result<SocketAddr>> {
+        fn resolve_one(
+            &self,
+            _expected_fingerprint: &str,
+            _timeout: Duration,
+        ) -> DiscoveryFuture<'_, Result<SocketAddr>> {
             Box::pin(async { Err(color_eyre::eyre::eyre!("no peer")) })
         }
     }
@@ -63,6 +71,9 @@ mod tests {
         let discovery: &dyn PeerDiscovery = &EmptyDiscovery;
         let mut browse = discovery.browse().await.unwrap();
         assert_eq!(browse.next_event().await.unwrap(), None);
-        assert!(discovery.resolve_one(Duration::from_secs(1)).await.is_err());
+        assert!(discovery
+            .resolve_one("AA:BB", Duration::from_secs(1))
+            .await
+            .is_err());
     }
 }

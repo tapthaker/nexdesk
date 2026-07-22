@@ -275,16 +275,22 @@ impl PeerDiscovery for MdnsDiscovery {
         })
     }
 
-    fn resolve_one(&self, timeout: Duration) -> DiscoveryFuture<'_, Result<SocketAddr>> {
-        Box::pin(async move { discover_one_attempt(timeout).await })
+    fn resolve_one(
+        &self,
+        expected_fingerprint: &str,
+        timeout: Duration,
+    ) -> DiscoveryFuture<'_, Result<SocketAddr>> {
+        let expected_fingerprint = expected_fingerprint.to_uppercase();
+        Box::pin(async move { discover_one_attempt(&expected_fingerprint, timeout).await })
     }
 }
 
-/// Discover the first nexdesk server on the LAN.
-/// Returns its socket address or an error if none found within `timeout`.
-pub async fn discover_one(timeout: Duration) -> Result<SocketAddr> {
+/// Discover the nexdesk server with the expected certificate fingerprint.
+/// Returns its current socket address or an error if none is found within `timeout`.
+pub async fn discover_one(expected_fingerprint: &str, timeout: Duration) -> Result<SocketAddr> {
     crate::app::resolve_peer_with_retry(
         &MdnsDiscovery,
+        expected_fingerprint,
         timeout,
         3,
         &crate::app::CancellationToken::new(),
@@ -292,20 +298,31 @@ pub async fn discover_one(timeout: Duration) -> Result<SocketAddr> {
     .await
 }
 
-async fn discover_one_attempt(timeout: Duration) -> Result<SocketAddr> {
+async fn discover_one_attempt(expected_fingerprint: &str, timeout: Duration) -> Result<SocketAddr> {
+    let expected_fingerprint = expected_fingerprint.to_uppercase();
     let mdns = ServiceDaemon::new()?;
     let receiver = mdns.browse(SERVICE_TYPE)?;
 
     info!("Searching for nexdesk server on the network...");
 
+    let browse_fingerprint = expected_fingerprint.clone();
     let result = tokio::time::timeout(
         timeout,
         tokio::task::spawn_blocking(move || loop {
             match receiver.recv() {
                 Ok(ServiceEvent::ServiceResolved(info)) => {
                     if let Some(peer) = discovered_peer(&info) {
-                        info!("Discovered server '{}' at {}", peer.name, peer.addr);
-                        return Ok(peer.addr);
+                        if peer.fingerprint == browse_fingerprint {
+                            info!(
+                                "Discovered trusted server '{}' at {} ({})",
+                                peer.name, peer.addr, peer.fingerprint
+                            );
+                            return Ok(peer.addr);
+                        }
+                        debug!(
+                            "Ignoring server '{}' at {} with fingerprint {}",
+                            peer.name, peer.addr, peer.fingerprint
+                        );
                     }
                 }
                 Ok(_) => {}
@@ -320,7 +337,11 @@ async fn discover_one_attempt(timeout: Duration) -> Result<SocketAddr> {
     match result {
         Ok(Ok(addr)) => addr,
         Ok(Err(e)) => Err(e.into()),
-        Err(_) => Err(eyre!("No nexdesk server found within {:?}", timeout)),
+        Err(_) => Err(eyre!(
+            "No nexdesk server with fingerprint {} found within {:?}",
+            expected_fingerprint,
+            timeout
+        )),
     }
 }
 

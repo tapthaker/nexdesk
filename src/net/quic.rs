@@ -1501,6 +1501,7 @@ trait ClientReconnectDriver {
 
 struct ProductionClientDriver {
     explicit_addr: Option<String>,
+    expected_fingerprint: Option<String>,
     injector_factory: Arc<dyn InputInjectorFactory>,
     display_control: Arc<dyn DisplaySessionControl>,
     trust_store: Arc<dyn TrustStore>,
@@ -1525,7 +1526,12 @@ impl ClientReconnectDriver for ProductionClientDriver {
             Some(addr) => tokio::task::spawn_blocking(move || resolve_addr(&addr))
                 .await
                 .wrap_err("Address resolution task failed")?,
-            None => discovery::discover_one(Duration::from_secs(10)).await,
+            None => {
+                let fingerprint = self.expected_fingerprint.as_deref().ok_or_else(|| {
+                    eyre!("No server fingerprint configured; run `nexdesk setup`")
+                })?;
+                discovery::discover_one(fingerprint, Duration::from_secs(10)).await
+            }
         }
     }
 
@@ -1658,8 +1664,16 @@ async fn connect_with_cancellation(
     addr: Option<&str>,
     cancellation: CancellationToken,
 ) -> Result<SessionExit> {
+    let expected_fingerprint = if addr.is_none() {
+        crate::config::NexdeskConfig::load()?
+            .server_fingerprint
+            .map(|fingerprint| fingerprint.to_uppercase())
+    } else {
+        None
+    };
     connect_with_dependencies(
         addr,
+        expected_fingerprint,
         cancellation,
         Arc::new(PlatformInputInjectorFactory),
         Arc::new(PlatformDisplaySessionControl),
@@ -1675,6 +1689,7 @@ async fn connect_with_cancellation(
 
 async fn connect_with_dependencies(
     addr: Option<&str>,
+    expected_fingerprint: Option<String>,
     cancellation: CancellationToken,
     injector_factory: Arc<dyn InputInjectorFactory>,
     display_control: Arc<dyn DisplaySessionControl>,
@@ -1689,6 +1704,7 @@ async fn connect_with_dependencies(
     let _idle_sleep_inhibitor = display_control.inhibit_idle_sleep()?;
     let mut driver = ProductionClientDriver {
         explicit_addr,
+        expected_fingerprint,
         injector_factory,
         display_control,
         trust_store,

@@ -9,6 +9,7 @@ use crate::ports::{DiscoveredPeer, DiscoveryEvent, PeerDiscovery};
 
 pub async fn resolve_peer_with_retry(
     discovery: &dyn PeerDiscovery,
+    expected_fingerprint: &str,
     timeout: Duration,
     attempts: u32,
     cancellation: &CancellationToken,
@@ -25,7 +26,10 @@ pub async fn resolve_peer_with_retry(
     for _ in 0..attempts {
         let result = tokio::select! {
             _ = cancellation.cancelled() => return Err(eyre!("Discovery cancelled")),
-            result = tokio::time::timeout(per_attempt, discovery.resolve_one(per_attempt)) => result,
+            result = tokio::time::timeout(
+                per_attempt,
+                discovery.resolve_one(expected_fingerprint, per_attempt),
+            ) => result,
         };
         match result {
             Ok(Ok(addr)) => return Ok(addr),
@@ -70,13 +74,18 @@ mod tests {
     async fn resolution_retries_failures_then_accepts_delayed_peer() {
         let discovery = ScriptedDiscovery::new();
         let addr = "192.0.2.10:4242".parse().unwrap();
-        discovery.fail_resolve("browse failed");
-        discovery.fail_resolve("channel closed");
-        discovery.resolve_after(Duration::from_secs(1), addr);
+        discovery.resolve_to("CC:DD", "192.0.2.99:4242".parse().unwrap());
+        discovery.fail_resolve("browse channel refreshed");
+        discovery.resolve_after(Duration::from_secs(1), "aa:bb", addr);
         let cancellation = CancellationToken::new();
 
-        let resolution =
-            resolve_peer_with_retry(&discovery, Duration::from_secs(6), 3, &cancellation);
+        let resolution = resolve_peer_with_retry(
+            &discovery,
+            "AA:BB",
+            Duration::from_secs(6),
+            3,
+            &cancellation,
+        );
         tokio::pin!(resolution);
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(1)).await;
@@ -88,10 +97,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn resolution_timeout_is_enforced_with_virtual_time() {
         let discovery = ScriptedDiscovery::new();
-        discovery.resolve_after(Duration::from_secs(30), "192.0.2.10:4242".parse().unwrap());
+        discovery.resolve_after(
+            Duration::from_secs(30),
+            "AA:BB",
+            "192.0.2.10:4242".parse().unwrap(),
+        );
         let cancellation = CancellationToken::new();
-        let resolution =
-            resolve_peer_with_retry(&discovery, Duration::from_secs(3), 1, &cancellation);
+        let resolution = resolve_peer_with_retry(
+            &discovery,
+            "AA:BB",
+            Duration::from_secs(3),
+            1,
+            &cancellation,
+        );
         tokio::pin!(resolution);
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(3)).await;
@@ -106,17 +124,25 @@ mod tests {
     #[tokio::test]
     async fn resolution_is_cancellable() {
         let discovery = ScriptedDiscovery::new();
-        discovery.resolve_after(Duration::from_secs(30), "192.0.2.10:4242".parse().unwrap());
+        discovery.resolve_after(
+            Duration::from_secs(30),
+            "AA:BB",
+            "192.0.2.10:4242".parse().unwrap(),
+        );
         let cancellation = CancellationToken::new();
         cancellation.cancel();
 
-        assert!(
-            resolve_peer_with_retry(&discovery, Duration::from_secs(30), 1, &cancellation,)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("cancelled")
-        );
+        assert!(resolve_peer_with_retry(
+            &discovery,
+            "AA:BB",
+            Duration::from_secs(30),
+            1,
+            &cancellation,
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("cancelled"));
     }
 
     #[test]

@@ -28,8 +28,8 @@ enum BrowseAction {
 }
 
 enum ResolveAction {
-    Address(SocketAddr),
-    Delayed(Duration, SocketAddr),
+    Peer(String, SocketAddr),
+    Delayed(Duration, String, SocketAddr),
     Failure(String),
 }
 
@@ -86,16 +86,16 @@ impl ScriptedDiscovery {
         scripts.browse_sessions.push_back(session);
     }
 
-    pub fn resolve_to(&self, addr: SocketAddr) {
+    pub fn resolve_to(&self, fingerprint: impl Into<String>, addr: SocketAddr) {
         lock_recover(&self.scripts)
             .resolves
-            .push_back(ResolveAction::Address(addr));
+            .push_back(ResolveAction::Peer(fingerprint.into(), addr));
     }
 
-    pub fn resolve_after(&self, delay: Duration, addr: SocketAddr) {
+    pub fn resolve_after(&self, delay: Duration, fingerprint: impl Into<String>, addr: SocketAddr) {
         lock_recover(&self.scripts)
             .resolves
-            .push_back(ResolveAction::Delayed(delay, addr));
+            .push_back(ResolveAction::Delayed(delay, fingerprint.into(), addr));
     }
 
     pub fn fail_resolve(&self, message: impl Into<String>) {
@@ -172,7 +172,12 @@ impl PeerDiscovery for ScriptedDiscovery {
         })
     }
 
-    fn resolve_one(&self, timeout: Duration) -> DiscoveryFuture<'_, Result<SocketAddr>> {
+    fn resolve_one(
+        &self,
+        expected_fingerprint: &str,
+        timeout: Duration,
+    ) -> DiscoveryFuture<'_, Result<SocketAddr>> {
+        let expected_fingerprint = expected_fingerprint.to_uppercase();
         Box::pin(async move {
             self.observations
                 .record(DiscoveryObservation::ResolveStarted(timeout));
@@ -181,10 +186,20 @@ impl PeerDiscovery for ScriptedDiscovery {
                 .pop_front()
                 .ok_or_else(|| eyre!("ScriptedDiscovery unexpected resolve: no scripted action"))?;
             let result = match action {
-                ResolveAction::Address(addr) => Ok(addr),
-                ResolveAction::Delayed(delay, addr) => {
+                ResolveAction::Peer(fingerprint, addr) => {
+                    if fingerprint.to_uppercase() == expected_fingerprint {
+                        Ok(addr)
+                    } else {
+                        Err(eyre!("no peer matched fingerprint {expected_fingerprint}"))
+                    }
+                }
+                ResolveAction::Delayed(delay, fingerprint, addr) => {
                     tokio::time::sleep(delay).await;
-                    Ok(addr)
+                    if fingerprint.to_uppercase() == expected_fingerprint {
+                        Ok(addr)
+                    } else {
+                        Err(eyre!("no peer matched fingerprint {expected_fingerprint}"))
+                    }
                 }
                 ResolveAction::Failure(message) => Err(eyre!(message)),
             };
@@ -246,15 +261,15 @@ mod tests {
     async fn resolution_scripts_delays_and_failures() {
         let discovery = ScriptedDiscovery::new();
         let addr = "192.0.2.2:4242".parse().unwrap();
-        discovery.resolve_after(Duration::from_secs(1), addr);
+        discovery.resolve_after(Duration::from_secs(1), "AA:BB", addr);
         discovery.fail_resolve("resolver unavailable");
 
-        let resolved = discovery.resolve_one(Duration::from_secs(5));
+        let resolved = discovery.resolve_one("AA:BB", Duration::from_secs(5));
         tokio::pin!(resolved);
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(resolved.await.unwrap(), addr);
         assert!(discovery
-            .resolve_one(Duration::from_secs(5))
+            .resolve_one("AA:BB", Duration::from_secs(5))
             .await
             .unwrap_err()
             .to_string()
