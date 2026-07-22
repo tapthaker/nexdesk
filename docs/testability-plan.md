@@ -271,7 +271,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 ### T5.1 — Property/model testing
 
 - [x] **T5.1.1** Add generated `ClientTransition` event sequences with cursor/input safety invariants.
-- [ ] **T5.1.2** Add generated `ServerTransition` sequences with grab and held-key invariants.
+- [x] **T5.1.2** Add generated `ServerTransition` sequences with grab and held-key invariants.
 - [ ] **T5.1.3** Add generated full client-session sequences over the fake peer link.
 - [ ] **T5.1.4** Add generated full server-session sequences over the fake peer link.
 - [ ] **T5.1.5** Persist minimal regression cases for every property-test defect found.
@@ -447,3 +447,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | T4.3.4 | Rendered every setup step through the production layout into Ratatui test buffers. |
 | 2026-07-22 | this commit | T4.3.5 | Tested service finalization with fake discovery, pairing, trust, service, and isolated persistence. |
 | 2026-07-22 | this commit | T5.1.1 | Generated client transition sequences and enforced cursor bounds and inactive-input safety. |
+| 2026-07-22 | this commit | T5.1.2 | Generated server transition sequences and enforced grab and held-input cleanup invariants. |

@@ -539,6 +539,52 @@ mod tests {
         ]
     }
 
+    #[derive(Clone, Debug)]
+    enum GeneratedServerEvent {
+        Poll {
+            x: i32,
+            y: i32,
+            buttons: u8,
+            keys: Vec<Message>,
+        },
+        PollActiveKeys(Vec<Message>),
+        ActivateInstant(Direction),
+        SwitchBack,
+        ShortcutDeactivate,
+    }
+
+    fn key_event_strategy() -> impl Strategy<Value = Message> {
+        (0u32..=255, any::<bool>(), any::<u16>()).prop_map(|(keycode, pressed, modifiers)| {
+            Message::KeyEvent {
+                keycode,
+                pressed,
+                modifiers,
+            }
+        })
+    }
+
+    fn server_event_strategy() -> impl Strategy<Value = GeneratedServerEvent> {
+        prop_oneof![
+            (
+                -100i32..=2_100,
+                -100i32..=1_200,
+                0u8..=7,
+                prop::collection::vec(key_event_strategy(), 0..5),
+            )
+                .prop_map(|(x, y, buttons, keys)| GeneratedServerEvent::Poll {
+                    x,
+                    y,
+                    buttons,
+                    keys,
+                }),
+            prop::collection::vec(key_event_strategy(), 0..5)
+                .prop_map(GeneratedServerEvent::PollActiveKeys),
+            direction_strategy().prop_map(GeneratedServerEvent::ActivateInstant),
+            Just(GeneratedServerEvent::SwitchBack),
+            Just(GeneratedServerEvent::ShortcutDeactivate),
+        ]
+    }
+
     fn client_event_strategy() -> impl Strategy<Value = GeneratedClientEvent> {
         prop_oneof![
             direction_strategy().prop_map(|direction| GeneratedClientEvent::Message(
@@ -586,6 +632,135 @@ mod tests {
     }
 
     // ===== Server Tests =====
+
+    fn apply_remote_input_messages(
+        messages: &[Message],
+        keys: &mut HashSet<u32>,
+        buttons: &mut HashSet<u8>,
+    ) {
+        for message in messages {
+            match message {
+                Message::KeyEvent {
+                    keycode, pressed, ..
+                } => {
+                    if *pressed {
+                        keys.insert(*keycode);
+                    } else {
+                        keys.remove(keycode);
+                    }
+                }
+                Message::MouseButton { button, pressed } => {
+                    if *pressed {
+                        buttons.insert(*button);
+                    } else {
+                        buttons.remove(button);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn generated_server_sequences_preserve_grab_and_held_input_safety(
+            events in prop::collection::vec(server_event_strategy(), 0..256),
+        ) {
+            let mut transition = ServerTransition::new(None, peer_screen());
+            let mut remote_keys = HashSet::new();
+            let mut remote_buttons = HashSet::new();
+            let mut grabbed = false;
+
+            for event in events {
+                let output = match event {
+                    GeneratedServerEvent::Poll { x, y, buttons, keys } => {
+                        Some(transition.poll(x, y, 1920, 1080, buttons, keys))
+                    }
+                    GeneratedServerEvent::PollActiveKeys(keys) => {
+                        Some(transition.poll_active_keys(keys))
+                    }
+                    GeneratedServerEvent::ActivateInstant(direction) => {
+                        if transition.is_active() {
+                            continue;
+                        }
+                        let messages = transition.activate_instant(direction);
+                        apply_remote_input_messages(
+                            &messages,
+                            &mut remote_keys,
+                            &mut remote_buttons,
+                        );
+                        None
+                    }
+                    GeneratedServerEvent::SwitchBack => {
+                        let messages = transition.on_switch_back();
+                        apply_remote_input_messages(
+                            &messages,
+                            &mut remote_keys,
+                            &mut remote_buttons,
+                        );
+                        grabbed = false;
+                        prop_assert!(transition.pressed_keys.is_empty());
+                        prop_assert!(transition.pressed_buttons.is_empty());
+                        None
+                    }
+                    GeneratedServerEvent::ShortcutDeactivate => {
+                        let messages = transition.deactivate_for_shortcut();
+                        apply_remote_input_messages(
+                            &messages,
+                            &mut remote_keys,
+                            &mut remote_buttons,
+                        );
+                        grabbed = false;
+                        prop_assert!(transition.pressed_keys.is_empty());
+                        prop_assert!(transition.pressed_buttons.is_empty());
+                        None
+                    }
+                };
+
+                if let Some(output) = output {
+                    match output {
+                        ServerOutput::Idle => {}
+                        ServerOutput::Activate { messages, grab } => {
+                            prop_assert!(grab, "poll activation must request an input grab");
+                            grabbed = grab;
+                            apply_remote_input_messages(
+                                &messages,
+                                &mut remote_keys,
+                                &mut remote_buttons,
+                            );
+                        }
+                        ServerOutput::Forward { messages } => apply_remote_input_messages(
+                            &messages,
+                            &mut remote_keys,
+                            &mut remote_buttons,
+                        ),
+                        ServerOutput::ShortcutRelease { messages }
+                        | ServerOutput::ForceRelease { messages } => {
+                            apply_remote_input_messages(
+                                &messages,
+                                &mut remote_keys,
+                                &mut remote_buttons,
+                            );
+                            grabbed = false;
+                            prop_assert!(transition.pressed_keys.is_empty());
+                            prop_assert!(transition.pressed_buttons.is_empty());
+                        }
+                    }
+                }
+
+                if !transition.is_active() {
+                    prop_assert!(!grabbed, "inactive server retained an input grab");
+                    prop_assert!(remote_keys.is_empty(), "inactive server left remote keys held");
+                    prop_assert!(
+                        remote_buttons.is_empty(),
+                        "inactive server left remote buttons held"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn server_edge_respects_trigger_filter() {
