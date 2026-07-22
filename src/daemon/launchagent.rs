@@ -1,3 +1,11 @@
+#![cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "production LaunchAgent entry points compile on Linux only for adapter contract tests"
+    )
+)]
+
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use std::path::PathBuf;
 use tracing::info;

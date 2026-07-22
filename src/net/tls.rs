@@ -97,11 +97,19 @@ fn trust_fingerprint_at(roots: &PersistenceRoots, fp: &str) -> Result<bool> {
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "retained as the isolated-root trust adapter for persistence contracts"
+)]
 #[derive(Clone, Debug)]
 pub struct RootedConfigTrustStore {
     roots: PersistenceRoots,
 }
 
+#[allow(
+    dead_code,
+    reason = "retained as the isolated-root trust adapter for persistence contracts"
+)]
 impl RootedConfigTrustStore {
     pub fn new(roots: PersistenceRoots) -> Self {
         Self { roots }

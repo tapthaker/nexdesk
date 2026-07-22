@@ -27,10 +27,6 @@ impl PersistenceRoots {
         }
     }
 
-    pub fn config_root(&self) -> &std::path::Path {
-        &self.config_root
-    }
-
     pub fn config_path(&self) -> PathBuf {
         self.config_root.join("config.toml")
     }
@@ -80,18 +76,6 @@ pub struct NexdeskConfig {
 }
 
 impl NexdeskConfig {
-    pub fn config_dir() -> Result<PathBuf> {
-        let roots = PersistenceRoots::production()?;
-        roots.ensure_config_root()?;
-        Ok(roots.config_root().to_path_buf())
-    }
-
-    pub fn config_path() -> Result<PathBuf> {
-        let roots = PersistenceRoots::production()?;
-        roots.ensure_config_root()?;
-        Ok(roots.config_path())
-    }
-
     pub fn certs_dir() -> Result<PathBuf> {
         let roots = PersistenceRoots::production()?;
         roots.ensure_config_root()?;

@@ -617,13 +617,6 @@ mod tests {
         ]
     }
 
-    fn server_screen() -> ScreenLayout {
-        ScreenLayout {
-            width: 1920,
-            height: 1080,
-        }
-    }
-
     fn peer_screen() -> ScreenLayout {
         ScreenLayout {
             width: 2560,

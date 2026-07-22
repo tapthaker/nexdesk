@@ -293,7 +293,7 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 ### T5.4 — Existing quality debt
 
-- [ ] **T5.4.1** Resolve or explicitly annotate current dead-code warnings.
+- [x] **T5.4.1** Resolve or explicitly annotate current dead-code warnings.
 - [ ] **T5.4.2** Resolve current strict-clippy findings without mixing behavior changes.
 - [ ] **T5.4.3** Enable `cargo clippy --all-targets -- -D warnings` as a required check.
 
@@ -328,6 +328,7 @@ The first complete client/server rigs must cover these release-blocking invarian
 | QUIC-1 | Fixed | Client Quinn channel readers were detached and could not be explicitly joined during shutdown. | T4.1.6 adds client peer-link shutdown, supervises all readers, and verifies both endpoints become idle. |
 | UPDATE-1 | Fixed | Undeclared oversized update bodies were bounded only later by the installer, not while the HTTP adapter streamed them. | T4.2.3 enforces the actual-byte limit in the response pump and propagates a reader error. |
 | SETUP-1 | Fixed | Setup finalization directly invoked pairing and service installation, preventing isolated ordering and failure scenarios. | T4.3.5 adds semantic setup ports and injects trust, persistence roots, pairing, and service installation. |
+| QUALITY-1 | Fixed | Retired wrappers and Linux builds of target-specific/test adapters produced unclassified dead-code warnings. | T5.4.1 removes obsolete code, uses retained helpers in production, gates target-specific mappings, and documents intentional retained adapters. |
 
 ## Progress log
 
@@ -460,3 +461,4 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-22 | this commit | T5.3.3 | Added tested LCOV summaries for each core/orchestration module and CI job-summary visibility. |
 | 2026-07-22 | this commit | T5.3.4 | Established 88.3%/64.2% line baselines and enforced conservative 85%/60% core/orchestration floors. |
 | 2026-07-22 | this commit | T5.3.5 | Required formatting, all-target tests, generated/scenario/QUIC suites, and safety-focused Clippy rules in CI. |
+| 2026-07-22 | this commit | T5.4.1 | Removed obsolete wrappers, used retained validation/mapping paths, and annotated intentional target/test adapters. |

@@ -723,6 +723,7 @@ async fn serve_with_dependencies(
     lock_source: Arc<dyn LocalSessionLockSource>,
     display_control: Arc<dyn DisplaySessionControl>,
 ) -> Result<()> {
+    validate_listen_port(port)?;
     let server_config = tls::server_config()?;
     let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
     let endpoint = Endpoint::server(server_config, addr)?;
@@ -1044,10 +1045,10 @@ async fn handle_server_connection(
 
                 match transition.poll(mx, my, sw, sh, buttons, key_events) {
                     ServerOutput::Idle => {}
-                    ServerOutput::Activate { messages, .. } => {
+                    ServerOutput::Activate { messages, grab } => {
                         info!("Edge detected — switching to remote");
                         pending_layer_shell_motion = (0.0, 0.0);
-                        capturer.lock().unwrap().set_grab(true).ok();
+                        capturer.lock().unwrap().set_grab(grab).ok();
                         let mut sender = input_send.lock().await;
                         for msg in messages {
                             send_message_uni(&mut sender, &msg).await.ok();
@@ -1273,12 +1274,8 @@ async fn handle_server_connection(
                         if transition.is_active() {
                             // Map evdev button codes to protocol button IDs
                             // evdev: BTN_LEFT=0x110, BTN_RIGHT=0x111, BTN_MIDDLE=0x112
-                            let btn_id = match button {
-                                0x110 => 0u8, // left
-                                0x111 => 1,   // right
-                                0x112 => 2,   // middle
-                                _ => button as u8,
-                            };
+                            let btn_id = layer_shell_button_to_protocol(button)
+                                .unwrap_or(button as u8);
                             transition.update_button(btn_id, pressed);
                             let msg = Message::MouseButton { button: btn_id, pressed };
                             let mut sender = input_send.lock().await;
@@ -1359,7 +1356,7 @@ async fn handle_server_connection(
                             }
                         }
                     }
-                    LayerShellEvent::KeyModifiers { .. } => {
+                    LayerShellEvent::KeyModifiers => {
                         // Modifier state is tracked via KeyEvent; modifiers event is informational
                     }
                 }
@@ -2571,10 +2568,6 @@ async fn connect_with_retry(endpoint: &Endpoint, addr: SocketAddr) -> Result<qui
 
 async fn send_message_uni(send: &mut TypedServerInputGuard, msg: &Message) -> Result<()> {
     send_server_input_messages(send.peer.as_ref(), [msg.clone()]).await
-}
-
-async fn recv_message_uni(recv: &mut quinn::RecvStream) -> Result<Option<Message>> {
-    recv_message(recv).await
 }
 
 #[cfg(test)]

@@ -121,7 +121,7 @@ fn read_text_with_runner(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn write_text_with_runner(
     runner: &dyn crate::ports::CommandRunner,
     program: &str,

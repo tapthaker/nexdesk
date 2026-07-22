@@ -346,10 +346,6 @@ fn print_command(program: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn run_systemctl(args: &[&str]) -> Result<()> {
-    run_systemctl_with_runner(&RealCommandRunner, args)
-}
-
 fn run_systemctl_with_runner(runner: &dyn CommandRunner, args: &[&str]) -> Result<()> {
     run_checked(runner, "systemctl", args).map(|_| ())
 }

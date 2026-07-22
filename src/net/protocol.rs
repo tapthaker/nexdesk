@@ -144,7 +144,6 @@ pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 pub const MAX_SCROLL_DELTA: f64 = 10_000.0;
 pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_KEYCODE: u32 = 255;
-pub const MAX_PEER_NAME_BYTES: usize = 1024;
 pub const OTP_DIGITS: usize = 6;
 
 pub fn local_build_version() -> String {

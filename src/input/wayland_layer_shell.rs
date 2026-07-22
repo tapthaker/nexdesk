@@ -40,32 +40,13 @@ use crate::net::protocol::Direction;
 /// Events sent from the Wayland capture task to the server loop.
 #[derive(Debug)]
 pub enum LayerShellEvent {
-    EdgeEnter {
-        direction: Direction,
-    },
-    MouseMove {
-        dx: f64,
-        dy: f64,
-    },
-    MouseButton {
-        button: u32,
-        pressed: bool,
-    },
-    MouseScroll {
-        dx: f64,
-        dy: f64,
-    },
+    EdgeEnter { direction: Direction },
+    MouseMove { dx: f64, dy: f64 },
+    MouseButton { button: u32, pressed: bool },
+    MouseScroll { dx: f64, dy: f64 },
     ScrollEnd,
-    KeyEvent {
-        keycode: u32,
-        pressed: bool,
-    },
-    KeyModifiers {
-        depressed: u32,
-        latched: u32,
-        locked: u32,
-        group: u32,
-    },
+    KeyEvent { keycode: u32, pressed: bool },
+    KeyModifiers,
 }
 
 /// Commands from the server loop to the Wayland capture task.
@@ -310,7 +291,6 @@ pub fn try_create(
         state.edge_surfaces.push(EdgeSurface {
             surface: surface.clone(),
             layer_surface,
-            direction: trigger_edge,
             configured: false,
             configured_width: 0,
             configured_height: 0,
@@ -380,7 +360,6 @@ struct OutputInfo {
 struct EdgeSurface {
     surface: wl_surface::WlSurface,
     layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
-    direction: Direction,
     configured: bool,
     configured_width: u32,
     configured_height: u32,
@@ -822,20 +801,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                     }
                 }
             }
-            wl_keyboard::Event::Modifiers {
-                mods_depressed,
-                mods_latched,
-                mods_locked,
-                group,
-                ..
-            } => {
+            wl_keyboard::Event::Modifiers { .. } => {
                 if state.grabbed {
-                    state.send_event(LayerShellEvent::KeyModifiers {
-                        depressed: mods_depressed,
-                        latched: mods_latched,
-                        locked: mods_locked,
-                        group,
-                    });
+                    state.send_event(LayerShellEvent::KeyModifiers);
                 }
             }
             wl_keyboard::Event::RepeatInfo { rate, delay } => {

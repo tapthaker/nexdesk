@@ -12,9 +12,8 @@ pub use client_transport::{client_channel_disposition, ClientChannelDisposition}
 pub use discovery::{resolve_peer_with_retry, DiscoveredPeerSet};
 pub(crate) use handshake::{
     client_pairing_decision, complete_client_pairing, decide_server_handshake,
-    require_handshake_message, require_server_certificate_fingerprint,
-    validate_client_server_hello, HandshakeMessage, PairingCompletion, PairingDecision,
-    ServerHandshakeDecision, ServerHandshakeOutcome, ServerHelloAck, ServerPairingMethod,
+    require_handshake_message, validate_client_server_hello, HandshakeMessage, PairingCompletion,
+    PairingDecision, ServerHandshakeDecision, ServerHelloAck, ServerPairingMethod,
 };
 pub use reconnect::RetryPolicy;
 pub use server_transport::{server_channel_disposition, ServerChannelDisposition};
