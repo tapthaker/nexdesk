@@ -540,4 +540,100 @@ mod tests {
         client.close(0u32.into(), b"test complete");
         server.closed().await;
     }
+
+    #[tokio::test]
+    async fn logical_channels_progress_independently_under_delay_and_closure() {
+        let fixture = QuicLoopback::new().unwrap();
+        let (server_connection, client_connection, server, client) =
+            fixture.connect_peer_links().await.unwrap();
+        let server = Arc::new(server);
+        let control_gate = Arc::new(tokio::sync::Notify::new());
+        let delayed_server = server.clone();
+        let delayed_gate = control_gate.clone();
+        let delayed_control = tokio::spawn(async move {
+            delayed_gate.notified().await;
+            delayed_server
+                .send_control(ServerControlCommand::AcknowledgeHeartbeat { timestamp: 77 })
+                .await
+        });
+
+        server
+            .send_input(ServerInputCommand::KeyChanged {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next_event().await,
+            Some(ClientTransportEvent::Input(ClientInputEvent::KeyChanged {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            }))
+        );
+        server
+            .send_clipboard(ServerClipboardCommand::SetPeerText(
+                "while control waits".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next_event().await,
+            Some(ClientTransportEvent::Clipboard(
+                ClientClipboardEvent::TextChanged("while control waits".to_string())
+            ))
+        );
+
+        control_gate.notify_one();
+        delayed_control.await.unwrap().unwrap();
+        assert_eq!(
+            client.next_event().await,
+            Some(ClientTransportEvent::Control(
+                ClientControlEvent::HeartbeatAcknowledged { timestamp: 77 }
+            ))
+        );
+
+        server.finish_control_stream().await.unwrap();
+        assert_eq!(
+            client.next_event().await,
+            Some(ClientTransportEvent::Closed(
+                crate::ports::ClientChannel::Control
+            ))
+        );
+
+        server
+            .send_input(ServerInputCommand::MouseButtonChanged {
+                button: 0,
+                pressed: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next_event().await,
+            Some(ClientTransportEvent::Input(
+                ClientInputEvent::MouseButtonChanged {
+                    button: 0,
+                    pressed: true,
+                }
+            ))
+        );
+        server
+            .send_clipboard(ServerClipboardCommand::SetPeerText(
+                "after control closes".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next_event().await,
+            Some(ClientTransportEvent::Clipboard(
+                ClientClipboardEvent::TextChanged("after control closes".to_string())
+            ))
+        );
+
+        server.shutdown().await;
+        client_connection.close(0u32.into(), b"test complete");
+        server_connection.closed().await;
+    }
 }

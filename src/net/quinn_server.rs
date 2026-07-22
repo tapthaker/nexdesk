@@ -62,6 +62,12 @@ impl QuinnServerPeerLink {
             tasks: Mutex::new(Some(tasks)),
         })
     }
+
+    #[cfg(test)]
+    pub(crate) async fn finish_control_stream(&self) -> Result<()> {
+        self.control_send.lock().await.finish()?;
+        Ok(())
+    }
 }
 
 impl ServerPeerLink for QuinnServerPeerLink {
