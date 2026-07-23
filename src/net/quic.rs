@@ -624,8 +624,18 @@ async fn attempt_client_update(
     repository: &dyn ReleaseRepository,
     installer: &dyn UpdateInstaller,
 ) -> Result<UpdateExecution> {
+    attempt_client_update_from(BUILD_VERSION, server_build, source, repository, installer).await
+}
+
+async fn attempt_client_update_from(
+    current_build: &str,
+    server_build: &str,
+    source: UpdateSource,
+    repository: &dyn ReleaseRepository,
+    installer: &dyn UpdateInstaller,
+) -> Result<UpdateExecution> {
     execute_update(
-        &UpdatePolicy::new(BUILD_VERSION),
+        &UpdatePolicy::new(current_build),
         Release::new(server_build),
         source,
         repository,
@@ -4325,12 +4335,13 @@ mod lifecycle_tests {
 
         let repository = ScriptedReleaseRepository::new();
         let installer = FakeUpdateInstaller::new();
-        repository.push_asset("v999.0.0", Some(3), [AssetStreamStep::bytes(b"bin")]);
+        repository.push_asset("v1.2.4", Some(3), [AssetStreamStep::bytes(b"bin")]);
         installer.succeed_next();
 
         assert_eq!(
-            attempt_client_update(
-                "v999.0.0",
+            attempt_client_update_from(
+                "v1.2.3",
+                "v1.2.4",
                 UpdateSource::TrustedPeer,
                 &repository,
                 &installer,
@@ -4338,15 +4349,21 @@ mod lifecycle_tests {
             .await
             .unwrap(),
             UpdateExecution::RestartRequested(RestartReason::UpdateInstalled {
-                version: "v999.0.0".to_string(),
+                version: "v1.2.4".to_string(),
             })
         );
         assert_eq!(installer.installed_updates().len(), 1);
 
         assert_eq!(
-            attempt_client_update("v0.0.0", UpdateSource::TrustedPeer, &repository, &installer,)
-                .await
-                .unwrap(),
+            attempt_client_update_from(
+                "v1.2.3",
+                "v1.2.2",
+                UpdateSource::TrustedPeer,
+                &repository,
+                &installer,
+            )
+            .await
+            .unwrap(),
             UpdateExecution::Ignored(crate::app::UpdateRejection::NotNewer)
         );
     }

@@ -333,6 +333,7 @@ The first complete client/server rigs must cover these release-blocking invarian
 | LOCK-2 | Fixed | Hyprlock locks the Wayland session without setting logind's `LockedHint`, so the server never entered the LOCK-1 release path and retained its exclusive keyboard grab. | The Linux lock adapter now detects the running Hyprlock process before querying logind; a command-runner test models the actual Omarchy lock mechanism. |
 | INPUT-1 | Fixed | A held server key produced only one synthetic key-down, and injected client input did not receive operating-system key repeat. | Server transitions now generate deterministic delayed repeats for non-modifier keys, stop on key-up, and clear repeat state during every control-release path. |
 | UPDATE-2 | Fixed | The server updater replaced its executable and called `process::exit` from a detached task, so restart intent and the supervised service handoff could not be tested together. | Server update polling now returns typed restart intent to the composition root; tests verify exact-version installation and systemd/launchd restart contracts. |
+| CI-1 | Fixed | The client update adapter test used the git-derived build version, which is a commit hash in shallow untagged CI checkouts and made its update expectation depend on repository state. | The adapter keeps the production build-version wrapper while its test injects explicit current and candidate semantic versions. |
 
 ## Progress log
 
