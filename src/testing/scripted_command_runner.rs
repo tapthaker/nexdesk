@@ -19,9 +19,13 @@ enum CommandAction {
 }
 
 struct BlockState {
-    outcome: Mutex<Option<std::result::Result<CommandOutput, String>>>,
-    entered: Mutex<bool>,
+    state: Mutex<BlockedCommandState>,
     changed: Condvar,
+}
+
+struct BlockedCommandState {
+    entered: bool,
+    outcome: Option<std::result::Result<CommandOutput, String>>,
 }
 
 #[derive(Clone, Default)]
@@ -45,8 +49,10 @@ impl ScriptedCommandRunner {
 
     pub fn block_next(&self) -> BlockingCommand {
         let state = Arc::new(BlockState {
-            outcome: Mutex::new(None),
-            entered: Mutex::new(false),
+            state: Mutex::new(BlockedCommandState {
+                entered: false,
+                outcome: None,
+            }),
             changed: Condvar::new(),
         });
         lock_recover(&self.actions).push_back(CommandAction::Block(state.clone()));
@@ -73,16 +79,16 @@ impl CommandRunner for ScriptedCommandRunner {
             CommandAction::Output(output) => Ok(output),
             CommandAction::Failure(message) => Err(message),
             CommandAction::Block(state) => {
-                *lock_recover(&state.entered) = true;
+                let mut blocked = lock_recover(&state.state);
+                blocked.entered = true;
                 state.changed.notify_all();
-                let mut outcome = lock_recover(&state.outcome);
-                while outcome.is_none() {
-                    outcome = state
+                while blocked.outcome.is_none() {
+                    blocked = state
                         .changed
-                        .wait(outcome)
+                        .wait(blocked)
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
-                outcome.take().unwrap()
+                blocked.outcome.take().unwrap()
             }
         };
         result.map_err(|message| {
@@ -99,23 +105,23 @@ pub struct BlockingCommand {
 
 impl BlockingCommand {
     pub fn wait_until_entered(&self) {
-        let mut entered = lock_recover(&self.state.entered);
-        while !*entered {
-            entered = self
+        let mut blocked = lock_recover(&self.state.state);
+        while !blocked.entered {
+            blocked = self
                 .state
                 .changed
-                .wait(entered)
+                .wait(blocked)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 
     pub fn complete(&self, output: CommandOutput) {
-        *lock_recover(&self.state.outcome) = Some(Ok(output));
+        lock_recover(&self.state.state).outcome = Some(Ok(output));
         self.state.changed.notify_all();
     }
 
     pub fn fail(&self, message: impl Into<String>) {
-        *lock_recover(&self.state.outcome) = Some(Err(message.into()));
+        lock_recover(&self.state.state).outcome = Some(Err(message.into()));
         self.state.changed.notify_all();
     }
 }
