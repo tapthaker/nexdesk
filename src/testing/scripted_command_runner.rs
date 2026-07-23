@@ -19,11 +19,11 @@ enum CommandAction {
 }
 
 struct BlockState {
-    state: Mutex<BlockedCommandState>,
+    progress: Mutex<BlockProgress>,
     changed: Condvar,
 }
 
-struct BlockedCommandState {
+struct BlockProgress {
     entered: bool,
     outcome: Option<std::result::Result<CommandOutput, String>>,
 }
@@ -49,7 +49,7 @@ impl ScriptedCommandRunner {
 
     pub fn block_next(&self) -> BlockingCommand {
         let state = Arc::new(BlockState {
-            state: Mutex::new(BlockedCommandState {
+            progress: Mutex::new(BlockProgress {
                 entered: false,
                 outcome: None,
             }),
@@ -79,16 +79,16 @@ impl CommandRunner for ScriptedCommandRunner {
             CommandAction::Output(output) => Ok(output),
             CommandAction::Failure(message) => Err(message),
             CommandAction::Block(state) => {
-                let mut blocked = lock_recover(&state.state);
-                blocked.entered = true;
+                let mut progress = lock_recover(&state.progress);
+                progress.entered = true;
                 state.changed.notify_all();
-                while blocked.outcome.is_none() {
-                    blocked = state
+                while progress.outcome.is_none() {
+                    progress = state
                         .changed
-                        .wait(blocked)
+                        .wait(progress)
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
-                blocked.outcome.take().unwrap()
+                progress.outcome.take().unwrap()
             }
         };
         result.map_err(|message| {
@@ -105,23 +105,23 @@ pub struct BlockingCommand {
 
 impl BlockingCommand {
     pub fn wait_until_entered(&self) {
-        let mut blocked = lock_recover(&self.state.state);
-        while !blocked.entered {
-            blocked = self
+        let mut progress = lock_recover(&self.state.progress);
+        while !progress.entered {
+            progress = self
                 .state
                 .changed
-                .wait(blocked)
+                .wait(progress)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 
     pub fn complete(&self, output: CommandOutput) {
-        lock_recover(&self.state.state).outcome = Some(Ok(output));
+        lock_recover(&self.state.progress).outcome = Some(Ok(output));
         self.state.changed.notify_all();
     }
 
     pub fn fail(&self, message: impl Into<String>) {
-        lock_recover(&self.state.state).outcome = Some(Err(message.into()));
+        lock_recover(&self.state.progress).outcome = Some(Err(message.into()));
         self.state.changed.notify_all();
     }
 }
