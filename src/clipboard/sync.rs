@@ -574,6 +574,47 @@ mod tests {
         assert!(requests[1].discard_output);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_clipboard_write_updates_clipboard_and_primary_selections() {
+        use crate::ports::CommandOutput;
+        use crate::testing::{CommandObservation, ScriptedCommandRunner};
+
+        let runner = ScriptedCommandRunner::new();
+        for _ in 0..2 {
+            runner.push_output(CommandOutput {
+                success: true,
+                code: Some(0),
+                signal: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            });
+        }
+
+        write_linux_clipboard_with_runner(&runner, "from peer").unwrap();
+
+        let requests = runner
+            .observations()
+            .snapshot()
+            .into_iter()
+            .filter_map(|entry| match entry.event {
+                CommandObservation::Run(request) => Some(request),
+                CommandObservation::Failed(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].program, "wl-copy");
+        assert!(requests[0].args.is_empty());
+        assert_eq!(requests[1].program, "wl-copy");
+        assert_eq!(requests[1].args, ["--primary"]);
+        assert!(requests
+            .iter()
+            .all(|request| request.stdin == b"from peer" && request.discard_output));
+        assert_eq!(runner.remaining_actions(), 0);
+    }
+
     #[cfg(unix)]
     #[test]
     fn read_text_from_command_enforces_output_limit() {
