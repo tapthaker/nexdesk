@@ -56,12 +56,69 @@ const CLIENT_LATENCY_RESTART_STRIKES: u8 = 3;
 /// process was suspended for system sleep. This is diagnostic only and does
 /// not alter connection recovery behavior.
 const CLIENT_DIAGNOSTIC_TIMER_GAP_THRESHOLD_MS: u64 = 5_000;
+const INPUT_DIAGNOSTIC_BUCKET_UPPER_BOUNDS_US: [u64; 7] =
+    [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000];
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DurationHistogram {
+    buckets: [u64; 8],
+    max_us: u64,
+}
+
+impl DurationHistogram {
+    fn record(&mut self, duration: Duration) {
+        let micros = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+        let bucket = INPUT_DIAGNOSTIC_BUCKET_UPPER_BOUNDS_US
+            .iter()
+            .position(|upper_bound| micros < *upper_bound)
+            .unwrap_or(INPUT_DIAGNOSTIC_BUCKET_UPPER_BOUNDS_US.len());
+        self.buckets[bucket] += 1;
+        self.max_us = self.max_us.max(micros);
+    }
+}
+
+#[derive(Debug)]
+struct QueuedInputMessage {
+    message: Message,
+    queued_at: Instant,
+    depth_after_push: usize,
+}
 
 #[derive(Debug)]
 enum InputQueueItem {
-    Message(Message),
+    Message(QueuedInputMessage),
     Closed,
     Error(String),
+}
+
+#[derive(Default)]
+struct ClientActivationDiagnostics {
+    input_messages: u64,
+    injected_mouse_moves: u64,
+    superseded_mouse_moves: u64,
+    max_queue_depth: usize,
+    last_move_arrival: Option<Instant>,
+    move_arrival_gap: DurationHistogram,
+    queue_residence: DurationHistogram,
+    pointer_tick_lateness: DurationHistogram,
+    injection_latency: DurationHistogram,
+}
+
+impl ClientActivationDiagnostics {
+    fn record_message(&mut self, queued: &QueuedInputMessage, dequeued_at: Instant) {
+        self.input_messages += 1;
+        self.max_queue_depth = self.max_queue_depth.max(queued.depth_after_push);
+        self.queue_residence
+            .record(dequeued_at.saturating_duration_since(queued.queued_at));
+
+        if matches!(queued.message, Message::MouseMove { .. }) {
+            if let Some(previous) = self.last_move_arrival {
+                self.move_arrival_gap
+                    .record(queued.queued_at.saturating_duration_since(previous));
+            }
+            self.last_move_arrival = Some(queued.queued_at);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -81,12 +138,20 @@ struct InputMessageQueue {
 
 impl InputMessageQueue {
     fn push(&self, message: Message) {
+        let queued_at = Instant::now();
         let mut state = self.state.lock().unwrap();
         if state.terminal_queued {
             return;
         }
 
-        state.items.push_back(InputQueueItem::Message(message));
+        let depth_after_push = state.items.len() + 1;
+        state
+            .items
+            .push_back(InputQueueItem::Message(QueuedInputMessage {
+                message,
+                queued_at,
+                depth_after_push,
+            }));
         drop(state);
         self.notify.notify_one();
     }
@@ -149,7 +214,7 @@ fn flush_pending_mouse(
     injector: &mut dyn InputInjector,
     pending: &mut Option<(i32, i32)>,
     activation_started: Option<Instant>,
-    injected_count: &mut u64,
+    diagnostics: &mut ClientActivationDiagnostics,
     first_inject_logged: &mut bool,
     context: &str,
 ) {
@@ -157,7 +222,7 @@ fn flush_pending_mouse(
         return;
     };
 
-    *injected_count += 1;
+    diagnostics.injected_mouse_moves += 1;
     if let Some(started) = activation_started {
         if !*first_inject_logged {
             *first_inject_logged = true;
@@ -169,7 +234,10 @@ fn flush_pending_mouse(
     }
 
     let message = Message::MouseMove { x, y };
-    if let Err(e) = inject_with_timing(injector, &message, context) {
+    let timings = activation_started
+        .is_some()
+        .then_some(&mut diagnostics.injection_latency);
+    if let Err(e) = inject_with_timing(injector, &message, context, timings) {
         warn!("Inject mouse move error: {}", e);
     }
 }
@@ -297,10 +365,14 @@ fn inject_with_timing(
     injector: &mut dyn InputInjector,
     msg: &Message,
     context: &str,
+    timings: Option<&mut DurationHistogram>,
 ) -> Result<()> {
     let started = Instant::now();
     let result = injector.inject(msg);
     let elapsed = started.elapsed();
+    if let Some(timings) = timings {
+        timings.record(elapsed);
+    }
     if elapsed > Duration::from_millis(100) {
         warn!(
             "Slow input injection during {}: {:.0}ms ({:?})",
@@ -2216,9 +2288,8 @@ async fn run_client_session(
     let mut injected_keys: HashSet<u32> = HashSet::new();
     let mut injected_buttons: HashSet<u8> = HashSet::new();
     let mut activation_started: Option<Instant> = None;
-    let mut activation_input_messages: u64 = 0;
-    let mut activation_inject_moves: u64 = 0;
-    let mut activation_superseded_moves: u64 = 0;
+    let mut activation_started_unix_ms: u64 = 0;
+    let mut activation_diagnostics = ClientActivationDiagnostics::default();
     let mut activation_first_inject_logged = false;
     let mut pending_mouse_move: Option<(i32, i32)> = None;
     let mut file_send_tasks = Vec::new();
@@ -2231,12 +2302,12 @@ async fn run_client_session(
             biased;
             item = input_queue.recv() => {
                 match item {
-                    InputQueueItem::Message(message) => {
+                    InputQueueItem::Message(queued) => {
                         if activation_started.is_some() {
-                            activation_input_messages += 1;
+                            activation_diagnostics.record_message(&queued, Instant::now());
                         }
-                        let original_message = message.clone();
-                        match transition.handle(message) {
+                        let original_message = queued.message.clone();
+                        match transition.handle(queued.message) {
                             ClientOutput::Ignore => {
                                 // Preserve ordering if a discrete release follows a
                                 // pointer position that has not reached CoreGraphics yet.
@@ -2245,7 +2316,7 @@ async fn run_client_session(
                                         &mut *injector,
                                         &mut pending_mouse_move,
                                         activation_started,
-                                        &mut activation_inject_moves,
+                                        &mut activation_diagnostics,
                                         &mut activation_first_inject_logged,
                                         "before ignored input",
                                     );
@@ -2266,15 +2337,14 @@ async fn run_client_session(
                                 info!("Server sharing mouse");
                                 pending_mouse_move = None;
                                 activation_started = Some(Instant::now());
-                                activation_input_messages = 0;
-                                activation_inject_moves = 0;
-                                activation_superseded_moves = 0;
+                                activation_started_unix_ms = unix_millis();
+                                activation_diagnostics = ClientActivationDiagnostics::default();
                                 activation_first_inject_logged = false;
                                 display_control.wake_display().ok();
                             }
                             ClientOutput::InjectMove { x, y } => {
                                 if pending_mouse_move.replace((x, y)).is_some() {
-                                    activation_superseded_moves += 1;
+                                    activation_diagnostics.superseded_mouse_moves += 1;
                                 }
                             }
                             ClientOutput::Forward(msg) => {
@@ -2282,11 +2352,14 @@ async fn run_client_session(
                                     &mut *injector,
                                     &mut pending_mouse_move,
                                     activation_started,
-                                    &mut activation_inject_moves,
+                                    &mut activation_diagnostics,
                                     &mut activation_first_inject_logged,
                                     "before discrete input",
                                 );
-                                if let Err(e) = inject_with_timing(&mut *injector, &msg, "forward") {
+                                let timings = activation_started
+                                    .is_some()
+                                    .then_some(&mut activation_diagnostics.injection_latency);
+                                if let Err(e) = inject_with_timing(&mut *injector, &msg, "forward", timings) {
                                     warn!("Inject error: {}", e);
                                 } else {
                                     track_injected_input(&msg, &mut injected_keys, &mut injected_buttons);
@@ -2298,7 +2371,10 @@ async fn run_client_session(
                                 pending_mouse_move = None;
                                 if let Some((x, y)) = inject {
                                     let msg = Message::MouseMove { x, y };
-                                    inject_with_timing(&mut *injector, &msg, "switch back").ok();
+                                    let timings = activation_started
+                                        .is_some()
+                                        .then_some(&mut activation_diagnostics.injection_latency);
+                                    inject_with_timing(&mut *injector, &msg, "switch back", timings).ok();
                                 }
                                 // Release any remote-held keys immediately on switch-back. The
                                 // server also sends cleanup releases, but those can arrive after
@@ -2342,12 +2418,17 @@ async fn run_client_session(
                     }
                 }
             }
-            _ = pointer_injection_interval.tick(), if pending_mouse_move.is_some() => {
+            scheduled = pointer_injection_interval.tick(), if pending_mouse_move.is_some() => {
+                if activation_started.is_some() {
+                    activation_diagnostics.pointer_tick_lateness.record(
+                        Instant::now().saturating_duration_since(scheduled),
+                    );
+                }
                 flush_pending_mouse(
                     &mut *injector,
                     &mut pending_mouse_move,
                     activation_started,
-                    &mut activation_inject_moves,
+                    &mut activation_diagnostics,
                     &mut activation_first_inject_logged,
                     "pointer frame",
                 );
@@ -2483,11 +2564,22 @@ async fn run_client_session(
                 if activation_started.is_some_and(|started| started.elapsed() >= Duration::from_secs(10)) {
                     let elapsed = activation_started.unwrap().elapsed();
                     info!(
-                        "Activation diagnostics: {:.0}s summary: input_messages={}, injected_mouse_moves={}, superseded_mouse_moves={}",
+                        "Activation diagnostics: {:.0}s summary: activation_unix_ms={} input_messages={} injected_mouse_moves={} superseded_mouse_moves={} max_queue_depth={} bucket_upper_bounds_us={:?} move_arrival_gap_buckets={:?} move_arrival_gap_max_us={} queue_residence_buckets={:?} queue_residence_max_us={} pointer_tick_lateness_buckets={:?} pointer_tick_lateness_max_us={} injection_latency_buckets={:?} injection_latency_max_us={}",
                         elapsed.as_secs_f64(),
-                        activation_input_messages,
-                        activation_inject_moves,
-                        activation_superseded_moves
+                        activation_started_unix_ms,
+                        activation_diagnostics.input_messages,
+                        activation_diagnostics.injected_mouse_moves,
+                        activation_diagnostics.superseded_mouse_moves,
+                        activation_diagnostics.max_queue_depth,
+                        INPUT_DIAGNOSTIC_BUCKET_UPPER_BOUNDS_US,
+                        activation_diagnostics.move_arrival_gap.buckets,
+                        activation_diagnostics.move_arrival_gap.max_us,
+                        activation_diagnostics.queue_residence.buckets,
+                        activation_diagnostics.queue_residence.max_us,
+                        activation_diagnostics.pointer_tick_lateness.buckets,
+                        activation_diagnostics.pointer_tick_lateness.max_us,
+                        activation_diagnostics.injection_latency.buckets,
+                        activation_diagnostics.injection_latency.max_us,
                     );
                     activation_started = None;
                 }
@@ -2857,37 +2949,70 @@ mod input_coalescing_tests {
         queue.push(Message::MouseMove { x: -2, y: 4 });
         queue.close();
 
+        let first = queue.recv().await;
         assert!(matches!(
-            queue.recv().await,
-            InputQueueItem::Message(Message::SwitchScreen {
-                direction: Direction::Right
-            })
-        ));
-        assert!(matches!(
-            queue.recv().await,
-            InputQueueItem::Message(Message::MouseMove { x: 100, y: 50 })
-        ));
-        assert!(matches!(
-            queue.recv().await,
-            InputQueueItem::Message(Message::MouseMove { x: 3, y: -2 })
-        ));
-        assert!(matches!(
-            queue.recv().await,
-            InputQueueItem::Message(Message::KeyEvent {
-                keycode: 30,
-                pressed: true,
+            first,
+            InputQueueItem::Message(QueuedInputMessage {
+                message: Message::SwitchScreen {
+                    direction: Direction::Right
+                },
+                depth_after_push: 1,
                 ..
             })
         ));
         assert!(matches!(
             queue.recv().await,
-            InputQueueItem::Message(Message::MouseMove { x: 7, y: 8 })
+            InputQueueItem::Message(QueuedInputMessage {
+                message: Message::MouseMove { x: 100, y: 50 },
+                depth_after_push: 2,
+                ..
+            })
         ));
         assert!(matches!(
             queue.recv().await,
-            InputQueueItem::Message(Message::MouseMove { x: -2, y: 4 })
+            InputQueueItem::Message(QueuedInputMessage {
+                message: Message::MouseMove { x: 3, y: -2 },
+                ..
+            })
+        ));
+        assert!(matches!(
+            queue.recv().await,
+            InputQueueItem::Message(QueuedInputMessage {
+                message: Message::KeyEvent {
+                    keycode: 30,
+                    pressed: true,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            queue.recv().await,
+            InputQueueItem::Message(QueuedInputMessage {
+                message: Message::MouseMove { x: 7, y: 8 },
+                ..
+            })
+        ));
+        assert!(matches!(
+            queue.recv().await,
+            InputQueueItem::Message(QueuedInputMessage {
+                message: Message::MouseMove { x: -2, y: 4 },
+                depth_after_push: 6,
+                ..
+            })
         ));
         assert!(matches!(queue.recv().await, InputQueueItem::Closed));
+    }
+
+    #[test]
+    fn duration_histogram_records_boundaries_and_maximum() {
+        let mut histogram = DurationHistogram::default();
+        for micros in [999, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000] {
+            histogram.record(Duration::from_micros(micros));
+        }
+
+        assert_eq!(histogram.buckets, [1; 8]);
+        assert_eq!(histogram.max_us, 64_000);
     }
 
     #[test]
