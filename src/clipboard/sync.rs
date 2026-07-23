@@ -315,15 +315,22 @@ pub(super) fn read_clipboard() -> Result<String> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn write_clipboard(text: &str) -> Result<()> {
-    let runner = crate::command::RealCommandRunner;
+fn write_linux_clipboard_with_runner(
+    runner: &dyn crate::ports::CommandRunner,
+    text: &str,
+) -> Result<()> {
     // wl-copy and xclip may fork a long-lived clipboard owner. Capturing
     // output here would leave the runner waiting forever for EOF on descriptors
     // inherited by that owner after the short-lived parent exits.
-    if write_text_with_runner_options(&runner, "wl-copy", &[], text, true).is_ok() {
+    if write_text_with_runner_options(runner, "wl-copy", &[], text, true).is_ok() {
         return Ok(());
     }
-    write_text_with_runner_options(&runner, "xclip", &["-selection", "clipboard"], text, true)
+    write_text_with_runner_options(runner, "xclip", &["-selection", "clipboard"], text, true)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn write_clipboard(text: &str) -> Result<()> {
+    write_linux_clipboard_with_runner(&crate::command::RealCommandRunner, text)
 }
 
 #[cfg(test)]
