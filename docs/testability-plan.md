@@ -335,6 +335,7 @@ The first complete client/server rigs must cover these release-blocking invarian
 | UPDATE-2 | Fixed | The server updater replaced its executable and called `process::exit` from a detached task, so restart intent and the supervised service handoff could not be tested together. | Server update polling now returns typed restart intent to the composition root; tests verify exact-version installation and systemd/launchd restart contracts. |
 | CI-1 | Fixed | The client update adapter test used the git-derived build version, which is a commit hash in shallow untagged CI checkouts and made its update expectation depend on repository state. | The adapter keeps the production build-version wrapper while its test injects explicit current and candidate semantic versions. |
 | CI-2 | Fixed | The blocking command fake waited on one condition variable with two different mutexes, which Linux tolerated but macOS correctly rejected at runtime. | Block entry and completion now share one mutex-protected state with the condition variable on every wait path. |
+| CI-3 | Fixed | CLI integration fixtures wrote Linux's XDG config layout on macOS, so configuration-validation tests accidentally loaded defaults instead of their fixtures. | CLI fixtures now use the platform-specific production config layout while retaining isolated temporary homes. |
 
 ## Progress log
 

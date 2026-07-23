@@ -4,8 +4,19 @@ use std::path::Path;
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+fn test_config_dir(root: &Path) -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        root.join("Library/Application Support/com.nexdesk.nexdesk")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        root.join("nexdesk")
+    }
+}
+
 fn write_config(root: &Path, role: &str, edge: Option<&str>) {
-    let config_dir = root.join("nexdesk");
+    let config_dir = test_config_dir(root);
     fs::create_dir_all(&config_dir).unwrap();
     let edge = edge
         .map(|value| format!("switch_edge = {value:?}\n"))
