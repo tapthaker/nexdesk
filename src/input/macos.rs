@@ -13,9 +13,11 @@ use objc2_core_graphics::{
 
 #[cfg(target_os = "macos")]
 use std::os::raw::{c_int, c_uint};
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[cfg(target_os = "macos")]
 use crate::input::capture::InputCapture;
@@ -28,6 +30,20 @@ use crate::net::protocol::Message;
 
 #[cfg(target_os = "macos")]
 const MAIN_DISPLAY: CGDirectDisplayID = 0;
+#[cfg(target_os = "macos")]
+const CORE_GRAPHICS_DIAGNOSTIC_THRESHOLD: Duration = Duration::from_millis(4);
+
+#[cfg(target_os = "macos")]
+fn log_core_graphics_timing(operation: &str, started: Instant) {
+    let elapsed = started.elapsed();
+    if elapsed >= CORE_GRAPHICS_DIAGNOSTIC_THRESHOLD {
+        warn!(
+            "CoreGraphics diagnostics: operation={} elapsed_us={}",
+            operation,
+            elapsed.as_micros()
+        );
+    }
+}
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -244,17 +260,24 @@ impl MacOSInjector {
     }
 
     fn event_source(&self) -> Result<CFRetained<CGEventSource>> {
+        let started = Instant::now();
         let source = CGEventSource::new(self.source_state)
             .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
+        log_core_graphics_timing("CGEventSourceCreate", started);
+
         // Avoid CoreGraphics' default local-event suppression window. This is
         // documented for remote-operation events and is harmless if the delay is
         // unrelated, but gives us a cheap A/B point for idle wake sluggishness.
+        let started = Instant::now();
         CGEventSource::set_local_events_suppression_interval(Some(&source), 0.0);
+        log_core_graphics_timing("CGEventSourceSetLocalEventsSuppressionInterval", started);
         Ok(source)
     }
 
     fn post_event(&self, event: &CGEvent) {
+        let started = Instant::now();
         CGEvent::post(self.tap_location, Some(event));
+        log_core_graphics_timing("CGEventPost", started);
     }
 
     /// Post an NSSystemDefined media key event (volume, brightness, play, etc.)
@@ -302,17 +325,23 @@ impl MacOSInjector {
     ) -> Result<()> {
         let point = CGPoint { x, y };
         let source = self.event_source()?;
+        let started = Instant::now();
         let event = CGEvent::new_mouse_event(Some(&source), event_type, point, button)
             .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create mouse event"))?;
+        log_core_graphics_timing("CGEventCreateMouseEvent", started);
         self.post_event(&event);
         Ok(())
     }
 
     fn current_position(&self) -> Result<(i32, i32)> {
         let source = self.event_source()?;
+        let started = Instant::now();
         let event = CGEvent::new(Some(&source))
             .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEvent"))?;
+        log_core_graphics_timing("CGEventCreate", started);
+        let started = Instant::now();
         let loc = CGEvent::location(Some(&event));
+        log_core_graphics_timing("CGEventGetLocation", started);
         Ok((loc.x as i32, loc.y as i32))
     }
 
@@ -510,8 +539,10 @@ impl InputInjector for MacOSInjector {
     }
 
     fn move_mouse(&mut self, x: i32, y: i32) -> Result<()> {
+        let started = Instant::now();
         let sw = CGDisplayPixelsWide(MAIN_DISPLAY) as i32;
         let sh = CGDisplayPixelsHigh(MAIN_DISPLAY) as i32;
+        log_core_graphics_timing("CGDisplayPixelDimensions", started);
         let x = x.clamp(0, sw - 1) as f64;
         let y = y.clamp(0, sh - 1) as f64;
         // macOS requires drag event types when a button is held, otherwise
@@ -530,7 +561,9 @@ impl InputInjector for MacOSInjector {
             return Ok(());
         }
         if matches!(event_type, CGEventType::MouseMoved) {
+            let started = Instant::now();
             let ret = unsafe { CGWarpMouseCursorPosition(CGPoint { x, y }) };
+            log_core_graphics_timing("CGWarpMouseCursorPosition", started);
             if ret != 0 {
                 debug!("CGWarpMouseCursorPosition returned {}", ret);
             }
