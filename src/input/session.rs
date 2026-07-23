@@ -41,6 +41,13 @@ fn linux_session_locked() -> bool {
 
 #[cfg(target_os = "linux")]
 fn linux_session_locked_with(runner: &dyn CommandRunner) -> bool {
+    // Hyprlock uses the Wayland session-lock protocol directly, so logind's
+    // LockedHint can remain "no" for the entire lock. Check the locker process
+    // used by Hyprland/Omarchy before falling back to logind.
+    if hyprlock_is_running(runner) {
+        return true;
+    }
+
     if let Ok(session_id) = std::env::var("XDG_SESSION_ID") {
         if session_locked_hint(runner, &session_id).unwrap_or(false) {
             return true;
@@ -72,6 +79,12 @@ fn linux_session_locked_with(runner: &dyn CommandRunner) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn hyprlock_is_running(runner: &dyn CommandRunner) -> bool {
+    run_command(runner, "pidof", &["hyprlock"])
+        .is_ok_and(|output| output.success && !output.stdout.is_empty())
+}
+
+#[cfg(target_os = "linux")]
 fn session_locked_hint(runner: &dyn CommandRunner, session_id: &str) -> Option<bool> {
     let output = run_command(
         runner,
@@ -85,4 +98,36 @@ fn session_locked_hint(runner: &dyn CommandRunner, session_id: &str) -> Option<b
     }
 
     Some(String::from_utf8_lossy(&output.stdout).trim() == "yes")
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::ports::CommandOutput;
+    use crate::testing::{CommandObservation, ScriptedCommandRunner};
+
+    fn successful_output(stdout: &[u8]) -> CommandOutput {
+        CommandOutput {
+            success: true,
+            code: Some(0),
+            signal: None,
+            stdout: stdout.to_vec(),
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        }
+    }
+
+    #[test]
+    fn running_hyprlock_marks_session_locked_when_logind_does_not() {
+        let runner = ScriptedCommandRunner::new();
+        runner.push_output(successful_output(b"4242\n"));
+
+        assert!(linux_session_locked_with(&runner));
+        assert!(matches!(
+            &runner.observations().snapshot()[0].event,
+            CommandObservation::Run(request)
+                if request.program == "pidof" && request.args == ["hyprlock"]
+        ));
+    }
 }

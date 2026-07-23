@@ -1,0 +1,33 @@
+[package]
+name = "nexdesk-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nexdesk = { path = ".." }
+
+[[bin]]
+name = "protocol_decode"
+path = "fuzz_targets/protocol_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "framed_chunks"
+path = "fuzz_targets/framed_chunks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "file_transfer_sequence"
+path = "fuzz_targets/file_transfer_sequence.rs"
+test = false
+doc = false
+bench = false

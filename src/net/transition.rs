@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::cursor::edge;
 use crate::net::protocol::{Direction, Message, ScreenLayout};
@@ -10,10 +10,17 @@ const SERVER_EDGE_COOLDOWN: u32 = 125;
 const INSET: i32 = 20;
 const CLIENT_EDGE_DWELL: u32 = 8;
 
-// Do not synthesize keyboard repeat in nexdesk. The client OS will repeat
-// naturally after a forwarded key-down. Synthesizing repeat here is dangerous:
-// if the Linux capturer misses a key-up during a switch-back/grab transition,
-// the stale pressed key becomes an endless stream of key-downs on the client.
+/// Polls before the first repeat (~500ms at the 2ms server polling interval).
+const KEY_REPEAT_DELAY: u32 = 250;
+/// Polls between repeats (~30ms, or approximately 33 repeats per second).
+const KEY_REPEAT_INTERVAL: u32 = 15;
+
+fn key_repeats(keycode: u32) -> bool {
+    !matches!(
+        keycode,
+        29 | 42 | 54 | 56 | 58 | 97 | 100 | 125 | 126 // Ctrl, Shift, Alt, Caps Lock, Meta
+    )
+}
 
 // Evdev keycodes for the safety escape combo (Ctrl+Alt+Escape)
 const KEY_ESC: u32 = 1;
@@ -60,6 +67,7 @@ pub struct ServerTransition {
     edge_dwell: u32,
     pressed_keys: HashSet<u32>,
     pressed_buttons: HashSet<u8>,
+    repeat_polls: BTreeMap<u32, u32>,
 }
 
 impl ServerTransition {
@@ -75,6 +83,7 @@ impl ServerTransition {
             edge_dwell: 0,
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
+            repeat_polls: BTreeMap::new(),
         }
     }
 
@@ -130,7 +139,7 @@ impl ServerTransition {
             return None;
         };
 
-        if self.trigger_edge.map_or(true, |edge| edge == direction) {
+        if self.trigger_edge.is_none_or(|edge| edge == direction) {
             Some(direction)
         } else {
             None
@@ -146,6 +155,7 @@ impl ServerTransition {
     }
 
     pub fn release_remote_inputs(&mut self) -> Vec<Message> {
+        self.repeat_polls.clear();
         let mut keys: Vec<u32> = self.pressed_keys.drain().collect();
         keys.sort_unstable();
         let mut buttons: Vec<u8> = self.pressed_buttons.drain().collect();
@@ -175,6 +185,7 @@ impl ServerTransition {
         self.edge_dwell = 0;
         self.edge_cooldown = 0;
         self.pressed_buttons.clear();
+        self.repeat_polls.clear();
 
         let pw = self.peer_screen.width as i32;
         let ph = self.peer_screen.height as i32;
@@ -201,8 +212,32 @@ impl ServerTransition {
     }
 
     fn push_key_events(&mut self, key_events: Vec<Message>, messages: &mut Vec<Message>) {
-        // No synthetic repeats. Forward only real press/release transitions.
+        for event in &key_events {
+            if let Message::KeyEvent {
+                keycode, pressed, ..
+            } = event
+            {
+                if *pressed && key_repeats(*keycode) {
+                    self.repeat_polls.entry(*keycode).or_insert(0);
+                } else {
+                    self.repeat_polls.remove(keycode);
+                }
+            }
+        }
         messages.extend(key_events);
+
+        for (&keycode, polls) in &mut self.repeat_polls {
+            *polls = polls.saturating_add(1);
+            if *polls >= KEY_REPEAT_DELAY
+                && (*polls - KEY_REPEAT_DELAY).is_multiple_of(KEY_REPEAT_INTERVAL)
+            {
+                messages.push(Message::KeyEvent {
+                    keycode,
+                    pressed: true,
+                    modifiers: 0,
+                });
+            }
+        }
     }
 
     pub fn poll_active_keys(&mut self, key_events: Vec<Message>) -> ServerOutput {
@@ -290,7 +325,7 @@ impl ServerTransition {
 
         if !self.active {
             let at_edge = edge::detect_edge(clamped_x, clamped_y, sw, sh)
-                .filter(|d| self.trigger_edge.map_or(true, |e| *d == e));
+                .filter(|d| self.trigger_edge.is_none_or(|e| *d == e));
 
             if self.edge_cooldown > 0 {
                 self.edge_cooldown -= 1;
@@ -359,7 +394,7 @@ impl ServerTransition {
                 self.last_buttons = buttons;
             }
 
-            // Keyboard events: forward originals and synthesize repeats.
+            // Keyboard events: forward physical transitions and synthesize repeat presses.
             self.push_key_events(key_events, &mut messages);
 
             ServerOutput::Forward { messages }
@@ -383,6 +418,7 @@ impl ServerTransition {
 
     pub fn deactivate(&mut self) {
         self.active = false;
+        self.repeat_polls.clear();
     }
 
     pub fn deactivate_for_shortcut(&mut self) -> Vec<Message> {
@@ -450,6 +486,14 @@ impl ClientTransition {
         self.screen_h = h;
         self.cursor_x = self.cursor_x.clamp(0, w as i32 - 1);
         self.cursor_y = self.cursor_y.clamp(0, h as i32 - 1);
+    }
+
+    /// Stop accepting remote input because the server reclaimed control.
+    pub fn release_control(&mut self) {
+        self.active = false;
+        self.first_move = false;
+        self.edge_dwell = 0;
+        self.switch_back_edge = None;
     }
 
     pub fn handle(&mut self, message: Message) -> ClientOutput {
@@ -522,12 +566,99 @@ impl ClientTransition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
-    fn server_screen() -> ScreenLayout {
-        ScreenLayout {
-            width: 1920,
-            height: 1080,
-        }
+    #[derive(Clone, Debug)]
+    enum GeneratedClientEvent {
+        Message(Message),
+        Resize { width: u32, height: u32 },
+    }
+
+    fn direction_strategy() -> impl Strategy<Value = Direction> {
+        prop_oneof![
+            Just(Direction::Left),
+            Just(Direction::Right),
+            Just(Direction::Up),
+            Just(Direction::Down),
+        ]
+    }
+
+    #[derive(Clone, Debug)]
+    enum GeneratedServerEvent {
+        Poll {
+            x: i32,
+            y: i32,
+            buttons: u8,
+            keys: Vec<Message>,
+        },
+        PollActiveKeys(Vec<Message>),
+        ActivateInstant(Direction),
+        SwitchBack,
+        ShortcutDeactivate,
+    }
+
+    fn key_event_strategy() -> impl Strategy<Value = Message> {
+        (0u32..=255, any::<bool>(), any::<u16>()).prop_map(|(keycode, pressed, modifiers)| {
+            Message::KeyEvent {
+                keycode,
+                pressed,
+                modifiers,
+            }
+        })
+    }
+
+    fn server_event_strategy() -> impl Strategy<Value = GeneratedServerEvent> {
+        prop_oneof![
+            (
+                -100i32..=2_100,
+                -100i32..=1_200,
+                0u8..=7,
+                prop::collection::vec(key_event_strategy(), 0..5),
+            )
+                .prop_map(|(x, y, buttons, keys)| GeneratedServerEvent::Poll {
+                    x,
+                    y,
+                    buttons,
+                    keys,
+                }),
+            prop::collection::vec(key_event_strategy(), 0..5)
+                .prop_map(GeneratedServerEvent::PollActiveKeys),
+            direction_strategy().prop_map(GeneratedServerEvent::ActivateInstant),
+            Just(GeneratedServerEvent::SwitchBack),
+            Just(GeneratedServerEvent::ShortcutDeactivate),
+        ]
+    }
+
+    fn client_event_strategy() -> impl Strategy<Value = GeneratedClientEvent> {
+        prop_oneof![
+            direction_strategy().prop_map(|direction| GeneratedClientEvent::Message(
+                Message::SwitchScreen { direction }
+            )),
+            (-10_000i32..=10_000, -10_000i32..=10_000)
+                .prop_map(|(x, y)| { GeneratedClientEvent::Message(Message::MouseMove { x, y }) }),
+            (0u8..=7, any::<bool>()).prop_map(|(button, pressed)| {
+                GeneratedClientEvent::Message(Message::MouseButton { button, pressed })
+            }),
+            (-100i16..=100, -100i16..=100).prop_map(|(dx, dy)| {
+                GeneratedClientEvent::Message(Message::MouseScroll {
+                    dx: f64::from(dx),
+                    dy: f64::from(dy),
+                    phase: crate::net::protocol::ScrollPhase::None,
+                })
+            }),
+            (0u32..=255, any::<bool>(), any::<u16>()).prop_map(|(keycode, pressed, modifiers)| {
+                GeneratedClientEvent::Message(Message::KeyEvent {
+                    keycode,
+                    pressed,
+                    modifiers,
+                })
+            }),
+            (1u32..=16_384, 1u32..=16_384)
+                .prop_map(|(width, height)| { GeneratedClientEvent::Resize { width, height } }),
+            any::<u64>().prop_map(
+                |timestamp| GeneratedClientEvent::Message(Message::Heartbeat { timestamp })
+            ),
+        ]
     }
 
     fn peer_screen() -> ScreenLayout {
@@ -538,6 +669,135 @@ mod tests {
     }
 
     // ===== Server Tests =====
+
+    fn apply_remote_input_messages(
+        messages: &[Message],
+        keys: &mut HashSet<u32>,
+        buttons: &mut HashSet<u8>,
+    ) {
+        for message in messages {
+            match message {
+                Message::KeyEvent {
+                    keycode, pressed, ..
+                } => {
+                    if *pressed {
+                        keys.insert(*keycode);
+                    } else {
+                        keys.remove(keycode);
+                    }
+                }
+                Message::MouseButton { button, pressed } => {
+                    if *pressed {
+                        buttons.insert(*button);
+                    } else {
+                        buttons.remove(button);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn generated_server_sequences_preserve_grab_and_held_input_safety(
+            events in prop::collection::vec(server_event_strategy(), 0..256),
+        ) {
+            let mut transition = ServerTransition::new(None, peer_screen());
+            let mut remote_keys = HashSet::new();
+            let mut remote_buttons = HashSet::new();
+            let mut grabbed = false;
+
+            for event in events {
+                let output = match event {
+                    GeneratedServerEvent::Poll { x, y, buttons, keys } => {
+                        Some(transition.poll(x, y, 1920, 1080, buttons, keys))
+                    }
+                    GeneratedServerEvent::PollActiveKeys(keys) => {
+                        Some(transition.poll_active_keys(keys))
+                    }
+                    GeneratedServerEvent::ActivateInstant(direction) => {
+                        if transition.is_active() {
+                            continue;
+                        }
+                        let messages = transition.activate_instant(direction);
+                        apply_remote_input_messages(
+                            &messages,
+                            &mut remote_keys,
+                            &mut remote_buttons,
+                        );
+                        None
+                    }
+                    GeneratedServerEvent::SwitchBack => {
+                        let messages = transition.on_switch_back();
+                        apply_remote_input_messages(
+                            &messages,
+                            &mut remote_keys,
+                            &mut remote_buttons,
+                        );
+                        grabbed = false;
+                        prop_assert!(transition.pressed_keys.is_empty());
+                        prop_assert!(transition.pressed_buttons.is_empty());
+                        None
+                    }
+                    GeneratedServerEvent::ShortcutDeactivate => {
+                        let messages = transition.deactivate_for_shortcut();
+                        apply_remote_input_messages(
+                            &messages,
+                            &mut remote_keys,
+                            &mut remote_buttons,
+                        );
+                        grabbed = false;
+                        prop_assert!(transition.pressed_keys.is_empty());
+                        prop_assert!(transition.pressed_buttons.is_empty());
+                        None
+                    }
+                };
+
+                if let Some(output) = output {
+                    match output {
+                        ServerOutput::Idle => {}
+                        ServerOutput::Activate { messages, grab } => {
+                            prop_assert!(grab, "poll activation must request an input grab");
+                            grabbed = grab;
+                            apply_remote_input_messages(
+                                &messages,
+                                &mut remote_keys,
+                                &mut remote_buttons,
+                            );
+                        }
+                        ServerOutput::Forward { messages } => apply_remote_input_messages(
+                            &messages,
+                            &mut remote_keys,
+                            &mut remote_buttons,
+                        ),
+                        ServerOutput::ShortcutRelease { messages }
+                        | ServerOutput::ForceRelease { messages } => {
+                            apply_remote_input_messages(
+                                &messages,
+                                &mut remote_keys,
+                                &mut remote_buttons,
+                            );
+                            grabbed = false;
+                            prop_assert!(transition.pressed_keys.is_empty());
+                            prop_assert!(transition.pressed_buttons.is_empty());
+                        }
+                    }
+                }
+
+                if !transition.is_active() {
+                    prop_assert!(!grabbed, "inactive server retained an input grab");
+                    prop_assert!(remote_keys.is_empty(), "inactive server left remote keys held");
+                    prop_assert!(
+                        remote_buttons.is_empty(),
+                        "inactive server left remote buttons held"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn server_edge_respects_trigger_filter() {
@@ -726,6 +986,32 @@ mod tests {
                     m,
                     Message::KeyEvent { keycode: 115, pressed: true, .. }
                 ))
+        ));
+    }
+
+    #[test]
+    fn server_active_key_polling_repeats_held_keys() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        activate_server(&mut st);
+        st.poll_active_keys(vec![Message::KeyEvent {
+            keycode: 30,
+            pressed: true,
+            modifiers: 0,
+        }]);
+
+        for _ in 0..KEY_REPEAT_DELAY - 2 {
+            let output = st.poll_active_keys(Vec::new());
+            assert!(matches!(output, ServerOutput::Forward { messages } if messages.is_empty()));
+        }
+
+        assert!(matches!(
+            st.poll_active_keys(Vec::new()),
+            ServerOutput::Forward { messages }
+                if matches!(messages.as_slice(), [Message::KeyEvent {
+                    keycode: 30,
+                    pressed: true,
+                    modifiers: 0,
+                }])
         ));
     }
 
@@ -998,6 +1284,93 @@ mod tests {
     }
 
     // ===== Client Tests =====
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn generated_client_sequences_preserve_cursor_and_input_safety(
+            initial_width in 1u32..=16_384,
+            initial_height in 1u32..=16_384,
+            events in prop::collection::vec(client_event_strategy(), 0..256),
+        ) {
+            let mut transition = ClientTransition::new(initial_width, initial_height);
+            let mut width = initial_width;
+            let mut height = initial_height;
+
+            for event in events {
+                match event {
+                    GeneratedClientEvent::Resize { width: next_width, height: next_height } => {
+                        transition.update_screen_size(next_width, next_height);
+                        width = next_width;
+                        height = next_height;
+                    }
+                    GeneratedClientEvent::Message(message) => {
+                        let was_active = transition.active;
+                        let is_press = matches!(
+                            &message,
+                            Message::KeyEvent { pressed: true, .. }
+                                | Message::MouseButton { pressed: true, .. }
+                        );
+                        let output = transition.handle(message);
+
+                        match output {
+                            ClientOutput::InjectMove { x, y } => {
+                                prop_assert!(was_active);
+                                prop_assert!((0..width as i32).contains(&x));
+                                prop_assert!((0..height as i32).contains(&y));
+                            }
+                            ClientOutput::SwitchBack { inject: Some((x, y)), .. } => {
+                                prop_assert!(was_active);
+                                prop_assert!((0..width as i32).contains(&x));
+                                prop_assert!((0..height as i32).contains(&y));
+                                prop_assert!(!transition.active);
+                            }
+                            ClientOutput::Forward(_) if is_press => {
+                                prop_assert!(was_active, "inactive client forwarded an input press");
+                            }
+                            ClientOutput::Activate => prop_assert!(transition.active),
+                            ClientOutput::Ignore
+                            | ClientOutput::Forward(_)
+                            | ClientOutput::SwitchBack { inject: None, .. } => {}
+                        }
+                    }
+                }
+
+                prop_assert!((0..width as i32).contains(&transition.cursor_x));
+                prop_assert!((0..height as i32).contains(&transition.cursor_y));
+            }
+        }
+    }
+
+    #[test]
+    fn client_forced_release_stops_remote_input() {
+        let mut transition = ClientTransition::new(1920, 1080);
+        assert!(matches!(
+            transition.handle(Message::SwitchScreen {
+                direction: Direction::Right,
+            }),
+            ClientOutput::Activate
+        ));
+
+        transition.release_control();
+
+        assert!(matches!(
+            transition.handle(Message::MouseButton {
+                button: 0,
+                pressed: true,
+            }),
+            ClientOutput::Ignore
+        ));
+        assert!(matches!(
+            transition.handle(Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            }),
+            ClientOutput::Ignore
+        ));
+    }
 
     #[test]
     fn client_inactive_ignores_mouse_move() {
@@ -1294,35 +1667,68 @@ mod tests {
     // ===== Key Repeat Tests =====
 
     #[test]
-    fn server_does_not_synthesize_key_repeat() {
+    fn server_repeats_held_non_modifier_keys_after_delay() {
         let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
         activate_server(&mut st);
 
-        // Press a non-modifier key (KEY_A = 30)
-        let key = vec![Message::KeyEvent {
-            keycode: 30,
-            pressed: true,
-            modifiers: 0,
-        }];
-        st.poll(1919, 500, 1920, 1080, 0, key);
+        let first = st.poll(
+            1919,
+            500,
+            1920,
+            1080,
+            0,
+            vec![Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            }],
+        );
+        assert!(matches!(
+            first,
+            ServerOutput::Forward { messages }
+                if messages.iter().filter(|message| matches!(
+                    message,
+                    Message::KeyEvent { keycode: 30, pressed: true, .. }
+                )).count() == 1
+        ));
 
-        // Holding the key without new physical events must not generate more
-        // key-down messages. The client OS handles natural key repeat.
-        for _ in 0..500 {
-            let out = st.poll(1919, 500, 1920, 1080, 0, vec![]);
-            if let ServerOutput::Forward { messages } = out {
-                assert!(
-                    !messages.iter().any(|m| matches!(
-                        m,
-                        Message::KeyEvent {
-                            keycode: 30,
-                            pressed: true,
-                            ..
-                        }
-                    )),
-                    "server must not synthesize repeat key-downs"
-                );
-            }
+        for _ in 0..KEY_REPEAT_DELAY - 2 {
+            let output = st.poll(1919, 500, 1920, 1080, 0, vec![]);
+            assert!(matches!(output, ServerOutput::Forward { messages } if messages.is_empty()));
+        }
+
+        let repeat = st.poll(1919, 500, 1920, 1080, 0, vec![]);
+        assert!(matches!(
+            repeat,
+            ServerOutput::Forward { messages }
+                if matches!(messages.as_slice(), [Message::KeyEvent {
+                    keycode: 30,
+                    pressed: true,
+                    modifiers: 0,
+                }])
+        ));
+    }
+
+    #[test]
+    fn server_does_not_repeat_modifier_keys() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        activate_server(&mut st);
+        st.poll(
+            1919,
+            500,
+            1920,
+            1080,
+            0,
+            vec![Message::KeyEvent {
+                keycode: KEY_LEFTSHIFT,
+                pressed: true,
+                modifiers: 0,
+            }],
+        );
+
+        for _ in 0..KEY_REPEAT_DELAY + KEY_REPEAT_INTERVAL {
+            let output = st.poll(1919, 500, 1920, 1080, 0, vec![]);
+            assert!(matches!(output, ServerOutput::Forward { messages } if messages.is_empty()));
         }
     }
 
@@ -1352,6 +1758,11 @@ mod tests {
                     Message::KeyEvent { keycode: 30, pressed: false, .. }
                 ))
         ));
+
+        for _ in 0..KEY_REPEAT_DELAY + KEY_REPEAT_INTERVAL {
+            let output = st.poll(1919, 500, 1920, 1080, 0, vec![]);
+            assert!(matches!(output, ServerOutput::Forward { messages } if messages.is_empty()));
+        }
     }
 
     // ===== activate_instant Tests =====

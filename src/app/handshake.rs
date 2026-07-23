@@ -117,6 +117,7 @@ pub(crate) fn client_pairing_decision(server_is_trusted: bool) -> PairingDecisio
     }
 }
 
+#[cfg(test)]
 pub(crate) fn require_server_certificate_fingerprint(
     fingerprint: Option<String>,
 ) -> Result<String> {

@@ -1,3 +1,11 @@
+#![cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "production LaunchAgent entry points compile on Linux only for adapter contract tests"
+    )
+)]
+
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use std::path::PathBuf;
 use tracing::info;
@@ -317,6 +325,11 @@ mod tests {
                 .count(),
             10
         );
-        assert!(plist.is_file());
+        let content = std::fs::read_to_string(&plist).unwrap();
+        assert!(content.contains("<key>KeepAlive</key>\n    <true/>"));
+        assert!(content.contains(&format!(
+            "<string>{}</string>",
+            std::env::current_exe().unwrap().display()
+        )));
     }
 }

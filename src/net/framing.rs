@@ -69,6 +69,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_outbound_message_is_rejected_before_writing_bytes() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        let invalid = Message::KeyEvent {
+            keycode: protocol::MAX_KEYCODE + 1,
+            pressed: true,
+            modifiers: 0,
+        };
+
+        let error = send_message(&mut writer, &invalid).await.unwrap_err();
+        assert!(error.to_string().contains("Invalid keycode"));
+
+        drop(writer);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
     async fn clean_close_and_partial_frame_close_are_distinct() {
         let (writer, mut reader) = tokio::io::duplex(16);
         drop(writer);

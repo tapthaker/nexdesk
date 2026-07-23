@@ -43,10 +43,16 @@ Run the target platform's complete unit-test suite:
 cargo test --all-targets
 ```
 
-Run advisory linting:
+Run the required strict lint gate:
 
 ```bash
-cargo clippy --all-targets
+cargo clippy --all-targets -- -D warnings
+```
+
+Run the explicit deterministic scenario gate:
+
+```bash
+scripts/test-deterministic.sh
 ```
 
 Before committing a change, run the narrowest relevant test command while developing, followed by formatting and `cargo test --all-targets` when the change can affect shared behavior.
@@ -57,13 +63,47 @@ A single test can be run with a fully qualified filter, for example:
 cargo test net::transition::tests::server_switch_back_releases_held_keys
 ```
 
+The normal suite includes generated transition and client/server session properties. Proptest shrinks failures and writes replay seeds under `proptest-regressions/`; commit each generated seed with its fix so the minimized case remains in every subsequent run.
+
+Run a bounded fuzz target after installing nightly Rust and `cargo-fuzz`:
+
+```bash
+cargo +nightly fuzz run protocol_decode -- -max_total_time=60 -timeout=10
+cargo +nightly fuzz run framed_chunks -- -max_total_time=60 -timeout=10
+cargo +nightly fuzz run file_transfer_sequence -- -max_total_time=60 -timeout=10
+```
+
+Scheduled CI runs each target for two minutes and retains any files under `fuzz/artifacts/<target>` for 30 days. Reproduce and minimize a retained crash before committing it to the target's corpus with its fix.
+
+Targeted mutation-test commands and results are recorded in [`mutation-testing.md`](mutation-testing.md).
+
 Generate an LCOV coverage report after installing [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov):
 
 ```bash
 cargo llvm-cov --all-targets --lcov --output-path lcov.info
 ```
 
-CI stores `lcov.info` as the `coverage-lcov` artifact. Coverage is initially informational and has no required percentage threshold.
+CI stores `lcov.info` and `coverage-summary.md` as the `coverage-lcov` artifact. The job summary reports line and function coverage per core/orchestration module and grouped area totals. Generate the same summary locally with:
+
+```bash
+python scripts/coverage-summary.py lcov.info
+```
+
+The deterministic Linux baseline currently reports 88.3% core line coverage and 64.2% orchestration line coverage. CI enforces conservative regression floors of 85% and 60%, respectively; it does not gate on function coverage yet. Reproduce the gate locally with:
+
+```bash
+python scripts/coverage-summary.py lcov.info \
+  --fail-under-core-lines 85 \
+  --fail-under-orchestration-lines 60
+```
+
+Run the opt-in live GitHub update contract smoke test only when external network access is intended:
+
+```bash
+cargo test live_github_update_contract_smoke -- --ignored --nocapture
+```
+
+This test checks the latest-release response and begins streaming the matching platform asset. It is ignored by normal local and CI test runs.
 
 ## Current baseline
 
@@ -74,13 +114,7 @@ At the start of the testability project on 2026-07-19:
 - The source contains additional target-gated macOS tests that do not run on Linux.
 - There are no tests in a top-level `tests/` integration-test directory yet.
 - `cargo clippy --all-targets` succeeds with warnings.
-- Strict clippy is not yet a passing gate:
-
-  ```bash
-  cargo clippy --all-targets -- -D warnings
-  ```
-
-  Current findings include dead code in target-specific input mappings, unused Wayland event fields, type-complexity suggestions, collapsible matches, items placed after test modules, and other style findings. These are existing quality debt tracked separately in Phase 5 of the testability plan; structural test work should not silently mix in unrelated lint cleanup.
+- Strict Clippy was initially non-passing because of dead code, target-specific imports, type complexity, and style findings. Phase 5 resolved or explicitly annotated that baseline, and `cargo clippy --all-targets -- -D warnings` is now required.
 
 ## Platform coverage rules
 

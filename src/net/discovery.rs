@@ -73,7 +73,7 @@ pub async fn advertise(port: u16) -> Result<()> {
         "unknown"
     };
 
-    let instance_name = format!("{hostname}");
+    let instance_name = hostname.to_string();
     let ip = local_ipv4().unwrap_or_default();
     let fingerprint = local_certificate_fingerprint()?;
     let service = ServiceInfo::new(
@@ -162,7 +162,7 @@ pub fn start_advertising(port: u16) -> Result<AdvertiseHandle> {
         "unknown"
     };
 
-    let instance_name = format!("{hostname}");
+    let instance_name = hostname.to_string();
     let ip = local_ipv4().unwrap_or_default();
     let fingerprint = local_certificate_fingerprint()?;
     let service = ServiceInfo::new(
@@ -287,19 +287,6 @@ impl PeerDiscovery for MdnsDiscovery {
         let expected_fingerprint = expected_fingerprint.to_uppercase();
         Box::pin(async move { discover_one_attempt(&expected_fingerprint, timeout).await })
     }
-}
-
-/// Discover the nexdesk server with the expected certificate fingerprint.
-/// Returns its current socket address or an error if none is found within `timeout`.
-pub async fn discover_one(expected_fingerprint: &str, timeout: Duration) -> Result<SocketAddr> {
-    crate::app::resolve_peer_with_retry(
-        &MdnsDiscovery,
-        expected_fingerprint,
-        timeout,
-        3,
-        &crate::app::CancellationToken::new(),
-    )
-    .await
 }
 
 async fn discover_one_attempt(expected_fingerprint: &str, timeout: Duration) -> Result<SocketAddr> {

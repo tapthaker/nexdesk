@@ -4,6 +4,7 @@ mod discovery;
 mod pairing;
 mod persistence;
 mod platform;
+mod setup;
 mod status;
 mod transport;
 mod trust;
@@ -17,6 +18,7 @@ pub use discovery::{
 pub use pairing::{PairingPrompt, PairingPromptFuture};
 pub use persistence::{AtomicFileStore, RealAtomicFileStore};
 pub use platform::{DisplaySessionControl, LocalSessionLockSource, SleepInhibitor};
+pub use setup::{SetupFuture, SetupPairing, SetupServiceInstaller};
 pub use status::StatusSink;
 pub use transport::{
     ClientChannel, ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand,

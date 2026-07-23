@@ -228,12 +228,12 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 ### T3.4 — File transfer
 
-- [ ] **T3.4.1** Move file-transfer protocol flow onto reusable typed message streams independent of Quinn concrete stream types.
-- [ ] **T3.4.2** Add deterministic transfer identifiers through injected entropy.
-- [ ] **T3.4.3** Add sender scenarios for mutation, truncation, growth, identity change, cancel, timeout, and mid-frame disconnect.
-- [ ] **T3.4.4** Add receiver scenarios for malformed offers, offsets, duplicates, checksum errors, collisions, cancellation, timeout, and disk failure.
-- [ ] **T3.4.5** Add concurrent transfer limit and shutdown tests.
-- [ ] **T3.4.6** Add end-to-end in-memory file transfer tests using real temporary files.
+- [x] **T3.4.1** Move file-transfer protocol flow onto reusable typed message streams independent of Quinn concrete stream types.
+- [x] **T3.4.2** Add deterministic transfer identifiers through injected entropy.
+- [x] **T3.4.3** Add sender scenarios for mutation, truncation, growth, identity change, cancel, timeout, and mid-frame disconnect.
+- [x] **T3.4.4** Add receiver scenarios for malformed offers, offsets, duplicates, checksum errors, collisions, cancellation, timeout, and disk failure.
+- [x] **T3.4.5** Add concurrent transfer limit and shutdown tests.
+- [x] **T3.4.6** Add end-to-end in-memory file transfer tests using real temporary files.
 
 ---
 
@@ -241,28 +241,28 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 ### T4.1 — QUIC loopback
 
-- [ ] **T4.1.1** Create localhost Quinn test endpoints with ephemeral ports and temporary certificates.
-- [ ] **T4.1.2** Test successful client/server handshake and all logical stream setup.
-- [ ] **T4.1.3** Test invalid TLS identity, fingerprint mismatch, and untrusted pairing.
-- [ ] **T4.1.4** Test split frames, mid-frame closure, oversized frames, and malformed payloads.
-- [ ] **T4.1.5** Test control/input/clipboard independence under delay and closure.
-- [ ] **T4.1.6** Test graceful shutdown and verify endpoints/tasks become idle.
+- [x] **T4.1.1** Create localhost Quinn test endpoints with ephemeral ports and temporary certificates.
+- [x] **T4.1.2** Test successful client/server handshake and all logical stream setup.
+- [x] **T4.1.3** Test invalid TLS identity, fingerprint mismatch, and untrusted pairing.
+- [x] **T4.1.4** Test split frames, mid-frame closure, oversized frames, and malformed payloads.
+- [x] **T4.1.5** Test control/input/clipboard independence under delay and closure.
+- [x] **T4.1.6** Test graceful shutdown and verify endpoints/tasks become idle.
 
 ### T4.2 — HTTP/update adapter contracts
 
-- [ ] **T4.2.1** Add a local HTTP server fixture for the reqwest adapter only.
-- [ ] **T4.2.2** Test release lookup statuses, malformed JSON, chunked bodies, size limits, and timeouts.
-- [ ] **T4.2.3** Test binary download statuses, empty/truncated/chunked bodies, declared/actual size limits, and timeouts.
-- [ ] **T4.2.4** Test successful atomic installation in a temporary executable root.
-- [ ] **T4.2.5** Add an opt-in live GitHub contract smoke test that is excluded from normal CI.
+- [x] **T4.2.1** Add a local HTTP server fixture for the reqwest adapter only.
+- [x] **T4.2.2** Test release lookup statuses, malformed JSON, chunked bodies, size limits, and timeouts.
+- [x] **T4.2.3** Test binary download statuses, empty/truncated/chunked bodies, declared/actual size limits, and timeouts.
+- [x] **T4.2.4** Test successful atomic installation in a temporary executable root.
+- [x] **T4.2.5** Add an opt-in live GitHub contract smoke test that is excluded from normal CI.
 
 ### T4.3 — CLI and setup
 
-- [ ] **T4.3.1** Add `assert_cmd` tests for help, invalid arguments, invalid configured roles/edges, and non-interactive errors.
-- [ ] **T4.3.2** Extract setup state transitions from terminal rendering/input.
-- [ ] **T4.3.3** Add setup workflow tests for server/client roles, discovery/manual address, back navigation, and cancellation.
-- [ ] **T4.3.4** Add Ratatui buffer rendering tests for each setup screen.
-- [ ] **T4.3.5** Add service-install setup scenarios using fake service, trust, discovery, and pairing ports.
+- [x] **T4.3.1** Add `assert_cmd` tests for help, invalid arguments, invalid configured roles/edges, and non-interactive errors.
+- [x] **T4.3.2** Extract setup state transitions from terminal rendering/input.
+- [x] **T4.3.3** Add setup workflow tests for server/client roles, discovery/manual address, back navigation, and cancellation.
+- [x] **T4.3.4** Add Ratatui buffer rendering tests for each setup screen.
+- [x] **T4.3.5** Add service-install setup scenarios using fake service, trust, discovery, and pairing ports.
 
 ---
 
@@ -270,32 +270,32 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 ### T5.1 — Property/model testing
 
-- [ ] **T5.1.1** Add generated `ClientTransition` event sequences with cursor/input safety invariants.
-- [ ] **T5.1.2** Add generated `ServerTransition` sequences with grab and held-key invariants.
-- [ ] **T5.1.3** Add generated full client-session sequences over the fake peer link.
-- [ ] **T5.1.4** Add generated full server-session sequences over the fake peer link.
-- [ ] **T5.1.5** Persist minimal regression cases for every property-test defect found.
+- [x] **T5.1.1** Add generated `ClientTransition` event sequences with cursor/input safety invariants.
+- [x] **T5.1.2** Add generated `ServerTransition` sequences with grab and held-key invariants.
+- [x] **T5.1.3** Add generated full client-session sequences over the fake peer link.
+- [x] **T5.1.4** Add generated full server-session sequences over the fake peer link.
+- [x] **T5.1.5** Persist minimal regression cases for every property-test defect found.
 
 ### T5.2 — Fuzzing
 
-- [ ] **T5.2.1** Add a protocol decode/validation fuzz target.
-- [ ] **T5.2.2** Add a framed-stream chunk-boundary fuzz target.
-- [ ] **T5.2.3** Add a file-transfer message-sequence fuzz target.
-- [ ] **T5.2.4** Add bounded fuzz runs to scheduled CI and retain crashing artifacts.
+- [x] **T5.2.1** Add a protocol decode/validation fuzz target.
+- [x] **T5.2.2** Add a framed-stream chunk-boundary fuzz target.
+- [x] **T5.2.3** Add a file-transfer message-sequence fuzz target.
+- [x] **T5.2.4** Add bounded fuzz runs to scheduled CI and retain crashing artifacts.
 
 ### T5.3 — Mutation and coverage gates
 
-- [ ] **T5.3.1** Run `cargo-mutants` against transition and protocol modules and record surviving mutants.
-- [ ] **T5.3.2** Add tests that kill high-value surviving mutants.
-- [ ] **T5.3.3** Establish per-module coverage visibility for core and orchestration code.
-- [ ] **T5.3.4** Introduce a coverage threshold only after deterministic suites stabilize.
-- [ ] **T5.3.5** Make formatting, tests, selected clippy rules, and deterministic scenario suites required CI checks.
+- [x] **T5.3.1** Run `cargo-mutants` against transition and protocol modules and record surviving mutants.
+- [x] **T5.3.2** Add tests that kill high-value surviving mutants. No tests were needed because T5.3.1 had no surviving mutants.
+- [x] **T5.3.3** Establish per-module coverage visibility for core and orchestration code.
+- [x] **T5.3.4** Introduce a coverage threshold only after deterministic suites stabilize.
+- [x] **T5.3.5** Make formatting, tests, selected clippy rules, and deterministic scenario suites required CI checks.
 
 ### T5.4 — Existing quality debt
 
-- [ ] **T5.4.1** Resolve or explicitly annotate current dead-code warnings.
-- [ ] **T5.4.2** Resolve current strict-clippy findings without mixing behavior changes.
-- [ ] **T5.4.3** Enable `cargo clippy --all-targets -- -D warnings` as a required check.
+- [x] **T5.4.1** Resolve or explicitly annotate current dead-code warnings.
+- [x] **T5.4.2** Resolve current strict-clippy findings without mixing behavior changes.
+- [x] **T5.4.3** Enable `cargo clippy --all-targets -- -D warnings` as a required check.
 
 ---
 
@@ -303,24 +303,36 @@ This is a direction, not a requirement to create every file immediately. Modules
 
 The first complete client/server rigs must cover these release-blocking invariants:
 
-- [ ] **A1** Client disconnect releases all tracked keys and buttons.
-- [ ] **A2** Client disconnect restores cursor visibility.
-- [ ] **A3** Server disconnect releases all input grabs.
-- [ ] **A4** Local session lock releases grabs before any network await.
-- [ ] **A5** Inactive client never injects key/button presses.
-- [ ] **A6** Switch-back races cannot leave synthetic input held.
-- [ ] **A7** Shutdown terminates all session-owned tasks.
-- [ ] **A8** Clipboard blocking cannot stall input/control processing.
-- [ ] **A9** Untrusted peers cannot trigger an update.
-- [ ] **A10** Successful updates request restart; failed updates do not.
-- [ ] **A11** Every outbound protocol message passes semantic validation.
-- [ ] **A12** Reconnect/discovery/file-transfer timeouts run under virtual time.
+- [x] **A1** Client disconnect releases all tracked keys and buttons.
+- [x] **A2** Client disconnect restores cursor visibility.
+- [x] **A3** Server disconnect releases all input grabs.
+- [x] **A4** Local session lock releases grabs before any network await.
+- [x] **A5** Inactive client never injects key/button presses.
+- [x] **A6** Switch-back races cannot leave synthetic input held.
+- [x] **A7** Shutdown terminates all session-owned tasks.
+- [x] **A8** Clipboard blocking cannot stall input/control processing.
+- [x] **A9** Untrusted peers cannot trigger an update.
+- [x] **A10** Successful updates request restart; failed updates do not.
+- [x] **A11** Every outbound protocol message passes semantic validation.
+- [x] **A12** Reconnect/discovery/file-transfer timeouts run under virtual time.
 
 ## Findings discovered during implementation
 
 | ID | Status | Finding | Planned test/fix |
 |---|---|---|---|
-| — | — | No implementation findings recorded yet. | — |
+| FT-1 | Fixed | The sender reopened offered paths and trusted stale sizes, allowing path replacement, mutation, truncation, or growth during transfer. | T3.4.3 pins open file identities, enforces offered sizes/metadata, cancels unsafe transfers, and covers each race. |
+| FT-2 | Fixed | File-transfer stream sends and offer responses had no bounded timeout. | T3.4.3 adds virtual-time-covered per-operation timeouts. |
+| FT-3 | Fixed | The receiver trusted unsafe names, offsets, duplicate data, declared sizes, and checksums and could overwrite an existing destination. | T3.4.4 validates every offer and message transition, uses create-new output semantics, and cancels invalid transfers. |
+| FT-4 | Fixed | A stalled sender could leave a receiver waiting forever. | T3.4.4 adds a virtual-time-covered receive timeout. |
+| FT-5 | Fixed | Each accepted file-transfer stream spawned an unbounded background task. | T3.4.5 bounds each connection to four transfers and aborts and joins all transfer tasks on shutdown. |
+| QUIC-1 | Fixed | Client Quinn channel readers were detached and could not be explicitly joined during shutdown. | T4.1.6 adds client peer-link shutdown, supervises all readers, and verifies both endpoints become idle. |
+| UPDATE-1 | Fixed | Undeclared oversized update bodies were bounded only later by the installer, not while the HTTP adapter streamed them. | T4.2.3 enforces the actual-byte limit in the response pump and propagates a reader error. |
+| SETUP-1 | Fixed | Setup finalization directly invoked pairing and service installation, preventing isolated ordering and failure scenarios. | T4.3.5 adds semantic setup ports and injects trust, persistence roots, pairing, and service installation. |
+| QUALITY-1 | Fixed | Retired wrappers and Linux builds of target-specific/test adapters produced unclassified dead-code warnings. | T5.4.1 removes obsolete code, uses retained helpers in production, gates target-specific mappings, and documents intentional retained adapters. |
+| LOCK-1 | Fixed | Locking the server released its local grab but left the client transition active, so input control did not return cleanly to the server. | Protocol v5 adds an explicit server-to-client control release that restores the client cursor and injected input state after the local grab is released. |
+| LOCK-2 | Fixed | Hyprlock locks the Wayland session without setting logind's `LockedHint`, so the server never entered the LOCK-1 release path and retained its exclusive keyboard grab. | The Linux lock adapter now detects the running Hyprlock process before querying logind; a command-runner test models the actual Omarchy lock mechanism. |
+| INPUT-1 | Fixed | A held server key produced only one synthetic key-down, and injected client input did not receive operating-system key repeat. | Server transitions now generate deterministic delayed repeats for non-modifier keys, stop on key-up, and clear repeat state during every control-release path. |
+| UPDATE-2 | Fixed | The server updater replaced its executable and called `process::exit` from a detached task, so restart intent and the supervised service handoff could not be tested together. | Server update polling now returns typed restart intent to the composition root; tests verify exact-version installation and systemd/launchd restart contracts. |
 
 ## Progress log
 
@@ -417,3 +429,54 @@ The first complete client/server rigs must cover these release-blocking invarian
 | 2026-07-19 | `c6a4175` | T3.3.4 | Tested Linux service lifecycle using only scripted commands. |
 | 2026-07-19 | `744b58f` | T3.3.5 | Tested macOS service lifecycle using only scripted commands. |
 | 2026-07-19 | this commit | T3.3.6 | Killed timed-out command process groups and verified cleanup. |
+| 2026-07-22 | this commit | T3.4.1 | Moved file-transfer flow onto generic typed framed streams with in-memory coverage. |
+| 2026-07-22 | this commit | T3.4.2 | Injected transfer ID generation and verified deterministic IDs across outgoing messages. |
+| 2026-07-22 | this commit | T3.4.3 | Hardened and covered sender mutation races, cancellation, timeout, and disconnect behavior. |
+| 2026-07-22 | this commit | T3.4.4 | Rejected malformed receiver flows, unsafe destinations, checksum failures, stalls, and storage errors. |
+| 2026-07-22 | this commit | T3.4.5 | Bounded incoming transfer tasks and proved capacity recovery and joined shutdown. |
+| 2026-07-22 | this commit | T3.4.6 | Transferred empty, small, and multi-chunk real files end to end over in-memory streams. |
+| 2026-07-22 | this commit | T4.1.1 | Added ephemeral localhost Quinn endpoints backed by isolated temporary certificates. |
+| 2026-07-22 | this commit | T4.1.2 | Completed a real handshake and exchanged control, input, and clipboard traffic in both directions. |
+| 2026-07-22 | this commit | T4.1.3 | Rejected wrong TLS host identity, advertised fingerprint mismatch, and invalid untrusted-peer OTP. |
+| 2026-07-22 | this commit | T4.1.4 | Exercised byte-split, partial, oversized, and malformed frames over real Quinn streams. |
+| 2026-07-22 | this commit | T4.1.5 | Proved input and clipboard progress while control is delayed and after its receive stream closes. |
+| 2026-07-22 | this commit | T4.1.6 | Joined client/server Quinn readers and verified graceful endpoint idleness. |
+| 2026-07-22 | this commit | T4.2.1 | Added a scripted localhost HTTP fixture for reqwest adapter contract tests. |
+| 2026-07-22 | this commit | T4.2.2 | Covered release metadata statuses, JSON parsing, chunking, size bounds, and timeout. |
+| 2026-07-22 | this commit | T4.2.3 | Covered executable HTTP status, body framing, declared/actual limits, and timeout. |
+| 2026-07-22 | this commit | T4.2.4 | Verified atomic executable replacement, final permissions, and temp-file cleanup in an isolated root. |
+| 2026-07-22 | this commit | T4.2.5 | Added a documented opt-in smoke test for live GitHub metadata and platform assets. |
+| 2026-07-22 | this commit | T4.3.1 | Added binary-level CLI coverage for help, argument/config validation, and non-interactive errors. |
+| 2026-07-22 | this commit | T4.3.2 | Moved semantic setup actions, navigation, and effects out of Crossterm input handling. |
+| 2026-07-22 | this commit | T4.3.3 | Covered server/client workflows, discovered/manual selection, back navigation, and cancellation. |
+| 2026-07-22 | this commit | T4.3.4 | Rendered every setup step through the production layout into Ratatui test buffers. |
+| 2026-07-22 | this commit | T4.3.5 | Tested service finalization with fake discovery, pairing, trust, service, and isolated persistence. |
+| 2026-07-22 | this commit | T5.1.1 | Generated client transition sequences and enforced cursor bounds and inactive-input safety. |
+| 2026-07-22 | this commit | T5.1.2 | Generated server transition sequences and enforced grab and held-input cleanup invariants. |
+| 2026-07-22 | this commit | T5.1.3 | Ran generated typed client-input sessions through the fake peer and verified disconnect cleanup. |
+| 2026-07-22 | this commit | T5.1.4 | Ran generated server capture/peer sessions and verified grab, remote-input, and task cleanup. |
+| 2026-07-22 | this commit | T5.1.5 | Documented source-parallel minimized-seed retention; initial property runs found no defects. |
+| 2026-07-22 | this commit | T5.2.1 | Added a libFuzzer target for framed protocol decoding, semantic validation, and re-encoding. |
+| 2026-07-22 | this commit | T5.2.2 | Added adversarial async chunk-boundary fuzzing cross-checked against slice decoding. |
+| 2026-07-22 | this commit | T5.2.3 | Added bounded semantic file-transfer sequence fuzzing through the production receiver and temporary storage. |
+| 2026-07-22 | this commit | T5.2.4 | Scheduled independent bounded fuzz jobs and retained per-target crash artifacts for 30 days. |
+| 2026-07-22 | this commit | T5.3.1 | Tested 220 transition/protocol mutants: 209 caught, 11 unviable, and none survived. |
+| 2026-07-22 | this commit | T5.3.2 | Confirmed no high-value surviving mutants required follow-up tests. |
+| 2026-07-22 | this commit | T5.3.3 | Added tested LCOV summaries for each core/orchestration module and CI job-summary visibility. |
+| 2026-07-22 | this commit | T5.3.4 | Established 88.3%/64.2% line baselines and enforced conservative 85%/60% core/orchestration floors. |
+| 2026-07-22 | this commit | T5.3.5 | Required formatting, all-target tests, generated/scenario/QUIC suites, and safety-focused Clippy rules in CI. |
+| 2026-07-22 | this commit | T5.4.1 | Removed obsolete wrappers, used retained validation/mapping paths, and annotated intentional target/test adapters. |
+| 2026-07-22 | this commit | T5.4.2 | Resolved all strict Clippy findings with behavior-preserving simplifications and documented composition-boundary exceptions. |
+| 2026-07-22 | this commit | T5.4.3 | Promoted all-target strict Clippy to a required CI job and documented the local gate. |
+| 2026-07-22 | this commit | A11 | Proved the shared outbound framing path rejects semantically invalid messages before writing any bytes. |
+| 2026-07-22 | this commit | A12 | Proved reconnect backoff uses virtual time alongside existing virtual-time discovery and file-transfer timeout coverage. |
+| 2026-07-22 | this commit | A1 | Reverified disconnect cleanup for tracked client keys and buttons. |
+| 2026-07-22 | this commit | A2 | Reverified every client exit restores cursor visibility. |
+| 2026-07-22 | this commit | A3 | Reverified every server exit releases full and keyboard-only grabs. |
+| 2026-07-22 | this commit | A4 | Reverified lock handling in both capture modes releases local grabs before blocked network notification. |
+| 2026-07-22 | this commit | A5 | Reverified generated client sequences never forward input presses while inactive. |
+| 2026-07-22 | this commit | A6 | Reverified late switch-back releases and generated sessions leave no synthetic input held. |
+| 2026-07-22 | this commit | A7 | Reverified client, server, and real Quinn shutdown joins every session-owned task. |
+| 2026-07-22 | this commit | A8 | Reverified blocked clipboard work leaves current-thread session processing responsive. |
+| 2026-07-22 | this commit | A9 | Reverified untrusted update sources never invoke asset download or installation. |
+| 2026-07-22 | this commit | A10 | Reverified successful installation records restart intent while download and installation failures do not. |

@@ -235,6 +235,10 @@ impl ClientPeerLink for ScriptedPeerLink {
         let result = self.take_send_result(PeerSendOperation::Clipboard);
         Box::pin(async move { result })
     }
+
+    fn shutdown(&self) -> TransportFuture<'_, ()> {
+        Box::pin(async {})
+    }
 }
 
 struct GateEntered {

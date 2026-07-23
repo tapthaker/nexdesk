@@ -13,116 +13,15 @@ use crossterm::{
 };
 use ratatui::{prelude::*, widgets::*};
 
-use crate::config::NexdeskConfig;
+use crate::config::{NexdeskConfig, PersistenceRoots};
 use crate::net::discovery::{BrowseHandle, DiscoveredPeer};
+use crate::net::tls::ConfigTrustStore;
+use crate::ports::{SetupPairing, SetupServiceInstaller, TrustStore};
 
+use super::flow::{advance_after_apply, reduce, SetupAction, SetupEffect, Step};
 use super::{certificates, network, permissions, role, screens, service, welcome};
 
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Step {
-    Welcome,
-    Role,
-    Network,
-    Screens,
-    Certificates,
-    Permissions,
-    Service,
-    Done,
-}
-
-impl Step {
-    fn next(self, role: Option<&str>) -> Self {
-        match self {
-            Step::Welcome => Step::Role,
-            Step::Role => match role {
-                Some("server") => Step::Screens,
-                _ => Step::Network,
-            },
-            Step::Network => Step::Certificates,
-            Step::Screens => Step::Certificates,
-            Step::Certificates => {
-                if cfg!(target_os = "macos") {
-                    Step::Permissions
-                } else {
-                    Step::Service
-                }
-            }
-            Step::Permissions => Step::Service,
-            Step::Service => Step::Done,
-            Step::Done => Step::Done,
-        }
-    }
-
-    fn prev(self, role: Option<&str>) -> Self {
-        match self {
-            Step::Welcome => Step::Welcome,
-            Step::Role => Step::Welcome,
-            Step::Network => Step::Role,
-            Step::Screens => Step::Role,
-            Step::Certificates => match role {
-                Some("server") => Step::Screens,
-                _ => Step::Network,
-            },
-            Step::Permissions => Step::Certificates,
-            Step::Service => {
-                if cfg!(target_os = "macos") {
-                    Step::Permissions
-                } else {
-                    Step::Certificates
-                }
-            }
-            Step::Done => Step::Service,
-        }
-    }
-
-    fn title(self) -> &'static str {
-        match self {
-            Step::Welcome => "Welcome",
-            Step::Role => "Role Selection",
-            Step::Network => "Network Configuration",
-            Step::Screens => "Screen Arrangement",
-            Step::Certificates => "Certificate Setup",
-            Step::Permissions => "Permissions",
-            Step::Service => "Install Service",
-            Step::Done => "Complete",
-        }
-    }
-
-    fn number(self, _role: Option<&str>) -> usize {
-        match self {
-            Step::Welcome => 1,
-            Step::Role => 2,
-            Step::Network => 3,
-            Step::Screens => 3,
-            Step::Certificates => 4,
-            Step::Permissions => 5,
-            Step::Service => {
-                if cfg!(target_os = "macos") {
-                    6
-                } else {
-                    5
-                }
-            }
-            Step::Done => {
-                if cfg!(target_os = "macos") {
-                    7
-                } else {
-                    6
-                }
-            }
-        }
-    }
-
-    fn total_steps() -> usize {
-        if cfg!(target_os = "macos") {
-            6
-        } else {
-            5
-        }
-    }
-}
 
 pub struct SetupState {
     pub step: Step,
@@ -189,6 +88,63 @@ fn discovery_refresh_due(state: &SetupState, now: Instant) -> bool {
         })
 }
 
+fn render_setup(frame: &mut Frame, state: &SetupState) {
+    let chunks = Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ])
+        .split(frame.area());
+
+    let title = if state.step == Step::Done {
+        " Nexdesk Setup - Complete ".to_string()
+    } else {
+        format!(
+            " Nexdesk Setup - Step {}/{}: {} ",
+            state.step.number(),
+            Step::total_steps(),
+            state.step.title()
+        )
+    };
+    frame.render_widget(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+        chunks[0],
+    );
+
+    let content_area = chunks[1];
+    match state.step {
+        Step::Welcome => welcome::render(frame, content_area),
+        Step::Role => role::render(frame, content_area, state),
+        Step::Network => network::render(frame, content_area, state),
+        Step::Screens => screens::render(frame, content_area, state),
+        Step::Certificates => certificates::render(frame, content_area, state),
+        Step::Permissions => permissions::render(frame, content_area, state),
+        Step::Service => service::render(frame, content_area, state),
+        Step::Done => render_done(frame, content_area),
+    };
+
+    let navigation = if state.step == Step::Done {
+        " Press 'q' to exit "
+    } else if state.step == Step::Screens {
+        " ←↑↓→ Select edge | Enter: Next | Backspace: Back | q: Quit "
+    } else if state.step == Step::Network {
+        " ↑/↓ Select | R: Refresh | Tab: Switch mode | Enter: Next | Backspace: Back | q: Quit "
+    } else {
+        " ←/→ Navigate | Enter: Next | q: Quit "
+    };
+    frame.render_widget(
+        Paragraph::new(navigation)
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::ALL)),
+        chunks[2],
+    );
+}
+
 pub async fn run() -> Result<()> {
     // When invoked via `curl | sh`, stdin may be a pipe or /dev/tty opened
     // read-only by the shell's `<` redirect. On macOS, kqueue returns EINVAL
@@ -199,13 +155,8 @@ pub async fn run() -> Result<()> {
     let _tty_guard = {
         let stdin_fd = io::stdin().as_raw_fd();
         let flags = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
-        let need_reopen = if !io::stdin().is_terminal() {
-            true
-        } else if flags >= 0 && (flags & libc::O_ACCMODE == libc::O_RDONLY) {
-            true
-        } else {
-            false
-        };
+        let need_reopen =
+            !io::stdin().is_terminal() || flags >= 0 && (flags & libc::O_ACCMODE == libc::O_RDONLY);
         if need_reopen {
             // Try to get the actual PTY device path via ttyname on stdin,
             // stdout, or stderr. On macOS, kqueue returns EINVAL for /dev/tty
@@ -269,153 +220,38 @@ pub async fn run() -> Result<()> {
             }
         }
 
-        terminal.draw(|frame| {
-            let area = frame.area();
-
-            // Header
-            let chunks = Layout::default()
-                .direction(ratatui::layout::Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(0),
-                    Constraint::Length(3),
-                ])
-                .split(area);
-
-            // Title bar
-            let role = state.config.role.as_deref();
-            let title = if state.step == Step::Done {
-                " Nexdesk Setup - Complete ".to_string()
-            } else {
-                format!(
-                    " Nexdesk Setup - Step {}/{}: {} ",
-                    state.step.number(role),
-                    Step::total_steps(),
-                    state.step.title()
-                )
-            };
-            let header = Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan));
-            frame.render_widget(header, chunks[0]);
-
-            // Content
-            let content_area = chunks[1];
-            match state.step {
-                Step::Welcome => welcome::render(frame, content_area),
-                Step::Role => role::render(frame, content_area, &state),
-                Step::Network => network::render(frame, content_area, &state),
-                Step::Screens => screens::render(frame, content_area, &state),
-                Step::Certificates => certificates::render(frame, content_area, &state),
-                Step::Permissions => permissions::render(frame, content_area, &state),
-                Step::Service => service::render(frame, content_area, &state),
-                Step::Done => render_done(frame, content_area),
-            };
-
-            // Footer
-            let nav = if state.step == Step::Done {
-                " Press 'q' to exit "
-            } else if state.step == Step::Screens {
-                " ←↑↓→ Select edge | Enter: Next | Backspace: Back | q: Quit "
-            } else if state.step == Step::Network {
-                " ↑/↓ Select | R: Refresh | Tab: Switch mode | Enter: Next | Backspace: Back | q: Quit "
-            } else {
-                " ←/→ Navigate | Enter: Next | q: Quit "
-            };
-            let footer = Paragraph::new(nav)
-                .alignment(Alignment::Center)
-                .block(Block::default().borders(Borders::ALL));
-            frame.render_widget(footer, chunks[2]);
-        })?;
+        terminal.draw(|frame| render_setup(frame, &state))?;
 
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Enter => {
-                        if state.step == Step::Done {
-                            break;
-                        }
-                        apply_step_with_terminal(&mut terminal, &mut state).await?;
-                        let role = state.config.role.as_deref().map(String::from);
-                        state.step = state.step.next(role.as_deref());
-                    }
-                    KeyCode::Right => {
-                        if state.step == Step::Screens {
-                            state.edge_selection = 1; // right
-                        } else {
-                            apply_step_with_terminal(&mut terminal, &mut state).await?;
-                            let role = state.config.role.as_deref().map(String::from);
-                            state.step = state.step.next(role.as_deref());
-                        }
-                    }
-                    KeyCode::Left => {
-                        if state.step == Step::Screens {
-                            state.edge_selection = 0; // left
-                        } else {
-                            let role = state.config.role.as_deref().map(String::from);
-                            state.step = state.step.prev(role.as_deref());
-                        }
-                    }
-                    KeyCode::Up => {
-                        match state.step {
-                            Step::Role => {
-                                state.role_selection = state.role_selection.saturating_sub(1);
-                            }
-                            Step::Network if state.use_discovery => {
-                                state.peer_selection = state.peer_selection.saturating_sub(1);
-                            }
-                            Step::Screens => {
-                                state.edge_selection = 2; // top
-                            }
-                            _ => {}
-                        }
-                    }
-                    KeyCode::Down => {
-                        match state.step {
-                            Step::Role => {
-                                state.role_selection = (state.role_selection + 1).min(1);
-                            }
-                            Step::Network
-                                if state.use_discovery && !state.discovered_peers.is_empty() =>
-                            {
-                                state.peer_selection = (state.peer_selection + 1)
-                                    .min(state.discovered_peers.len() - 1);
-                            }
-                            Step::Screens => {
-                                state.edge_selection = 3; // bottom
-                            }
-                            _ => {}
-                        }
-                    }
+                let action = match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => SetupAction::Quit,
+                    KeyCode::Enter => SetupAction::Next,
+                    KeyCode::Right => SetupAction::Right,
+                    KeyCode::Left => SetupAction::Left,
+                    KeyCode::Up => SetupAction::Up,
+                    KeyCode::Down => SetupAction::Down,
                     KeyCode::Char('r') | KeyCode::Char('R')
                         if state.step == Step::Network && state.use_discovery =>
                     {
-                        restart_peer_browsing(&mut state);
+                        SetupAction::RefreshDiscovery
                     }
-                    KeyCode::Char(c) => {
-                        if state.step == Step::Network && !state.use_discovery {
-                            state.manual_addr.push(c);
-                        }
+                    KeyCode::Char(character) => SetupAction::EnterCharacter(character),
+                    KeyCode::Backspace => SetupAction::DeleteCharacter,
+                    KeyCode::Tab => SetupAction::ToggleNetworkMode,
+                    _ => continue,
+                };
+                match reduce(&mut state, action) {
+                    SetupEffect::None => {}
+                    SetupEffect::Exit => break,
+                    SetupEffect::RefreshDiscovery => restart_peer_browsing(&mut state),
+                    SetupEffect::ApplyAndAdvance => {
+                        apply_step_with_terminal(&mut terminal, &mut state).await?;
+                        advance_after_apply(&mut state);
                     }
-                    KeyCode::Backspace => {
-                        if state.step == Step::Network && !state.use_discovery {
-                            state.manual_addr.pop();
-                        } else {
-                            let role = state.config.role.as_deref().map(String::from);
-                            state.step = state.step.prev(role.as_deref());
-                        }
-                    }
-                    KeyCode::Tab => {
-                        if state.step == Step::Network {
-                            state.use_discovery = !state.use_discovery;
-                        }
-                    }
-                    _ => {}
                 }
             }
         }
@@ -477,6 +313,29 @@ fn apply_network_selection(state: &mut SetupState) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ProductionSetupPairing;
+
+impl SetupPairing for ProductionSetupPairing {
+    fn pair<'a>(
+        &'a self,
+        address: &'a str,
+        expected_fingerprint: Option<&'a str>,
+    ) -> crate::ports::SetupFuture<'a, Result<String>> {
+        Box::pin(crate::net::quic::pair(address, expected_fingerprint))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ProductionSetupServiceInstaller;
+
+impl SetupServiceInstaller for ProductionSetupServiceInstaller {
+    fn install(&self, arguments: &[String]) -> Result<()> {
+        let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        crate::daemon::install_service(&arguments)
+    }
+}
+
 fn service_arguments(state: &SetupState) -> Vec<String> {
     match state.config.role.as_deref() {
         Some("server") => vec!["serve".to_string()],
@@ -486,6 +345,38 @@ fn service_arguments(state: &SetupState) -> Vec<String> {
             None => vec!["connect".to_string()],
         },
     }
+}
+
+async fn install_service_step(
+    state: &mut SetupState,
+    roots: &PersistenceRoots,
+    pairing: &dyn SetupPairing,
+    trust: &dyn TrustStore,
+    service: &dyn SetupServiceInstaller,
+) -> Result<()> {
+    if state.config.role.as_deref() != Some("server") {
+        let address = state
+            .config
+            .server_addr
+            .as_deref()
+            .ok_or_else(|| eyre!("No server selected"))?;
+        let fingerprint = pairing
+            .pair(address, state.config.server_fingerprint.as_deref())
+            .await?;
+        trust.trust(&fingerprint)?;
+        state.config.server_fingerprint = Some(fingerprint);
+    }
+
+    // Persist the identity before installation because production service
+    // managers start the daemon immediately.
+    state.config.save_to(roots)?;
+    let arguments = service_arguments(state);
+    if let Err(error) = service.install(&arguments) {
+        tracing::warn!("Failed to install service: {}", error);
+    } else {
+        state.service_installed = true;
+    }
+    Ok(())
 }
 
 async fn apply_step(state: &mut SetupState) -> Result<()> {
@@ -527,27 +418,14 @@ async fn apply_step(state: &mut SetupState) -> Result<()> {
             state.fingerprint = Some(crate::net::tls::fingerprint(&cert));
         }
         Step::Service => {
-            if state.config.role.as_deref() != Some("server") {
-                let addr = state
-                    .config
-                    .server_addr
-                    .as_deref()
-                    .ok_or_else(|| eyre!("No server selected"))?;
-                let fingerprint =
-                    crate::net::quic::pair(addr, state.config.server_fingerprint.as_deref())
-                        .await?;
-                state.config.server_fingerprint = Some(fingerprint);
-            }
-            // The daemon starts immediately during installation, so persist its
-            // fingerprint target before allowing the service manager to launch it.
-            state.config.save()?;
-            let arguments = service_arguments(state);
-            let args = arguments.iter().map(String::as_str).collect::<Vec<_>>();
-            if let Err(e) = crate::daemon::install_service(&args) {
-                tracing::warn!("Failed to install service: {}", e);
-            } else {
-                state.service_installed = true;
-            }
+            install_service_step(
+                state,
+                &PersistenceRoots::production()?,
+                &ProductionSetupPairing,
+                &ConfigTrustStore,
+                &ProductionSetupServiceInstaller,
+            )
+            .await?;
         }
         _ => {}
     }
@@ -577,6 +455,66 @@ fn render_done(frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::{DiscoveryEvent, PeerDiscovery};
+    use crate::testing::{MemoryTrustStore, ScriptedDiscovery};
+
+    struct FakeSetupPairing {
+        result: String,
+        calls: std::sync::Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl FakeSetupPairing {
+        fn new(result: &str) -> Self {
+            Self {
+                result: result.to_string(),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, Option<String>)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl SetupPairing for FakeSetupPairing {
+        fn pair<'a>(
+            &'a self,
+            address: &'a str,
+            expected_fingerprint: Option<&'a str>,
+        ) -> crate::ports::SetupFuture<'a, Result<String>> {
+            self.calls.lock().unwrap().push((
+                address.to_string(),
+                expected_fingerprint.map(str::to_string),
+            ));
+            let result = self.result.clone();
+            Box::pin(async move { Ok(result) })
+        }
+    }
+
+    struct RecordingSetupService {
+        roots: PersistenceRoots,
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+        persisted_fingerprints: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    impl RecordingSetupService {
+        fn new(roots: PersistenceRoots) -> Self {
+            Self {
+                roots,
+                calls: std::sync::Mutex::new(Vec::new()),
+                persisted_fingerprints: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SetupServiceInstaller for RecordingSetupService {
+        fn install(&self, arguments: &[String]) -> Result<()> {
+            self.calls.lock().unwrap().push(arguments.to_vec());
+            let persisted = NexdeskConfig::load_from(&self.roots)?.server_fingerprint;
+            self.persisted_fingerprints.lock().unwrap().push(persisted);
+            Ok(())
+        }
+    }
 
     fn state() -> SetupState {
         SetupState {
@@ -596,6 +534,193 @@ mod tests {
             _browse_handle: None,
             discovery_started_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn discovered_client_install_uses_fake_discovery_pairing_trust_and_service() {
+        let discovery = ScriptedDiscovery::new();
+        discovery.push_peer(DiscoveredPeer {
+            name: "server".to_string(),
+            platform: "linux".to_string(),
+            addr: "192.0.2.40:4242".parse().unwrap(),
+            fingerprint: "AA:BB:CC".to_string(),
+        });
+        let mut browse = discovery.browse().await.unwrap();
+        let Some(DiscoveryEvent::Found(peer)) = browse.next_event().await.unwrap() else {
+            panic!("scripted discovery did not return a peer");
+        };
+
+        let mut state = state();
+        state.config.role = Some("client".to_string());
+        merge_discovered_peer(&mut state.discovered_peers, peer);
+        apply_network_selection(&mut state).unwrap();
+        state.step = Step::Service;
+
+        let root = tempfile::tempdir().unwrap();
+        let roots = PersistenceRoots::from_config_root(root.path());
+        let pairing = FakeSetupPairing::new("AA:BB:CC");
+        let trust = MemoryTrustStore::new();
+        let service = RecordingSetupService::new(roots.clone());
+        install_service_step(&mut state, &roots, &pairing, &trust, &service)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pairing.calls(),
+            vec![("192.0.2.40:4242".to_string(), Some("AA:BB:CC".to_string()))]
+        );
+        assert!(trust.is_trusted("AA:BB:CC").unwrap());
+        assert_eq!(service.calls.lock().unwrap().as_slice(), &[vec!["connect"]]);
+        assert_eq!(
+            service.persisted_fingerprints.lock().unwrap().as_slice(),
+            &[Some("AA:BB:CC".to_string())]
+        );
+        assert!(state.service_installed);
+    }
+
+    #[tokio::test]
+    async fn server_install_skips_pairing_and_installs_serve_service() {
+        let mut state = state();
+        state.step = Step::Service;
+        state.config.role = Some("server".to_string());
+        state.config.switch_edge = Some("right".to_string());
+        let root = tempfile::tempdir().unwrap();
+        let roots = PersistenceRoots::from_config_root(root.path());
+        let pairing = FakeSetupPairing::new("UNUSED");
+        let trust = MemoryTrustStore::new();
+        let service = RecordingSetupService::new(roots.clone());
+
+        install_service_step(&mut state, &roots, &pairing, &trust, &service)
+            .await
+            .unwrap();
+
+        assert!(pairing.calls().is_empty());
+        assert!(trust.observations().is_empty());
+        assert_eq!(service.calls.lock().unwrap().as_slice(), &[vec!["serve"]]);
+        assert!(state.service_installed);
+    }
+
+    fn rendered_setup(state: &SetupState) -> String {
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render_setup(frame, state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                rendered.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            rendered.push('\n');
+        }
+        rendered
+    }
+
+    #[test]
+    fn every_setup_screen_renders_into_a_ratatui_buffer() {
+        let cases = [
+            (Step::Welcome, "Welcome to Nexdesk!"),
+            (Step::Role, "Select this machine's role"),
+            (Step::Network, "Network Configuration"),
+            (Step::Screens, "Where is the other machine's screen"),
+            (Step::Certificates, "Certificate Setup"),
+            (Step::Permissions, "Accessibility Permission"),
+            (Step::Service, "Install as Background Service"),
+            (Step::Done, "Setup complete!"),
+        ];
+
+        for (step, expected) in cases {
+            let mut state = state();
+            state.step = step;
+            let rendered = rendered_setup(&state);
+            assert!(
+                rendered.contains(expected),
+                "{step:?} did not render {expected:?}\n{rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn server_setup_workflow_selects_role_edge_and_certificate_step() {
+        let mut state = state();
+        state.step = Step::Welcome;
+        state.role_selection = 0;
+
+        assert_eq!(
+            reduce(&mut state, SetupAction::Next),
+            SetupEffect::ApplyAndAdvance
+        );
+        apply_step(&mut state).await.unwrap();
+        advance_after_apply(&mut state);
+        assert_eq!(state.step, Step::Role);
+
+        apply_step(&mut state).await.unwrap();
+        advance_after_apply(&mut state);
+        assert_eq!(state.config.role.as_deref(), Some("server"));
+        assert_eq!(state.step, Step::Screens);
+
+        reduce(&mut state, SetupAction::Down);
+        apply_step(&mut state).await.unwrap();
+        advance_after_apply(&mut state);
+        assert_eq!(state.config.switch_edge.as_deref(), Some("bottom"));
+        assert_eq!(state.step, Step::Certificates);
+    }
+
+    #[test]
+    fn discovered_client_workflow_selects_identity_and_supports_back_navigation() {
+        let mut state = state();
+        state.config.role = Some("client".to_string());
+        state.discovered_peers.extend([
+            DiscoveredPeer {
+                name: "first".to_string(),
+                platform: "linux".to_string(),
+                addr: "192.0.2.10:4242".parse().unwrap(),
+                fingerprint: "AA:AA".to_string(),
+            },
+            DiscoveredPeer {
+                name: "second".to_string(),
+                platform: "macos".to_string(),
+                addr: "192.0.2.20:4242".parse().unwrap(),
+                fingerprint: "BB:BB".to_string(),
+            },
+        ]);
+
+        reduce(&mut state, SetupAction::Down);
+        assert_eq!(state.peer_selection, 1);
+        apply_network_selection(&mut state).unwrap();
+        advance_after_apply(&mut state);
+        assert_eq!(state.step, Step::Certificates);
+        assert_eq!(state.config.server_fingerprint.as_deref(), Some("BB:BB"));
+
+        reduce(&mut state, SetupAction::DeleteCharacter);
+        assert_eq!(state.step, Step::Network);
+    }
+
+    #[test]
+    fn manual_client_workflow_edits_and_pins_the_address() {
+        let mut state = state();
+        state.config.role = Some("client".to_string());
+        reduce(&mut state, SetupAction::ToggleNetworkMode);
+        for character in "192.0.2.30:4243x".chars() {
+            reduce(&mut state, SetupAction::EnterCharacter(character));
+        }
+        reduce(&mut state, SetupAction::DeleteCharacter);
+
+        apply_network_selection(&mut state).unwrap();
+        advance_after_apply(&mut state);
+        assert_eq!(state.step, Step::Certificates);
+        assert_eq!(state.config.server_addr.as_deref(), Some("192.0.2.30:4243"));
+        assert_eq!(state.config.server_fingerprint, None);
+    }
+
+    #[test]
+    fn setup_cancellation_exits_without_mutating_progress() {
+        let mut state = state();
+        state.step = Step::Role;
+        let role_selection = state.role_selection;
+
+        assert_eq!(reduce(&mut state, SetupAction::Quit), SetupEffect::Exit);
+        assert_eq!(state.step, Step::Role);
+        assert_eq!(state.role_selection, role_selection);
     }
 
     #[test]

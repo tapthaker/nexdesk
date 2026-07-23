@@ -1,7 +1,7 @@
-/// Keycode translation between evdev (Linux) and macOS virtual keycodes.
-///
-/// Evdev keycodes follow linux/input-event-codes.h.
-/// macOS keycodes are CGKeyCode / kVK_* virtual key codes.
+//! Keycode translation between evdev (Linux) and macOS virtual keycodes.
+//!
+//! Evdev keycodes follow linux/input-event-codes.h.
+//! macOS keycodes are CGKeyCode / kVK_* virtual key codes.
 
 /// Sentinel value for unmapped keys.
 const NONE: u16 = 0xFFFF;
@@ -150,6 +150,7 @@ pub fn evdev_to_macos(evdev: u32) -> Option<u16> {
 
 /// Lookup table: index = macOS virtual keycode, value = evdev keycode.
 /// 0xFFFF means unmapped.
+#[cfg(any(target_os = "macos", test))]
 static MACOS_TO_EVDEV: std::sync::LazyLock<[u32; 256]> = std::sync::LazyLock::new(|| {
     let mut t = [0xFFFFFFFFu32; 256];
     for (evdev, &mac) in EVDEV_TO_MACOS.iter().enumerate() {
@@ -162,6 +163,7 @@ static MACOS_TO_EVDEV: std::sync::LazyLock<[u32; 256]> = std::sync::LazyLock::ne
 
 /// Convert a macOS virtual keycode to an evdev keycode.
 /// Returns `None` for unmapped keys.
+#[cfg(any(target_os = "macos", test))]
 pub fn macos_to_evdev(mac: u16) -> Option<u32> {
     if (mac as usize) < MACOS_TO_EVDEV.len() {
         let ev = MACOS_TO_EVDEV[mac as usize];

@@ -9,8 +9,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+pub use crate::app::is_release_version;
 use crate::app::MAX_RELEASE_VERSION_BYTES;
-pub use crate::app::{is_newer, is_release_version};
+use crate::app::{
+    execute_update, RestartReason, UpdateExecution, UpdatePolicy, UpdateRejection, UpdateSource,
+};
 use crate::ports::{Release, ReleaseAsset, ReleaseRepository, UpdateFuture, UpdateInstaller};
 
 const MAX_UPDATE_SIZE: u64 = 100 * 1024 * 1024;
@@ -81,45 +84,63 @@ impl ReleaseRepository for GithubReleaseRepository {
                 release.version, platform
             );
             info!("Downloading update from {}", url);
-            let client = reqwest::Client::builder()
-                .user_agent("nexdesk")
-                .timeout(UPDATE_HTTP_TIMEOUT)
-                .build()
-                .map_err(|e| eyre!("Failed to build HTTP client: {}", e))?;
-            let response = client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| eyre!("Failed to download update: {}", e))?;
-            if !response.status().is_success() {
-                return Err(eyre!("Download failed with HTTP {}", response.status()));
-            }
-            let declared_size = response.content_length();
-            if declared_size.is_some_and(|length| length > MAX_UPDATE_SIZE) {
-                return Err(eyre!(
-                    "Downloaded binary is too large: {} bytes (max {})",
-                    declared_size.expect("declared size was checked"),
-                    MAX_UPDATE_SIZE
-                ));
-            }
-
-            let (sender, receiver) = mpsc::channel(1);
-            tokio::spawn(pump_response(response, sender));
-            Ok(ReleaseAsset::new(
-                declared_size,
-                Box::pin(HttpAssetReader {
-                    receiver,
-                    current: None,
-                }),
-            ))
+            let client = update_http_client(UPDATE_HTTP_TIMEOUT)?;
+            stream_asset_at(&client, &url, MAX_UPDATE_SIZE).await
         })
     }
 }
 
-async fn pump_response(mut response: reqwest::Response, sender: mpsc::Sender<io::Result<Vec<u8>>>) {
+async fn stream_asset_at(
+    client: &reqwest::Client,
+    url: &str,
+    max_size: u64,
+) -> Result<ReleaseAsset> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| eyre!("Failed to download update: {}", e))?;
+    if !response.status().is_success() {
+        return Err(eyre!("Download failed with HTTP {}", response.status()));
+    }
+    let declared_size = response.content_length();
+    if declared_size.is_some_and(|length| length > max_size) {
+        return Err(eyre!(
+            "Downloaded binary is too large: {} bytes (max {})",
+            declared_size.expect("declared size was checked"),
+            max_size
+        ));
+    }
+
+    let (sender, receiver) = mpsc::channel(1);
+    tokio::spawn(pump_response(response, sender, max_size));
+    Ok(ReleaseAsset::new(
+        declared_size,
+        Box::pin(HttpAssetReader {
+            receiver,
+            current: None,
+        }),
+    ))
+}
+
+async fn pump_response(
+    mut response: reqwest::Response,
+    sender: mpsc::Sender<io::Result<Vec<u8>>>,
+    max_size: u64,
+) {
+    let mut downloaded = 0u64;
     loop {
         let item = match response.chunk().await {
-            Ok(Some(chunk)) => Ok(chunk.to_vec()),
+            Ok(Some(chunk)) => match checked_downloaded_size(downloaded, chunk.len()) {
+                Ok(total) if total <= max_size => {
+                    downloaded = total;
+                    Ok(chunk.to_vec())
+                }
+                Ok(total) => Err(io::Error::other(format!(
+                    "Downloaded binary exceeded max size: {total} bytes (max {max_size})"
+                ))),
+                Err(error) => Err(io::Error::other(error.to_string())),
+            },
             Ok(None) => break,
             Err(error) => Err(io::Error::other(format!(
                 "Failed to read response body: {error}"
@@ -179,88 +200,86 @@ pub struct ExecutableUpdateInstaller;
 impl UpdateInstaller for ExecutableUpdateInstaller {
     fn install<'a>(&'a self, release: &'a Release, asset: ReleaseAsset) -> UpdateFuture<'a, ()> {
         Box::pin(async move {
-            if asset
-                .declared_size
-                .is_some_and(|length| length > MAX_UPDATE_SIZE)
-            {
-                return Err(eyre!(
-                    "Downloaded binary is too large: {} bytes (max {})",
-                    asset.declared_size.expect("declared size was checked"),
-                    MAX_UPDATE_SIZE
-                ));
-            }
             let exe_path = std::env::current_exe()
                 .map_err(|e| eyre!("Failed to get current exe path: {}", e))?;
-            let exe_dir = exe_path
-                .parent()
-                .ok_or_else(|| eyre!("Current exe has no parent directory"))?;
-            let (mut file, tmp_path) = create_update_temp_file(exe_dir)?;
-            let mut reader = asset.into_reader();
-            let mut buffer = vec![0u8; 64 * 1024];
-            let mut downloaded = 0u64;
-            loop {
-                let read = reader
-                    .read(&mut buffer)
-                    .await
-                    .map_err(|e| eyre!("Failed to read response body: {}", e))?;
-                if read == 0 {
-                    break;
-                }
-                downloaded = checked_downloaded_size(downloaded, read)?;
-                if downloaded > MAX_UPDATE_SIZE {
-                    return Err(eyre!(
-                        "Downloaded binary exceeded max size: {} bytes (max {})",
-                        downloaded,
-                        MAX_UPDATE_SIZE
-                    ));
-                }
-                file.write_all(&buffer[..read])
-                    .await
-                    .map_err(|e| eyre!("Failed to write temp file: {}", e))?;
-            }
-            file.flush()
-                .await
-                .map_err(|e| eyre!("Failed to flush temp file: {}", e))?;
-            file.sync_all()
-                .await
-                .map_err(|e| eyre!("Failed to sync temp update file: {}", e))?;
-            drop(file);
-            if downloaded == 0 {
-                return Err(eyre!("Downloaded binary is empty"));
-            }
-            info!("Downloaded {} bytes", downloaded);
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
-                    .map_err(|e| eyre!("Failed to set permissions: {}", e))?;
-                sync_file_path(&tmp_path)
-                    .map_err(|e| eyre!("Failed to sync executable permissions: {}", e))?;
-            }
-
-            tmp_path
-                .persist(&exe_path)
-                .map_err(|e| eyre!("Failed to replace executable: {}", e.error))?;
-            sync_directory(exe_dir).map_err(|e| {
-                eyre!(
-                    "Failed to sync executable directory after update ({}): {}",
-                    exe_dir.display(),
-                    e
-                )
-            })?;
-            info!("Successfully updated to {}", release.version);
-            Ok(())
+            install_asset_at(&exe_path, release, asset, MAX_UPDATE_SIZE).await
         })
     }
 }
 
-/// Downloads the target version and atomically replaces the current executable.
-pub async fn self_update(target_version: &str) -> Result<()> {
-    let release = Release::new(target_version);
-    let repository = GithubReleaseRepository;
-    let asset = repository.stream_asset(&release).await?;
-    ExecutableUpdateInstaller.install(&release, asset).await
+async fn install_asset_at(
+    exe_path: &Path,
+    release: &Release,
+    asset: ReleaseAsset,
+    max_size: u64,
+) -> Result<()> {
+    if asset.declared_size.is_some_and(|length| length > max_size) {
+        return Err(eyre!(
+            "Downloaded binary is too large: {} bytes (max {})",
+            asset.declared_size.expect("declared size was checked"),
+            max_size
+        ));
+    }
+    let exe_dir = exe_path
+        .parent()
+        .ok_or_else(|| eyre!("Current exe has no parent directory"))?;
+    let (mut file, tmp_path) = create_update_temp_file(exe_dir)?;
+    let mut reader = asset.into_reader();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut downloaded = 0u64;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|e| eyre!("Failed to read response body: {}", e))?;
+        if read == 0 {
+            break;
+        }
+        downloaded = checked_downloaded_size(downloaded, read)?;
+        if downloaded > max_size {
+            return Err(eyre!(
+                "Downloaded binary exceeded max size: {} bytes (max {})",
+                downloaded,
+                max_size
+            ));
+        }
+        file.write_all(&buffer[..read])
+            .await
+            .map_err(|e| eyre!("Failed to write temp file: {}", e))?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| eyre!("Failed to flush temp file: {}", e))?;
+    file.sync_all()
+        .await
+        .map_err(|e| eyre!("Failed to sync temp update file: {}", e))?;
+    drop(file);
+    if downloaded == 0 {
+        return Err(eyre!("Downloaded binary is empty"));
+    }
+    info!("Downloaded {} bytes", downloaded);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| eyre!("Failed to set permissions: {}", e))?;
+        sync_file_path(&tmp_path)
+            .map_err(|e| eyre!("Failed to sync executable permissions: {}", e))?;
+    }
+
+    tmp_path
+        .persist(exe_path)
+        .map_err(|e| eyre!("Failed to replace executable: {}", e.error))?;
+    sync_directory(exe_dir).map_err(|e| {
+        eyre!(
+            "Failed to sync executable directory after update ({}): {}",
+            exe_dir.display(),
+            e
+        )
+    })?;
+    info!("Successfully updated to {}", release.version);
+    Ok(())
 }
 
 fn create_update_temp_file(dir: &Path) -> Result<(tokio::fs::File, tempfile::TempPath)> {
@@ -290,16 +309,25 @@ fn sync_directory(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::File::open(path)?.sync_all()
 }
 
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/tapthaker/nexdesk/releases/latest";
+
+fn update_http_client(timeout: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent("nexdesk")
+        .timeout(timeout)
+        .build()
+        .map_err(|e| eyre!("Failed to build HTTP client: {}", e))
+}
+
 /// Fetches the latest release tag from GitHub (e.g. "v0.1.8").
 pub async fn check_latest_version() -> Result<String> {
-    let client = reqwest::Client::builder()
-        .user_agent("nexdesk")
-        .timeout(UPDATE_HTTP_TIMEOUT)
-        .build()
-        .map_err(|e| eyre!("Failed to build HTTP client: {}", e))?;
+    let client = update_http_client(UPDATE_HTTP_TIMEOUT)?;
+    check_latest_version_at(&client, LATEST_RELEASE_URL).await
+}
 
+async fn check_latest_version_at(client: &reqwest::Client, url: &str) -> Result<String> {
     let mut resp = client
-        .get("https://api.github.com/repos/tapthaker/nexdesk/releases/latest")
+        .get(url)
         .send()
         .await
         .map_err(|e| eyre!("Failed to fetch latest release: {}", e))?;
@@ -344,39 +372,49 @@ pub async fn check_latest_version() -> Result<String> {
     Ok(tag.to_string())
 }
 
+async fn check_server_update(
+    current_version: &str,
+    repository: &dyn ReleaseRepository,
+    installer: &dyn UpdateInstaller,
+) -> Result<UpdateExecution> {
+    let release = repository.latest_release().await?;
+    execute_update(
+        &UpdatePolicy::new(current_version),
+        release,
+        UpdateSource::TrustedRepository,
+        repository,
+        installer,
+    )
+    .await
+}
+
 /// Periodically checks for new releases and self-updates. The first check runs
 /// immediately so a restarted or manually installed stale daemon does not wait
-/// 30 minutes. A successful update exits so the service manager restarts the
-/// new binary.
-pub async fn update_check_loop() {
+/// 30 minutes. A successful update returns restart intent to the composition
+/// root so the service manager can start the newly installed binary.
+pub async fn update_check_loop() -> RestartReason {
     use crate::net::protocol::BUILD_VERSION;
-    use std::time::Duration;
 
     if !is_release_version(BUILD_VERSION) {
         info!("Dev build ({}), skipping update checks", BUILD_VERSION);
-        return;
+        return std::future::pending().await;
     }
 
+    let repository = GithubReleaseRepository;
+    let installer = ExecutableUpdateInstaller;
     loop {
-        match check_latest_version().await {
-            Ok(latest) if latest == BUILD_VERSION => {
+        match check_server_update(BUILD_VERSION, &repository, &installer).await {
+            Ok(UpdateExecution::RestartRequested(reason)) => {
+                info!(?reason, "Server update installed; requesting restart");
+                return reason;
+            }
+            Ok(UpdateExecution::Ignored(UpdateRejection::NotNewer)) => {
                 info!("Up to date ({})", BUILD_VERSION);
             }
-            Ok(latest) if is_release_version(&latest) && is_newer(&latest, BUILD_VERSION) => {
-                info!(
-                    "New version available: {} (current: {})",
-                    latest, BUILD_VERSION
-                );
-                match self_update(&latest).await {
-                    Ok(()) => {
-                        info!("Updated to {}. Exiting for restart...", latest);
-                        std::process::exit(0);
-                    }
-                    Err(e) => warn!("Self-update to {} failed: {}", latest, e),
-                }
+            Ok(UpdateExecution::Ignored(reason)) => {
+                warn!(?reason, "Ignoring invalid server update candidate");
             }
-            Ok(_) => {}
-            Err(e) => warn!("Update check failed: {}", e),
+            Err(error) => warn!("Update check failed: {}", error),
         }
 
         tokio::time::sleep(Duration::from_secs(30 * 60)).await;
@@ -386,11 +424,180 @@ pub async fn update_check_loop() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::update_http_fixture::{LocalHttpFixture, ScriptedHttpResponse};
+    use crate::testing::{
+        AssetStreamStep, FakeUpdateInstaller, ScriptedReleaseRepository, UpdateObservation,
+    };
+
+    #[tokio::test]
+    async fn server_update_installs_latest_version_and_requests_restart() {
+        let repository = ScriptedReleaseRepository::new();
+        let installer = FakeUpdateInstaller::new();
+        repository.push_latest_release("v1.2.4");
+        repository.push_asset("v1.2.4", Some(3), [AssetStreamStep::bytes(b"bin")]);
+        installer.succeed_next();
+
+        let outcome = check_server_update("v1.2.3", &repository, &installer)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UpdateExecution::RestartRequested(RestartReason::UpdateInstalled {
+                version: "v1.2.4".to_string(),
+            })
+        );
+        assert_eq!(installer.installed_updates()[0].version, "v1.2.4");
+        let observations = repository.observations().snapshot();
+        assert!(observations.iter().any(|entry| matches!(
+            &entry.event,
+            UpdateObservation::LatestReleaseReturned { version } if version == "v1.2.4"
+        )));
+        assert!(observations.iter().any(|entry| matches!(
+            &entry.event,
+            UpdateObservation::AssetRequested { version } if version == "v1.2.4"
+        )));
+    }
+
+    #[tokio::test]
+    async fn current_server_version_does_not_download_or_restart() {
+        let repository = ScriptedReleaseRepository::new();
+        let installer = FakeUpdateInstaller::new();
+        repository.push_latest_release("v1.2.3");
+
+        assert_eq!(
+            check_server_update("v1.2.3", &repository, &installer)
+                .await
+                .unwrap(),
+            UpdateExecution::Ignored(UpdateRejection::NotNewer)
+        );
+        assert_eq!(repository.remaining_asset_actions(), 0);
+        assert!(installer.installed_updates().is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live access to the GitHub API and release assets"]
+    async fn live_github_update_contract_smoke() {
+        let repository = GithubReleaseRepository;
+        let release = repository.latest_release().await.unwrap();
+        assert!(is_release_version(&release.version));
+
+        let asset = repository.stream_asset(&release).await.unwrap();
+        assert!(asset.declared_size.is_none_or(|size| size > 0));
+        let mut reader = asset.into_reader();
+        let mut prefix = [0u8; 16];
+        let read = reader.read(&mut prefix).await.unwrap();
+        assert!(read > 0, "live release asset was empty");
+    }
 
     #[test]
     fn downloaded_size_accounting_rejects_overflow() {
         assert_eq!(checked_downloaded_size(10, 5).unwrap(), 15);
         assert!(checked_downloaded_size(u64::MAX, 1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervised_restart_launches_the_replacement_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("nexdesk");
+        std::fs::write(
+            &executable,
+            b"#!/bin/sh\nprintf 'v1.2.3\\n'\nread stopped\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut old_process = tokio::process::Command::new(&executable)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut old_stdout = BufReader::new(old_process.stdout.take().unwrap());
+        let mut running_version = String::new();
+        old_stdout.read_line(&mut running_version).await.unwrap();
+        assert_eq!(running_version.trim(), "v1.2.3");
+
+        let replacement = b"#!/bin/sh\nprintf 'v1.2.4\\n'\n".to_vec();
+        install_asset_at(
+            &executable,
+            &Release::new("v1.2.4"),
+            ReleaseAsset::new(
+                Some(replacement.len() as u64),
+                Box::pin(std::io::Cursor::new(replacement)),
+            ),
+            1024,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            old_process.try_wait().unwrap().is_none(),
+            "replacing the path must not pretend the old process changed version"
+        );
+        old_process
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"stop\n")
+            .await
+            .unwrap();
+        assert!(old_process.wait().await.unwrap().success());
+
+        let restarted = tokio::process::Command::new(&executable)
+            .output()
+            .await
+            .unwrap();
+        assert!(restarted.status.success());
+        assert_eq!(
+            String::from_utf8(restarted.stdout).unwrap().trim(),
+            "v1.2.4"
+        );
+    }
+
+    #[tokio::test]
+    async fn installer_atomically_replaces_a_temporary_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("nexdesk");
+        std::fs::write(&executable, b"old executable").unwrap();
+        let replacement = b"new executable bytes".to_vec();
+
+        #[cfg(unix)]
+        let old_inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&executable).unwrap().ino()
+        };
+
+        install_asset_at(
+            &executable,
+            &Release::new("v9.9.9"),
+            ReleaseAsset::new(
+                Some(replacement.len() as u64),
+                Box::pin(std::io::Cursor::new(replacement.clone())),
+            ),
+            1024,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&executable).unwrap(), replacement);
+        let entries: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("nexdesk")]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let metadata = std::fs::metadata(&executable).unwrap();
+            assert_ne!(metadata.ino(), old_inode);
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
+        }
     }
 
     #[tokio::test]
@@ -423,5 +630,189 @@ mod tests {
     #[test]
     fn release_api_response_limit_is_small() {
         assert_eq!(MAX_RELEASE_API_RESPONSE_SIZE, 64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn release_lookup_rejects_http_statuses_and_malformed_json() {
+        let fixture = LocalHttpFixture::start().await;
+        let client = update_http_client(Duration::from_secs(1)).unwrap();
+        for status in [404, 500] {
+            fixture.push(ScriptedHttpResponse::bytes(status, "failure"));
+            let error = check_latest_version_at(&client, &fixture.url("/latest"))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("HTTP {status}")), "{error}");
+        }
+
+        fixture.push(ScriptedHttpResponse::bytes(200, "not json"));
+        assert!(check_latest_version_at(&client, &fixture.url("/latest"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to parse GitHub response"));
+    }
+
+    #[tokio::test]
+    async fn release_lookup_accepts_chunked_json() {
+        let fixture = LocalHttpFixture::start().await;
+        fixture.push(ScriptedHttpResponse::chunked(
+            200,
+            vec![b"{\"tag_".to_vec(), b"name\":\"v1.2.3\"}".to_vec()],
+        ));
+
+        let version = check_latest_version_at(
+            &update_http_client(Duration::from_secs(1)).unwrap(),
+            &fixture.url("/latest"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(version, "v1.2.3");
+    }
+
+    #[tokio::test]
+    async fn release_lookup_enforces_declared_and_streamed_size_limits() {
+        let fixture = LocalHttpFixture::start().await;
+        let client = update_http_client(Duration::from_secs(1)).unwrap();
+
+        fixture.push(
+            ScriptedHttpResponse::bytes(200, "{}")
+                .with_header("Content-Length", MAX_RELEASE_API_RESPONSE_SIZE + 1),
+        );
+        assert!(check_latest_version_at(&client, &fixture.url("/latest"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("response too large"));
+
+        fixture.push(ScriptedHttpResponse::chunked(
+            200,
+            vec![vec![b'x'; MAX_RELEASE_API_RESPONSE_SIZE as usize + 1]],
+        ));
+        assert!(check_latest_version_at(&client, &fixture.url("/latest"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("response exceeded max size"));
+    }
+
+    async fn read_asset(asset: ReleaseAsset) -> io::Result<Vec<u8>> {
+        let mut reader = asset.into_reader();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await?;
+        Ok(bytes)
+    }
+
+    #[tokio::test]
+    async fn binary_download_rejects_http_statuses() {
+        let fixture = LocalHttpFixture::start().await;
+        let client = update_http_client(Duration::from_secs(1)).unwrap();
+        for status in [404, 500] {
+            fixture.push(ScriptedHttpResponse::bytes(status, "failure"));
+            let error = stream_asset_at(&client, &fixture.url("/asset"), 1024)
+                .await
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains(&format!("HTTP {status}")), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_download_exposes_empty_and_chunked_bodies() {
+        let fixture = LocalHttpFixture::start().await;
+        let client = update_http_client(Duration::from_secs(1)).unwrap();
+
+        fixture.push(ScriptedHttpResponse::bytes(200, Vec::new()));
+        let empty = stream_asset_at(&client, &fixture.url("/asset"), 1024)
+            .await
+            .unwrap();
+        assert_eq!(empty.declared_size, Some(0));
+        assert!(read_asset(empty).await.unwrap().is_empty());
+
+        fixture.push(ScriptedHttpResponse::chunked(
+            200,
+            vec![b"release ".to_vec(), b"binary".to_vec()],
+        ));
+        let chunked = stream_asset_at(&client, &fixture.url("/asset"), 1024)
+            .await
+            .unwrap();
+        assert_eq!(chunked.declared_size, None);
+        assert_eq!(read_asset(chunked).await.unwrap(), b"release binary");
+    }
+
+    #[tokio::test]
+    async fn truncated_binary_body_fails_during_streaming() {
+        let fixture = LocalHttpFixture::start().await;
+        fixture.push(ScriptedHttpResponse::truncated(200, 10, b"short".to_vec()));
+        let asset = stream_asset_at(
+            &update_http_client(Duration::from_secs(1)).unwrap(),
+            &fixture.url("/asset"),
+            1024,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(asset.declared_size, Some(10));
+        assert!(read_asset(asset).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn binary_download_enforces_declared_and_actual_size_limits() {
+        let fixture = LocalHttpFixture::start().await;
+        let client = update_http_client(Duration::from_secs(1)).unwrap();
+
+        fixture.push(
+            ScriptedHttpResponse::bytes(200, b"12345".to_vec()).with_header("Content-Length", 5),
+        );
+        assert!(stream_asset_at(&client, &fixture.url("/asset"), 4)
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("too large"));
+
+        fixture.push(ScriptedHttpResponse::chunked(
+            200,
+            vec![b"123".to_vec(), b"45".to_vec()],
+        ));
+        let asset = stream_asset_at(&client, &fixture.url("/asset"), 4)
+            .await
+            .unwrap();
+        assert!(read_asset(asset)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("exceeded max size"));
+    }
+
+    #[tokio::test]
+    async fn binary_download_timeout_is_bounded() {
+        let fixture = LocalHttpFixture::start().await;
+        fixture
+            .push(ScriptedHttpResponse::bytes(200, "late").with_delay(Duration::from_millis(200)));
+        let client = update_http_client(Duration::from_millis(25)).unwrap();
+
+        let error = stream_asset_at(&client, &fixture.url("/asset"), 1024)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("Failed to download update"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn release_lookup_timeout_is_bounded() {
+        let fixture = LocalHttpFixture::start().await;
+        fixture.push(ScriptedHttpResponse::stalled());
+        let client = update_http_client(Duration::from_millis(25)).unwrap();
+
+        let error = check_latest_version_at(&client, &fixture.url("/latest"))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("Failed to fetch latest release"), "{error}");
     }
 }

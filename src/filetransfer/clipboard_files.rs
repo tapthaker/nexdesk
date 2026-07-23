@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use color_eyre::eyre::Result;
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(target_os = "macos")]
+use tracing::warn;
 
 /// Check if the clipboard contains file references and return their paths.
 ///
@@ -245,8 +247,8 @@ fn urldecode(s: &str) -> String {
     let mut chars = s.bytes();
     while let Some(b) = chars.next() {
         if b == b'%' {
-            let hi = chars.next().and_then(|c| hex_val(c));
-            let lo = chars.next().and_then(|c| hex_val(c));
+            let hi = chars.next().and_then(hex_val);
+            let lo = chars.next().and_then(hex_val);
             if let (Some(h), Some(l)) = (hi, lo) {
                 result.push((h << 4 | l) as char);
             } else {

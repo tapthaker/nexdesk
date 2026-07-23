@@ -8,6 +8,7 @@ use crate::config::PersistenceRoots;
 use crate::ports::{AtomicFileStore, RealAtomicFileStore, StatusSink};
 
 pub const MAX_STATUS_DISPLAY_BYTES: usize = 1024;
+#[allow(dead_code, reason = "bounds retained command-output test adapters")]
 pub const MAX_COMMAND_OUTPUT_DISPLAY_BYTES: usize = 64 * 1024;
 pub const MAX_STATUS_FILE_BYTES: u64 = 1024 * 1024;
 
@@ -15,6 +16,7 @@ pub fn terminal_safe(value: &str, max_bytes: usize) -> String {
     terminal_safe_with(value, max_bytes, |_| false)
 }
 
+#[allow(dead_code, reason = "sanitizes retained command-output test adapters")]
 pub fn terminal_safe_multiline(value: &str, max_bytes: usize) -> String {
     terminal_safe_with(value, max_bytes, |ch| matches!(ch, '\n' | '\t'))
 }
@@ -125,6 +127,10 @@ pub fn load_status_at(path: &std::path::Path) -> Result<Option<RuntimeStatus>> {
     Ok(Some(status))
 }
 
+#[allow(
+    dead_code,
+    reason = "policy is retained for stale-status consumers and contract tests"
+)]
 pub fn load_status_with_policy(
     path: &std::path::Path,
     now: u64,

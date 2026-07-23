@@ -346,10 +346,6 @@ fn print_command(program: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn run_systemctl(args: &[&str]) -> Result<()> {
-    run_systemctl_with_runner(&RealCommandRunner, args)
-}
-
 fn run_systemctl_with_runner(runner: &dyn CommandRunner, args: &[&str]) -> Result<()> {
     run_checked(runner, "systemctl", args).map(|_| ())
 }
@@ -397,6 +393,11 @@ mod tests {
             .count();
         assert_eq!(commands, 7);
         assert_eq!(runner.remaining_actions(), 0);
-        assert!(service.is_file());
+        let unit = std::fs::read_to_string(&service).unwrap();
+        assert!(unit.contains("Restart=always"));
+        assert!(unit.contains(&format!(
+            "ExecStart={} connect 192.0.2.1:4242",
+            std::env::current_exe().unwrap().display()
+        )));
     }
 }

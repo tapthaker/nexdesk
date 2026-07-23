@@ -40,32 +40,13 @@ use crate::net::protocol::Direction;
 /// Events sent from the Wayland capture task to the server loop.
 #[derive(Debug)]
 pub enum LayerShellEvent {
-    EdgeEnter {
-        direction: Direction,
-    },
-    MouseMove {
-        dx: f64,
-        dy: f64,
-    },
-    MouseButton {
-        button: u32,
-        pressed: bool,
-    },
-    MouseScroll {
-        dx: f64,
-        dy: f64,
-    },
+    EdgeEnter { direction: Direction },
+    MouseMove { dx: f64, dy: f64 },
+    MouseButton { button: u32, pressed: bool },
+    MouseScroll { dx: f64, dy: f64 },
     ScrollEnd,
-    KeyEvent {
-        keycode: u32,
-        pressed: bool,
-    },
-    KeyModifiers {
-        depressed: u32,
-        latched: u32,
-        locked: u32,
-        group: u32,
-    },
+    KeyEvent { keycode: u32, pressed: bool },
+    KeyModifiers,
 }
 
 /// Commands from the server loop to the Wayland capture task.
@@ -159,18 +140,17 @@ impl LayerShellEventReceiver {
     }
 }
 
+/// Active layer-shell event stream, command channel, and screen dimensions.
+pub type LayerShellCapture = (
+    LayerShellEventReceiver,
+    mpsc::UnboundedSender<LayerShellCommand>,
+    u32,
+    u32,
+);
+
 /// Try to create a layer-shell capture. Returns None if the layer-shell
 /// protocol is not available (GNOME, KDE, X11 session).
-pub fn try_create(
-    trigger_edge: Direction,
-) -> Result<
-    Option<(
-        LayerShellEventReceiver,
-        mpsc::UnboundedSender<LayerShellCommand>,
-        u32, // screen_width
-        u32, // screen_height
-    )>,
-> {
+pub fn try_create(trigger_edge: Direction) -> Result<Option<LayerShellCapture>> {
     // Must have WAYLAND_DISPLAY to connect
     if std::env::var("WAYLAND_DISPLAY").is_err() {
         debug!("No WAYLAND_DISPLAY set, layer-shell not available");
@@ -310,7 +290,6 @@ pub fn try_create(
         state.edge_surfaces.push(EdgeSurface {
             surface: surface.clone(),
             layer_surface,
-            direction: trigger_edge,
             configured: false,
             configured_width: 0,
             configured_height: 0,
@@ -380,7 +359,6 @@ struct OutputInfo {
 struct EdgeSurface {
     surface: wl_surface::WlSurface,
     layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
-    direction: Direction,
     configured: bool,
     configured_width: u32,
     configured_height: u32,
@@ -729,28 +707,22 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 button,
                 state: btn_state,
                 ..
-            } => {
-                if state.grabbed {
-                    let pressed = btn_state == WEnum::Value(wl_pointer::ButtonState::Pressed);
-                    state.send_event(LayerShellEvent::MouseButton { button, pressed });
+            } if state.grabbed => {
+                let pressed = btn_state == WEnum::Value(wl_pointer::ButtonState::Pressed);
+                state.send_event(LayerShellEvent::MouseButton { button, pressed });
+            }
+            wl_pointer::Event::Axis { axis, value, .. } if state.grabbed => {
+                let (dx, dy) = match axis {
+                    WEnum::Value(wl_pointer::Axis::HorizontalScroll) => (value, 0.0),
+                    WEnum::Value(wl_pointer::Axis::VerticalScroll) => (0.0, value),
+                    _ => (0.0, 0.0),
+                };
+                if dx != 0.0 || dy != 0.0 {
+                    state.send_event(LayerShellEvent::MouseScroll { dx, dy });
                 }
             }
-            wl_pointer::Event::Axis { axis, value, .. } => {
-                if state.grabbed {
-                    let (dx, dy) = match axis {
-                        WEnum::Value(wl_pointer::Axis::HorizontalScroll) => (value, 0.0),
-                        WEnum::Value(wl_pointer::Axis::VerticalScroll) => (0.0, value),
-                        _ => (0.0, 0.0),
-                    };
-                    if dx != 0.0 || dy != 0.0 {
-                        state.send_event(LayerShellEvent::MouseScroll { dx, dy });
-                    }
-                }
-            }
-            wl_pointer::Event::AxisStop { .. } => {
-                if state.grabbed {
-                    state.send_event(LayerShellEvent::ScrollEnd);
-                }
+            wl_pointer::Event::AxisStop { .. } if state.grabbed => {
+                state.send_event(LayerShellEvent::ScrollEnd);
             }
             _ => {}
         }
@@ -766,18 +738,18 @@ impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for WaylandStat
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        if let zwp_relative_pointer_v1::Event::RelativeMotion {
-            dx_unaccel,
-            dy_unaccel,
-            ..
-        } = event
-        {
-            if state.grabbed {
+        match event {
+            zwp_relative_pointer_v1::Event::RelativeMotion {
+                dx_unaccel,
+                dy_unaccel,
+                ..
+            } if state.grabbed => {
                 state.send_event(LayerShellEvent::MouseMove {
                     dx: dx_unaccel,
                     dy: dy_unaccel,
                 });
             }
+            _ => {}
         }
     }
 }
@@ -796,47 +768,32 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                 key,
                 state: key_state,
                 ..
-            } => {
-                if state.grabbed {
-                    let pressed = key_state == WEnum::Value(wl_keyboard::KeyState::Pressed);
-                    state.send_event(LayerShellEvent::KeyEvent {
-                        keycode: key,
-                        pressed,
-                    });
+            } if state.grabbed => {
+                let pressed = key_state == WEnum::Value(wl_keyboard::KeyState::Pressed);
+                state.send_event(LayerShellEvent::KeyEvent {
+                    keycode: key,
+                    pressed,
+                });
 
-                    // Track held keys for repeat
-                    if pressed {
-                        // Only repeat non-modifier keys
-                        if !is_modifier(key) {
-                            // Remove any existing entry for this key
-                            state.held_keys.retain(|k| k.keycode != key);
-                            let now = Instant::now();
-                            state.held_keys.push(KeyRepeatState {
-                                keycode: key,
-                                started: now,
-                                last_repeat: now,
-                            });
-                        }
-                    } else {
+                // Track held keys for repeat
+                if pressed {
+                    // Only repeat non-modifier keys
+                    if !is_modifier(key) {
+                        // Remove any existing entry for this key
                         state.held_keys.retain(|k| k.keycode != key);
+                        let now = Instant::now();
+                        state.held_keys.push(KeyRepeatState {
+                            keycode: key,
+                            started: now,
+                            last_repeat: now,
+                        });
                     }
+                } else {
+                    state.held_keys.retain(|k| k.keycode != key);
                 }
             }
-            wl_keyboard::Event::Modifiers {
-                mods_depressed,
-                mods_latched,
-                mods_locked,
-                group,
-                ..
-            } => {
-                if state.grabbed {
-                    state.send_event(LayerShellEvent::KeyModifiers {
-                        depressed: mods_depressed,
-                        latched: mods_latched,
-                        locked: mods_locked,
-                        group,
-                    });
-                }
+            wl_keyboard::Event::Modifiers { .. } if state.grabbed => {
+                state.send_event(LayerShellEvent::KeyModifiers);
             }
             wl_keyboard::Event::RepeatInfo { rate, delay } => {
                 state.repeat_rate = rate;
@@ -886,18 +843,15 @@ impl Dispatch<zxdg_output_v1::ZxdgOutputV1, wl_output::WlOutput> for WaylandStat
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        match event {
-            zxdg_output_v1::Event::LogicalSize { width, height } => {
-                for o in &mut state.outputs {
-                    if o.wl_output == *output {
-                        o.logical_width = width;
-                        o.logical_height = height;
-                        debug!("Output logical size: {}x{}", width, height);
-                        break;
-                    }
+        if let zxdg_output_v1::Event::LogicalSize { width, height } = event {
+            for o in &mut state.outputs {
+                if o.wl_output == *output {
+                    o.logical_width = width;
+                    o.logical_height = height;
+                    debug!("Output logical size: {}x{}", width, height);
+                    break;
                 }
             }
-            _ => {}
         }
     }
 }

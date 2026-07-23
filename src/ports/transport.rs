@@ -42,6 +42,7 @@ pub enum ClientControlEvent {
     HeartbeatAcknowledged { timestamp: u64 },
     PeerScreenChanged(PeerScreen),
     WakeDisplay,
+    ReleaseControl,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,6 +109,7 @@ pub enum ServerControlCommand {
     AcknowledgeHeartbeat { timestamp: u64 },
     LocalScreenChanged(PeerScreen),
     WakePeerDisplay,
+    ReleasePeerControl,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -203,6 +205,8 @@ pub trait ClientPeerLink: Send + Sync {
     fn send_control(&self, command: ClientControlCommand) -> TransportFuture<'_, Result<()>>;
 
     fn send_clipboard(&self, command: ClientClipboardCommand) -> TransportFuture<'_, Result<()>>;
+
+    fn shutdown(&self) -> TransportFuture<'_, ()>;
 }
 
 /// Post-handshake server transport boundary.
@@ -238,6 +242,10 @@ mod tests {
             _command: ClientClipboardCommand,
         ) -> TransportFuture<'_, Result<()>> {
             Box::pin(async { Ok(()) })
+        }
+
+        fn shutdown(&self) -> TransportFuture<'_, ()> {
+            Box::pin(async {})
         }
     }
 

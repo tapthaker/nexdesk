@@ -4,6 +4,7 @@ use std::time::Duration;
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use quinn::{Connection, RecvStream, SendStream};
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinSet;
 
 use crate::net::framing;
 use crate::net::protocol::{self, ClipboardContent, Direction, Message, ScrollPhase};
@@ -22,6 +23,7 @@ pub(crate) struct QuinnClientPeerLink {
     control_send: Arc<Mutex<SendStream>>,
     clipboard_send: Arc<Mutex<SendStream>>,
     events: Mutex<mpsc::Receiver<ClientTransportEvent>>,
+    tasks: Mutex<Option<JoinSet<()>>>,
 }
 
 impl QuinnClientPeerLink {
@@ -48,19 +50,23 @@ impl QuinnClientPeerLink {
             .ok_or_else(|| eyre!("Input stream closed before ready marker"))?;
 
         let (event_send, events) = mpsc::channel(EVENT_BUFFER);
+        let mut tasks = JoinSet::new();
         spawn_reader(
+            &mut tasks,
             control_recv,
             ClientChannel::Control,
             event_send.clone(),
             map_control_message,
         );
         spawn_reader(
+            &mut tasks,
             input_recv,
             ClientChannel::Input,
             event_send.clone(),
             map_input_message,
         );
         spawn_reader(
+            &mut tasks,
             clipboard_recv,
             ClientChannel::Clipboard,
             event_send,
@@ -71,7 +77,13 @@ impl QuinnClientPeerLink {
             control_send: Arc::new(Mutex::new(control_send)),
             clipboard_send: Arc::new(Mutex::new(clipboard_send)),
             events: Mutex::new(events),
+            tasks: Mutex::new(Some(tasks)),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn reader_tasks_are_idle(&self) -> bool {
+        self.tasks.lock().await.is_none()
     }
 }
 
@@ -99,15 +111,25 @@ impl ClientPeerLink for QuinnClientPeerLink {
             framing::send_message(&mut *sender.lock().await, &message).await
         })
     }
+
+    fn shutdown(&self) -> TransportFuture<'_, ()> {
+        Box::pin(async move {
+            if let Some(mut tasks) = self.tasks.lock().await.take() {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+            }
+        })
+    }
 }
 
 fn spawn_reader(
+    tasks: &mut JoinSet<()>,
     mut recv: RecvStream,
     channel: ClientChannel,
     sender: mpsc::Sender<ClientTransportEvent>,
     map: fn(Message) -> std::result::Result<ClientTransportEvent, String>,
 ) {
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         loop {
             let event = match framing::recv_message(&mut recv).await {
                 Ok(Some(message)) => match map(message) {
@@ -143,6 +165,7 @@ fn map_control_message(message: Message) -> std::result::Result<ClientTransportE
             height: screen.height,
         }),
         Message::WakeDisplay => ClientControlEvent::WakeDisplay,
+        Message::ReleaseControl => ClientControlEvent::ReleaseControl,
         other => return Err(unexpected_message(ClientChannel::Control, &other)),
     };
     Ok(ClientTransportEvent::Control(event))
@@ -249,6 +272,10 @@ mod tests {
         assert_eq!(
             map_control_message(Message::Heartbeat { timestamp: 7 }).unwrap(),
             ClientTransportEvent::Control(ClientControlEvent::Heartbeat { timestamp: 7 })
+        );
+        assert_eq!(
+            map_control_message(Message::ReleaseControl).unwrap(),
+            ClientTransportEvent::Control(ClientControlEvent::ReleaseControl)
         );
         assert_eq!(
             map_input_message(Message::MouseButton {

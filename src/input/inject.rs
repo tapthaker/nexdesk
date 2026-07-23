@@ -33,11 +33,6 @@ impl InputInjectorFactory for PlatformInputInjectorFactory {
     }
 }
 
-/// Create a platform-appropriate input injector.
-pub fn create_injector() -> Result<Box<dyn InputInjector>> {
-    PlatformInputInjectorFactory.create()
-}
-
 fn create_platform_injector() -> Result<Box<dyn InputInjector>> {
     #[cfg(target_os = "linux")]
     {

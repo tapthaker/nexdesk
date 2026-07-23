@@ -62,6 +62,17 @@ impl QuinnServerPeerLink {
             tasks: Mutex::new(Some(tasks)),
         })
     }
+
+    #[cfg(test)]
+    pub(crate) async fn finish_control_stream(&self) -> Result<()> {
+        self.control_send.lock().await.finish()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn reader_tasks_are_idle(&self) -> bool {
+        self.tasks.lock().await.is_none()
+    }
 }
 
 impl ServerPeerLink for QuinnServerPeerLink {
@@ -186,6 +197,7 @@ fn control_command_message(command: ServerControlCommand) -> Message {
             },
         },
         ServerControlCommand::WakePeerDisplay => Message::WakeDisplay,
+        ServerControlCommand::ReleasePeerControl => Message::ReleaseControl,
     }
 }
 
@@ -300,6 +312,10 @@ mod tests {
         assert!(matches!(
             control_command_message(ServerControlCommand::WakePeerDisplay),
             Message::WakeDisplay
+        ));
+        assert!(matches!(
+            control_command_message(ServerControlCommand::ReleasePeerControl),
+            Message::ReleaseControl
         ));
     }
 

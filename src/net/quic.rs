@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
-use quinn::{Endpoint, RecvStream, SendStream};
+use quinn::Endpoint;
 use rand::Rng;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 use tokio::time::{self, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -35,10 +35,10 @@ use crate::net::update::{ExecutableUpdateInstaller, GithubReleaseRepository};
 use crate::ports::{
     ClientChannel, ClientClipboardCommand, ClientClipboardEvent, ClientControlCommand,
     ClientControlEvent, ClientInputEvent, ClientPeerLink, ClientTransportEvent, Clipboard,
-    DisplaySessionControl, LocalSessionLockSource, PairingPrompt, PeerDirection, PeerScreen,
-    PeerScrollPhase, Release, ReleaseRepository, ServerClipboardCommand, ServerClipboardEvent,
-    ServerControlCommand, ServerControlEvent, ServerInputCommand, ServerPeerLink,
-    ServerTransportEvent, StatusSink, TrustStore, UpdateInstaller,
+    DisplaySessionControl, LocalSessionLockSource, PairingPrompt, PeerDirection, PeerDiscovery,
+    PeerScreen, PeerScrollPhase, Release, ReleaseRepository, ServerClipboardCommand,
+    ServerClipboardEvent, ServerControlCommand, ServerControlEvent, ServerInputCommand,
+    ServerPeerLink, ServerTransportEvent, StatusSink, TrustStore, UpdateInstaller,
 };
 use crate::status::{self, FileStatusSink, RuntimeStatus};
 
@@ -423,6 +423,17 @@ fn restore_client_input_state(
     }
 }
 
+fn release_client_control(
+    transition: &mut ClientTransition,
+    injector: &mut dyn InputInjector,
+    display_control: &dyn DisplaySessionControl,
+    injected_keys: &mut HashSet<u32>,
+    injected_buttons: &mut HashSet<u8>,
+) {
+    transition.release_control();
+    restore_client_input_state(injector, display_control, injected_keys, injected_buttons);
+}
+
 async fn terminate_server_tasks(tasks: &mut tokio::task::JoinSet<()>) {
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
@@ -714,7 +725,10 @@ fn validate_listen_port(port: u16) -> Result<()> {
 }
 
 /// Run a QUIC server that captures local mouse and sends events to clients.
-pub async fn serve(port: u16, trigger_edge: Option<crate::net::protocol::Direction>) -> Result<()> {
+pub async fn serve(
+    port: u16,
+    trigger_edge: Option<crate::net::protocol::Direction>,
+) -> Result<SessionExit> {
     serve_with_dependencies(
         port,
         trigger_edge,
@@ -731,7 +745,8 @@ async fn serve_with_dependencies(
     capture_factory: Arc<dyn InputCaptureFactory>,
     lock_source: Arc<dyn LocalSessionLockSource>,
     display_control: Arc<dyn DisplaySessionControl>,
-) -> Result<()> {
+) -> Result<SessionExit> {
+    validate_listen_port(port)?;
     let server_config = tls::server_config()?;
     let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
     let endpoint = Endpoint::server(server_config, addr)?;
@@ -752,10 +767,21 @@ async fn serve_with_dependencies(
     let otp = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000u32));
     println!("\n  Pairing code: {}\n", otp);
 
-    // Periodically check for new releases and self-update
-    tokio::spawn(crate::net::update::update_check_loop());
+    // Periodically check for new releases. Successful installation returns
+    // typed restart intent instead of exiting below the composition root.
+    let update_check = crate::net::update::update_check_loop();
+    tokio::pin!(update_check);
 
-    while let Some(incoming) = endpoint.accept().await {
+    loop {
+        let incoming = tokio::select! {
+            reason = &mut update_check => {
+                return Ok(SessionExit::RestartRequested(reason));
+            }
+            incoming = endpoint.accept() => match incoming {
+                Some(incoming) => incoming,
+                None => return Ok(SessionExit::Disconnected),
+            },
+        };
         let connection = match incoming.await {
             Ok(connection) => connection,
             Err(e) => {
@@ -804,8 +830,6 @@ async fn serve_with_dependencies(
             }
         });
     }
-
-    Ok(())
 }
 
 async fn handle_server_connection(
@@ -993,12 +1017,12 @@ async fn handle_server_connection(
     // Spawn file transfer acceptor (receives files from client via new bi-streams)
     let ft_conn = connection.clone();
     connection_tasks.spawn(async move {
-        let mut transfers = tokio::task::JoinSet::new();
+        let mut transfers = crate::filetransfer::supervisor::TransferTaskSet::default();
         loop {
             tokio::select! {
                 result = ft_conn.accept_bi() => match result {
                 Ok((send, recv)) => {
-                    transfers.spawn(async move {
+                    if !transfers.try_spawn(async move {
                         match crate::filetransfer::recv::receive_files(send, recv).await {
                             Ok(paths) if !paths.is_empty() => {
                                 info!("Received {} file(s) from client", paths.len());
@@ -1011,22 +1035,25 @@ async fn handle_server_connection(
                             Ok(_) => {}
                             Err(e) => warn!("File transfer receive error: {}", e),
                         }
-                    });
+                    }) {
+                        warn!("Rejecting file transfer: concurrent transfer limit reached");
+                    }
                 }
                 Err(_) => break,
                 },
-                Some(_) = transfers.join_next(), if !transfers.is_empty() => {}
+                _ = transfers.join_next(), if !transfers.is_empty() => {}
             }
         }
-        transfers.abort_all();
-        while transfers.join_next().await.is_some() {}
+        transfers.shutdown().await;
     });
 
     info!("Server ready. Move mouse to screen edge to start sharing.");
     info!("Screen size: {}x{}", screen_w, screen_h);
 
     let mut poll_interval = time::interval(MOUSE_POLL_INTERVAL);
+    poll_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut layer_shell_key_poll_interval = time::interval(MOUSE_POLL_INTERVAL);
+    layer_shell_key_poll_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut pointer_send_interval = time::interval(POINTER_FRAME_INTERVAL);
     pointer_send_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut pending_layer_shell_motion = (0.0f64, 0.0f64);
@@ -1070,7 +1097,7 @@ async fn handle_server_connection(
 
                 // Log position every 500 polls (~1 second)
                 debug_counter += 1;
-                if debug_counter % 500 == 0 {
+                if debug_counter.is_multiple_of(500) {
                     let clamped_x = mx.clamp(0, sw as i32 - 1);
                     let clamped_y = my.clamp(0, sh as i32 - 1);
                     debug!("Mouse: ({}, {}) raw: ({}, {}) screen: {}x{}", clamped_x, clamped_y, mx, my, sw, sh);
@@ -1078,10 +1105,10 @@ async fn handle_server_connection(
 
                 match transition.poll(mx, my, sw, sh, buttons, key_events) {
                     ServerOutput::Idle => {}
-                    ServerOutput::Activate { messages, .. } => {
+                    ServerOutput::Activate { messages, grab } => {
                         info!("Edge detected — switching to remote");
                         pending_layer_shell_motion = (0.0, 0.0);
-                        capturer.lock().unwrap().set_grab(true).ok();
+                        capturer.lock().unwrap().set_grab(grab).ok();
                         let mut sender = input_send.lock().await;
                         for msg in messages {
                             send_message_uni(&mut sender, &msg).await.ok();
@@ -1307,12 +1334,8 @@ async fn handle_server_connection(
                         if transition.is_active() {
                             // Map evdev button codes to protocol button IDs
                             // evdev: BTN_LEFT=0x110, BTN_RIGHT=0x111, BTN_MIDDLE=0x112
-                            let btn_id = match button {
-                                0x110 => 0u8, // left
-                                0x111 => 1,   // right
-                                0x112 => 2,   // middle
-                                _ => button as u8,
-                            };
+                            let btn_id = layer_shell_button_to_protocol(button)
+                                .unwrap_or(button as u8);
                             transition.update_button(btn_id, pressed);
                             let msg = Message::MouseButton { button: btn_id, pressed };
                             let mut sender = input_send.lock().await;
@@ -1393,7 +1416,7 @@ async fn handle_server_connection(
                             }
                         }
                     }
-                    LayerShellEvent::KeyModifiers { .. } => {
+                    LayerShellEvent::KeyModifiers => {
                         // Modifier state is tracked via KeyEvent; modifiers event is informational
                     }
                 }
@@ -1493,6 +1516,12 @@ async fn handle_server_connection(
                                     send_message_uni(&mut sender, &msg).await.ok();
                                 }
                             }
+                            if let Err(error) = peer
+                                .send_control(ServerControlCommand::ReleasePeerControl)
+                                .await
+                            {
+                                warn!("Failed to tell peer that the server reclaimed control: {}", error);
+                            }
                         },
                     )
                     .await;
@@ -1589,9 +1618,39 @@ trait ClientReconnectDriver {
     fn record_disconnected(&mut self, _addr: SocketAddr) {}
 }
 
-struct ProductionClientDriver {
+struct ClientTargetResolver {
     explicit_addr: Option<String>,
     expected_fingerprint: Option<String>,
+    discovery: Arc<dyn PeerDiscovery>,
+    discovery_timeout: Duration,
+    discovery_attempts: u32,
+}
+
+impl ClientTargetResolver {
+    async fn resolve(&self) -> Result<SocketAddr> {
+        match self.explicit_addr.clone() {
+            Some(addr) => tokio::task::spawn_blocking(move || resolve_addr(&addr))
+                .await
+                .wrap_err("Address resolution task failed")?,
+            None => {
+                let fingerprint = self.expected_fingerprint.as_deref().ok_or_else(|| {
+                    eyre!("No server fingerprint configured; run `nexdesk setup`")
+                })?;
+                crate::app::resolve_peer_with_retry(
+                    self.discovery.as_ref(),
+                    fingerprint,
+                    self.discovery_timeout,
+                    self.discovery_attempts,
+                    &CancellationToken::new(),
+                )
+                .await
+            }
+        }
+    }
+}
+
+struct ProductionClientDriver {
+    target_resolver: ClientTargetResolver,
     injector_factory: Arc<dyn InputInjectorFactory>,
     display_control: Arc<dyn DisplaySessionControl>,
     trust_store: Arc<dyn TrustStore>,
@@ -1612,17 +1671,7 @@ impl ClientReconnectDriver for ProductionClientDriver {
     type Connected = ConnectedClient;
 
     async fn resolve_target(&mut self) -> Result<SocketAddr> {
-        match self.explicit_addr.clone() {
-            Some(addr) => tokio::task::spawn_blocking(move || resolve_addr(&addr))
-                .await
-                .wrap_err("Address resolution task failed")?,
-            None => {
-                let fingerprint = self.expected_fingerprint.as_deref().ok_or_else(|| {
-                    eyre!("No server fingerprint configured; run `nexdesk setup`")
-                })?;
-                discovery::discover_one(fingerprint, Duration::from_secs(10)).await
-            }
-        }
+        self.target_resolver.resolve().await
     }
 
     async fn connect_target(&mut self, addr: SocketAddr) -> Result<Self::Connected> {
@@ -1779,6 +1828,7 @@ async fn connect_with_cancellation(
         addr,
         expected_fingerprint,
         cancellation,
+        Arc::new(discovery::MdnsDiscovery),
         Arc::new(PlatformInputInjectorFactory),
         Arc::new(PlatformDisplaySessionControl),
         Arc::new(ConfigTrustStore),
@@ -1791,10 +1841,15 @@ async fn connect_with_cancellation(
     .await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "composition root wires explicit client capability ports"
+)]
 async fn connect_with_dependencies(
     addr: Option<&str>,
     expected_fingerprint: Option<String>,
     cancellation: CancellationToken,
+    discovery: Arc<dyn PeerDiscovery>,
     injector_factory: Arc<dyn InputInjectorFactory>,
     display_control: Arc<dyn DisplaySessionControl>,
     trust_store: Arc<dyn TrustStore>,
@@ -1807,8 +1862,13 @@ async fn connect_with_dependencies(
     let explicit_addr = explicit_connect_addr_arg(addr)?;
     let _idle_sleep_inhibitor = display_control.inhibit_idle_sleep()?;
     let mut driver = ProductionClientDriver {
-        explicit_addr,
-        expected_fingerprint,
+        target_resolver: ClientTargetResolver {
+            explicit_addr,
+            expected_fingerprint,
+            discovery,
+            discovery_timeout: Duration::from_secs(10),
+            discovery_attempts: 3,
+        },
         injector_factory,
         display_control,
         trust_store,
@@ -1822,6 +1882,10 @@ async fn connect_with_dependencies(
 }
 
 /// Handle one established client connection, including handshake and session loops.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "session boundary receives explicit transport and platform capabilities"
+)]
 async fn run_client_session(
     connection: quinn::Connection,
     addr: SocketAddr,
@@ -2055,14 +2119,14 @@ async fn run_client_session(
     let receive_clipboard = clipboard_port.clone();
     let mut shutdown_rx3 = shutdown_tx.subscribe();
     let file_acceptor_task = tokio::spawn(async move {
-        let mut transfer_tasks = tokio::task::JoinSet::new();
+        let mut transfer_tasks = crate::filetransfer::supervisor::TransferTaskSet::default();
         loop {
             tokio::select! {
                 result = ft_conn.accept_bi() => {
                     match result {
                         Ok((send, recv)) => {
                             let receive_clipboard = receive_clipboard.clone();
-                            transfer_tasks.spawn(async move {
+                            if !transfer_tasks.try_spawn(async move {
                                 match crate::filetransfer::recv::receive_files(send, recv).await {
                                     Ok(paths) if !paths.is_empty() => {
                                         info!("Received {} file(s) from server", paths.len());
@@ -2075,7 +2139,9 @@ async fn run_client_session(
                                         warn!("File transfer receive error: {}", e);
                                     }
                                 }
-                            });
+                            }) {
+                                warn!("Rejecting file transfer: concurrent transfer limit reached");
+                            }
                         }
                         Err(_) => break,
                     }
@@ -2086,8 +2152,7 @@ async fn run_client_session(
                 }
             }
         }
-        transfer_tasks.abort_all();
-        while transfer_tasks.join_next().await.is_some() {}
+        transfer_tasks.shutdown().await;
     });
 
     info!("Client ready. Waiting for server to share mouse...");
@@ -2331,6 +2396,18 @@ async fn run_client_session(
                         debug!("Peer user active — keeping this system awake");
                         display_control.wake_display().ok();
                     }
+                    Some(ClientTransportEvent::Control(ClientControlEvent::ReleaseControl)) => {
+                        info!("Server reclaimed input control");
+                        pending_mouse_move = None;
+                        activation_started = None;
+                        release_client_control(
+                            &mut transition,
+                            &mut *injector,
+                            display_control,
+                            &mut injected_keys,
+                            &mut injected_buttons,
+                        );
+                    }
                     Some(ClientTransportEvent::Clipboard(ClientClipboardEvent::TextChanged(text))) => {
                         let content = protocol::ClipboardContent::Text(text);
                         if clipboard_update_tx.send(Some(content)).is_err() {
@@ -2515,8 +2592,9 @@ async fn run_client_session(
     // Signal clipboard tasks to shut down
     shutdown_tx.send(true).ok();
 
-    // Closing the connection releases transport waits. Abort any task still
-    // waiting on a blocking adapter, then join every connection-owned task.
+    // Stop and join transport readers, then close the connection to release
+    // any remaining transport waits. Abort blocking adapter tasks afterward.
+    peer.shutdown().await;
     connection.close(0u32.into(), b"disconnected");
     let mut session_tasks = vec![clipboard_task, file_acceptor_task, peer_reader_task];
     session_tasks.append(&mut file_send_tasks);
@@ -2747,10 +2825,6 @@ async fn send_message_uni(send: &mut TypedServerInputGuard, msg: &Message) -> Re
     send_server_input_messages(send.peer.as_ref(), [msg.clone()]).await
 }
 
-async fn recv_message_uni(recv: &mut quinn::RecvStream) -> Result<Option<Message>> {
-    recv_message(recv).await
-}
-
 #[cfg(test)]
 mod input_coalescing_tests {
     use super::*;
@@ -2825,9 +2899,335 @@ mod input_coalescing_tests {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use proptest::prelude::*;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    fn peer_direction_strategy() -> impl Strategy<Value = PeerDirection> {
+        prop_oneof![
+            Just(PeerDirection::Left),
+            Just(PeerDirection::Right),
+            Just(PeerDirection::Up),
+            Just(PeerDirection::Down),
+        ]
+    }
+
+    fn client_session_event_strategy() -> impl Strategy<Value = ClientInputEvent> {
+        prop_oneof![
+            peer_direction_strategy()
+                .prop_map(|direction| ClientInputEvent::SwitchToClient { direction }),
+            (-2_000i32..=2_000, -2_000i32..=2_000)
+                .prop_map(|(x, y)| ClientInputEvent::MouseMoved { x, y }),
+            (0u8..=7, any::<bool>()).prop_map(|(button, pressed)| {
+                ClientInputEvent::MouseButtonChanged { button, pressed }
+            }),
+            (0u32..=255, any::<bool>(), any::<u16>()).prop_map(|(keycode, pressed, modifiers)| {
+                ClientInputEvent::KeyChanged {
+                    keycode,
+                    pressed,
+                    modifiers,
+                }
+            }),
+            (-100i16..=100, -100i16..=100).prop_map(|(dx, dy)| {
+                ClientInputEvent::MouseScrolled {
+                    dx: f64::from(dx),
+                    dy: f64::from(dy),
+                    phase: PeerScrollPhase::None,
+                }
+            }),
+        ]
+    }
+
+    #[derive(Clone, Debug)]
+    enum GeneratedServerSessionEvent {
+        Poll {
+            x: i32,
+            y: i32,
+            buttons: u8,
+            keys: Vec<Message>,
+        },
+        Activate(PeerDirection),
+        SwitchBack(PeerDirection),
+        Resize {
+            width: u32,
+            height: u32,
+        },
+    }
+
+    fn generated_key_strategy() -> impl Strategy<Value = Message> {
+        (0u32..=255, any::<bool>(), any::<u16>()).prop_map(|(keycode, pressed, modifiers)| {
+            Message::KeyEvent {
+                keycode,
+                pressed,
+                modifiers,
+            }
+        })
+    }
+
+    fn server_session_event_strategy() -> impl Strategy<Value = GeneratedServerSessionEvent> {
+        prop_oneof![
+            (
+                -100i32..=2_100,
+                -100i32..=1_200,
+                0u8..=7,
+                prop::collection::vec(generated_key_strategy(), 0..5),
+            )
+                .prop_map(|(x, y, buttons, keys)| GeneratedServerSessionEvent::Poll {
+                    x,
+                    y,
+                    buttons,
+                    keys,
+                }),
+            peer_direction_strategy().prop_map(GeneratedServerSessionEvent::Activate),
+            peer_direction_strategy().prop_map(GeneratedServerSessionEvent::SwitchBack),
+            (1u32..=16_384, 1u32..=16_384).prop_map(|(width, height)| {
+                GeneratedServerSessionEvent::Resize { width, height }
+            }),
+        ]
+    }
+
+    async fn run_generated_client_session(
+        rig: &crate::testing::ClientRig,
+        events: Vec<ClientInputEvent>,
+    ) {
+        for _ in 0..events.len() {
+            rig.peer.succeed_next_control_send();
+        }
+        for event in events {
+            rig.peer.push_event(ClientTransportEvent::Input(event));
+        }
+        rig.peer.push_channel_close(ClientChannel::Input);
+
+        let mut injector = rig.injector_factory.create().unwrap();
+        let mut transition = ClientTransition::new(1920, 1080);
+        let mut injected_keys = HashSet::new();
+        let mut injected_buttons = HashSet::new();
+
+        while let Some(event) = rig.peer.next_event().await {
+            match event {
+                ClientTransportEvent::Input(event) => {
+                    let original = protocol_input_message(event);
+                    match transition.handle(original.clone()) {
+                        ClientOutput::Ignore => {
+                            inject_late_release(
+                                &mut *injector,
+                                &original,
+                                &mut injected_keys,
+                                &mut injected_buttons,
+                            )
+                            .unwrap();
+                        }
+                        ClientOutput::Activate => {
+                            rig.display.wake_display().unwrap();
+                        }
+                        ClientOutput::InjectMove { x, y } => {
+                            injector.inject(&Message::MouseMove { x, y }).unwrap();
+                        }
+                        ClientOutput::Forward(message) => {
+                            injector.inject(&message).unwrap();
+                            track_injected_input(
+                                &message,
+                                &mut injected_keys,
+                                &mut injected_buttons,
+                            );
+                        }
+                        ClientOutput::SwitchBack { direction, inject } => {
+                            if let Some((x, y)) = inject {
+                                injector.inject(&Message::MouseMove { x, y }).unwrap();
+                            }
+                            restore_client_input_state(
+                                &mut *injector,
+                                &rig.display,
+                                &mut injected_keys,
+                                &mut injected_buttons,
+                            );
+                            rig.peer
+                                .send_control(ClientControlCommand::RequestSwitchBack {
+                                    direction: peer_direction(direction),
+                                })
+                                .await
+                                .unwrap();
+                        }
+                    }
+                }
+                ClientTransportEvent::Closed(ClientChannel::Input) => break,
+                other => panic!("unexpected generated client event: {other:?}"),
+            }
+        }
+
+        restore_client_input_state(
+            &mut *injector,
+            &rig.display,
+            &mut injected_keys,
+            &mut injected_buttons,
+        );
+        rig.peer.shutdown().await;
+    }
+
+    async fn send_generated_server_messages(
+        rig: &crate::testing::ServerRig,
+        messages: Vec<Message>,
+    ) {
+        for _ in &messages {
+            rig.peer
+                .succeed_next_send(crate::testing::ServerSendOperation::Input);
+        }
+        send_server_input_messages(&rig.peer, messages)
+            .await
+            .unwrap();
+    }
+
+    async fn run_generated_server_session(
+        rig: &crate::testing::ServerRig,
+        events: Vec<GeneratedServerSessionEvent>,
+    ) {
+        let mut capture = rig.capture.clone();
+        let mut transition = ServerTransition::new(
+            None,
+            ScreenLayout {
+                width: 1920,
+                height: 1080,
+            },
+        );
+
+        for event in events {
+            match event {
+                GeneratedServerSessionEvent::Poll {
+                    x,
+                    y,
+                    buttons,
+                    keys,
+                } => match transition.poll(x, y, 1920, 1080, buttons, keys) {
+                    ServerOutput::Idle => {}
+                    ServerOutput::Activate { messages, grab } => {
+                        capture.set_grab(grab).unwrap();
+                        send_generated_server_messages(rig, messages).await;
+                    }
+                    ServerOutput::Forward { messages } => {
+                        send_generated_server_messages(rig, messages).await;
+                    }
+                    ServerOutput::ShortcutRelease { messages }
+                    | ServerOutput::ForceRelease { messages } => {
+                        capture.set_grab(false).unwrap();
+                        send_generated_server_messages(rig, messages).await;
+                    }
+                },
+                GeneratedServerSessionEvent::Activate(direction) => {
+                    if !transition.is_active() {
+                        capture.set_grab(true).unwrap();
+                        let messages = transition.activate_instant(protocol_direction(direction));
+                        send_generated_server_messages(rig, messages).await;
+                    }
+                }
+                GeneratedServerSessionEvent::SwitchBack(direction) => {
+                    rig.peer.push_event(ServerTransportEvent::Control(
+                        ServerControlEvent::SwitchBackRequested { direction },
+                    ));
+                    let event = rig.peer.next_event().await.unwrap();
+                    assert!(matches!(
+                        event,
+                        ServerTransportEvent::Control(
+                            ServerControlEvent::SwitchBackRequested { .. }
+                        )
+                    ));
+                    let messages = transition.on_switch_back();
+                    capture.set_grab(false).unwrap();
+                    send_generated_server_messages(rig, messages).await;
+                }
+                GeneratedServerSessionEvent::Resize { width, height } => {
+                    rig.peer.push_event(ServerTransportEvent::Control(
+                        ServerControlEvent::PeerScreenChanged(PeerScreen { width, height }),
+                    ));
+                    let event = rig.peer.next_event().await.unwrap();
+                    let ServerTransportEvent::Control(ServerControlEvent::PeerScreenChanged(
+                        screen,
+                    )) = event
+                    else {
+                        panic!("unexpected generated server event: {event:?}");
+                    };
+                    transition.update_peer_screen(ScreenLayout {
+                        width: screen.width,
+                        height: screen.height,
+                    });
+                }
+            }
+        }
+
+        let releases = restore_server_input_state(&mut capture, false, &mut transition);
+        send_generated_server_messages(rig, releases).await;
+        rig.peer.shutdown().await;
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn generated_client_sessions_restore_inputs_cursor_and_tasks(
+            events in prop::collection::vec(client_session_event_strategy(), 0..96),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let rig = crate::testing::ClientRig::new();
+                run_generated_client_session(&rig, events).await;
+                rig.assert_pressed_inputs(&[], &[]);
+                rig.assert_cursor_visible(true);
+                assert_eq!(rig.peer.pending_events(), 0);
+                rig.assert_tasks_completed();
+            });
+        }
+
+        #[test]
+        fn generated_server_sessions_release_grabs_inputs_and_tasks(
+            events in prop::collection::vec(server_session_event_strategy(), 0..96),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let rig = crate::testing::ServerRig::new();
+                run_generated_server_session(&rig, events).await;
+
+                let mut remote_keys = HashSet::new();
+                let mut remote_buttons = HashSet::new();
+                for observation in rig.peer.observations().snapshot() {
+                    if let crate::testing::ServerPeerObservation::InputSend(command) = observation.event {
+                        match command {
+                            ServerInputCommand::KeyChanged { keycode, pressed, .. } => {
+                                if pressed {
+                                    remote_keys.insert(keycode);
+                                } else {
+                                    remote_keys.remove(&keycode);
+                                }
+                            }
+                            ServerInputCommand::MouseButtonChanged { button, pressed } => {
+                                if pressed {
+                                    remote_buttons.insert(button);
+                                } else {
+                                    remote_buttons.remove(&button);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                assert!(remote_keys.is_empty(), "server exit left remote keys held");
+                assert!(remote_buttons.is_empty(), "server exit left remote buttons held");
+                assert!(matches!(
+                    rig.capture.grab_history().last(),
+                    Some(crate::testing::GrabChange::All(false))
+                ));
+                assert_eq!(rig.peer.pending_events(), 0);
+                assert!(rig.peer.is_shutdown());
+                rig.assert_tasks_completed();
+            });
+        }
+    }
 
     #[derive(Clone, Copy)]
     enum BlockingStage {
@@ -2883,6 +3283,85 @@ mod lifecycle_tests {
         }
     }
 
+    struct FingerprintRediscoveryDriver {
+        target_resolver: ClientTargetResolver,
+        connected_addrs: Vec<SocketAddr>,
+        session_exits: VecDeque<SessionExit>,
+    }
+
+    impl ClientReconnectDriver for FingerprintRediscoveryDriver {
+        type Connected = SocketAddr;
+
+        async fn resolve_target(&mut self) -> Result<SocketAddr> {
+            self.target_resolver.resolve().await
+        }
+
+        async fn connect_target(&mut self, addr: SocketAddr) -> Result<Self::Connected> {
+            self.connected_addrs.push(addr);
+            Ok(addr)
+        }
+
+        async fn run_session(&mut self, _connected: Self::Connected) -> Result<SessionExit> {
+            self.session_exits
+                .pop_front()
+                .ok_or_else(|| eyre!("unexpected reconnect session"))
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_rediscovery_follows_fingerprint_to_changed_address() {
+        const FINGERPRINT: &str = "AA:BB:CC";
+        let old_addr = "192.0.2.10:4242".parse().unwrap();
+        let new_addr = "192.0.2.77:4242".parse().unwrap();
+        let discovery = crate::testing::ScriptedDiscovery::new();
+        discovery.resolve_to(FINGERPRINT, old_addr);
+        discovery.fail_resolve("server rebooting");
+        discovery.resolve_to("DD:EE:FF", old_addr);
+        discovery.resolve_to("aa:bb:cc", new_addr);
+
+        let mut driver = FingerprintRediscoveryDriver {
+            target_resolver: ClientTargetResolver {
+                explicit_addr: None,
+                expected_fingerprint: Some(FINGERPRINT.to_string()),
+                discovery: Arc::new(discovery.clone()),
+                discovery_timeout: Duration::from_secs(1),
+                discovery_attempts: 1,
+            },
+            connected_addrs: Vec::new(),
+            session_exits: VecDeque::from([SessionExit::Disconnected, SessionExit::Cancelled]),
+        };
+
+        let outcome = run_client_reconnect_loop(
+            &mut driver,
+            RetryPolicy::fixed(Duration::ZERO),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, SessionExit::Cancelled));
+        assert_eq!(driver.connected_addrs, [old_addr, new_addr]);
+        assert_eq!(discovery.remaining_resolves(), 0);
+
+        let observations = discovery.observations().snapshot();
+        let fingerprints = observations
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                crate::testing::DiscoveryObservation::ResolveStarted {
+                    expected_fingerprint,
+                    ..
+                } => Some(expected_fingerprint.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fingerprints, [FINGERPRINT; 4]);
+        assert!(observations.iter().any(|entry| matches!(
+            &entry.event,
+            crate::testing::DiscoveryObservation::Failed(message)
+                if message.contains("no peer matched fingerprint")
+        )));
+    }
+
     async fn wait_for_call(counter: &AtomicUsize) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while counter.load(Ordering::SeqCst) == 0 {
@@ -2932,6 +3411,24 @@ mod lifecycle_tests {
             .expect("reconnect loop should not fail");
         assert!(matches!(outcome, SessionExit::Cancelled));
         calls
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_backoff_runs_under_virtual_time() {
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move { wait_for_retry(&cancellation, Duration::from_secs(60)).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+
+        tokio::time::advance(Duration::from_secs(59)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(task.await.unwrap());
     }
 
     #[tokio::test]
@@ -3074,6 +3571,54 @@ mod lifecycle_tests {
         assert!(inject_late_release(&mut *injector, &release, &mut keys, &mut buttons,).unwrap());
         assert!(!inject_late_release(&mut *injector, &release, &mut keys, &mut buttons,).unwrap());
         rig.assert_pressed_inputs(&[], &[]);
+    }
+
+    #[test]
+    fn server_lock_release_reclaims_client_input_and_cursor() {
+        let rig = crate::testing::ClientRig::new();
+        let mut transition = ClientTransition::new(1920, 1080);
+        assert!(matches!(
+            transition.handle(Message::SwitchScreen {
+                direction: protocol::Direction::Right,
+            }),
+            ClientOutput::Activate
+        ));
+        let mut injector = rig.injector_factory.create().unwrap();
+        injector.set_cursor_visible(false).unwrap();
+        injector
+            .inject(&Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            })
+            .unwrap();
+        injector
+            .inject(&Message::MouseButton {
+                button: 0,
+                pressed: true,
+            })
+            .unwrap();
+        let mut keys = HashSet::from([30]);
+        let mut buttons = HashSet::from([0]);
+
+        release_client_control(
+            &mut transition,
+            &mut *injector,
+            &rig.display,
+            &mut keys,
+            &mut buttons,
+        );
+
+        rig.assert_pressed_inputs(&[], &[]);
+        rig.assert_cursor_visible(true);
+        assert!(matches!(
+            transition.handle(Message::KeyEvent {
+                keycode: 31,
+                pressed: true,
+                modifiers: 0,
+            }),
+            ClientOutput::Ignore
+        ));
     }
 
     #[test]
@@ -3411,6 +3956,64 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
+    async fn held_server_key_repeats_over_the_peer_input_channel() {
+        let rig = crate::testing::ServerRig::new();
+        let mut transition = ServerTransition::new(
+            None,
+            ScreenLayout {
+                width: 2560,
+                height: 1440,
+            },
+        );
+        transition.activate_instant(protocol::Direction::Right);
+
+        let mut key_messages = Vec::new();
+        if let ServerOutput::Forward { messages } =
+            transition.poll_active_keys(vec![Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            }])
+        {
+            key_messages.extend(messages);
+        }
+        for _ in 0..300 {
+            if let ServerOutput::Forward { messages } = transition.poll_active_keys(Vec::new()) {
+                key_messages.extend(messages);
+            }
+            if key_messages.len() >= 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            key_messages.len(),
+            2,
+            "expected initial and repeat key-downs"
+        );
+
+        for _ in &key_messages {
+            rig.peer
+                .succeed_next_send(crate::testing::ServerSendOperation::Input);
+        }
+        send_server_input_messages(&rig.peer, key_messages)
+            .await
+            .unwrap();
+
+        rig.assert_outbound_peer_messages(&[
+            crate::testing::ServerPeerObservation::InputSend(ServerInputCommand::KeyChanged {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            }),
+            crate::testing::ServerPeerObservation::InputSend(ServerInputCommand::KeyChanged {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            }),
+        ]);
+    }
+
+    #[tokio::test]
     async fn server_switch_back_releases_held_keys_and_local_grab() {
         let rig = crate::testing::ServerRig::new();
         let mut capture = rig.capture.clone();
@@ -3492,6 +4095,8 @@ mod lifecycle_tests {
             let messages = transition.deactivate_for_shortcut();
             rig.peer
                 .succeed_next_send(crate::testing::ServerSendOperation::Input);
+            rig.peer
+                .succeed_next_send(crate::testing::ServerSendOperation::Control);
             notify_after_local_input_release(
                 || {
                     if layer_shell {
@@ -3500,7 +4105,12 @@ mod lifecycle_tests {
                         capture.set_grab(false).unwrap();
                     }
                 },
-                send_server_input_messages(&rig.peer, messages),
+                async {
+                    send_server_input_messages(&rig.peer, messages).await?;
+                    rig.peer
+                        .send_control(ServerControlCommand::ReleasePeerControl)
+                        .await
+                },
             )
             .await
             .unwrap();
@@ -3518,13 +4128,16 @@ mod lifecycle_tests {
                 ]
             };
             rig.assert_grab_history(&expected);
-            rig.assert_outbound_peer_messages(&[crate::testing::ServerPeerObservation::InputSend(
-                ServerInputCommand::KeyChanged {
+            rig.assert_outbound_peer_messages(&[
+                crate::testing::ServerPeerObservation::InputSend(ServerInputCommand::KeyChanged {
                     keycode: 30,
                     pressed: false,
                     modifiers: 0,
-                },
-            )]);
+                }),
+                crate::testing::ServerPeerObservation::ControlSend(
+                    ServerControlCommand::ReleasePeerControl,
+                ),
+            ]);
         }
     }
 
