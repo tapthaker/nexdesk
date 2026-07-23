@@ -56,9 +56,19 @@ pub enum LayerShellCommand {
     Shutdown,
 }
 
+/// An input event plus queue timing captured at the Wayland callback boundary.
+#[derive(Debug)]
+pub struct ReceivedLayerShellEvent {
+    pub event: LayerShellEvent,
+    pub queued_at: Instant,
+    pub last_updated_at: Instant,
+    pub coalesced_motion_events: u64,
+    pub depth_after_push: usize,
+}
+
 #[derive(Default)]
 struct LayerShellEventQueueState {
-    events: VecDeque<LayerShellEvent>,
+    events: VecDeque<ReceivedLayerShellEvent>,
     closed: bool,
 }
 
@@ -89,26 +99,47 @@ fn layer_shell_event_channel() -> (LayerShellEventSender, LayerShellEventReceive
 
 impl LayerShellEventSender {
     fn send(&self, event: LayerShellEvent) {
+        let queued_at = Instant::now();
         let mut state = self.state.lock().unwrap();
         if state.closed {
             return;
         }
 
         if let LayerShellEvent::MouseMove { dx, dy } = event {
-            if let Some(LayerShellEvent::MouseMove {
-                dx: queued_dx,
-                dy: queued_dy,
+            if let Some(ReceivedLayerShellEvent {
+                event:
+                    LayerShellEvent::MouseMove {
+                        dx: queued_dx,
+                        dy: queued_dy,
+                    },
+                last_updated_at,
+                coalesced_motion_events,
+                ..
             }) = state.events.back_mut()
             {
                 *queued_dx += dx;
                 *queued_dy += dy;
+                *last_updated_at = queued_at;
+                *coalesced_motion_events += 1;
                 return;
             }
-            state
-                .events
-                .push_back(LayerShellEvent::MouseMove { dx, dy });
+            let depth_after_push = state.events.len() + 1;
+            state.events.push_back(ReceivedLayerShellEvent {
+                event: LayerShellEvent::MouseMove { dx, dy },
+                queued_at,
+                last_updated_at: queued_at,
+                coalesced_motion_events: 1,
+                depth_after_push,
+            });
         } else {
-            state.events.push_back(event);
+            let depth_after_push = state.events.len() + 1;
+            state.events.push_back(ReceivedLayerShellEvent {
+                event,
+                queued_at,
+                last_updated_at: queued_at,
+                coalesced_motion_events: 0,
+                depth_after_push,
+            });
         }
         drop(state);
         self.notify.notify_one();
@@ -123,7 +154,7 @@ impl Drop for LayerShellEventSender {
 }
 
 impl LayerShellEventReceiver {
-    pub async fn recv(&mut self) -> Option<LayerShellEvent> {
+    pub async fn recv(&mut self) -> Option<ReceivedLayerShellEvent> {
         loop {
             let notified = self.notify.notified();
             {
@@ -1020,18 +1051,32 @@ mod tests {
 
         assert!(matches!(
             receiver.recv().await,
-            Some(LayerShellEvent::MouseMove { dx, dy }) if dx == 1.0 && dy == 1.0
+            Some(ReceivedLayerShellEvent {
+                event: LayerShellEvent::MouseMove { dx, dy },
+                coalesced_motion_events: 2,
+                depth_after_push: 1,
+                ..
+            }) if dx == 1.0 && dy == 1.0
         ));
         assert!(matches!(
             receiver.recv().await,
-            Some(LayerShellEvent::MouseButton {
-                button: 0x110,
-                pressed: true
+            Some(ReceivedLayerShellEvent {
+                event: LayerShellEvent::MouseButton {
+                    button: 0x110,
+                    pressed: true
+                },
+                depth_after_push: 2,
+                ..
             })
         ));
         assert!(matches!(
             receiver.recv().await,
-            Some(LayerShellEvent::MouseMove { dx, dy }) if dx == 2.0 && dy == 3.0
+            Some(ReceivedLayerShellEvent {
+                event: LayerShellEvent::MouseMove { dx, dy },
+                coalesced_motion_events: 1,
+                depth_after_push: 3,
+                ..
+            }) if dx == 2.0 && dy == 3.0
         ));
         assert!(receiver.recv().await.is_none());
     }

@@ -122,6 +122,65 @@ impl ClientActivationDiagnostics {
 }
 
 #[derive(Default)]
+struct ServerActivationDiagnostics {
+    captured_motion_events: u64,
+    capture_batches: u64,
+    coalesced_capture_events: u64,
+    sent_mouse_moves: u64,
+    pending_capture_events: u64,
+    max_capture_events_per_send: u64,
+    max_capture_queue_depth: usize,
+    last_capture_batch: Option<Instant>,
+    last_send: Option<Instant>,
+    capture_batch_gap: DurationHistogram,
+    capture_queue_residence: DurationHistogram,
+    capture_coalescing_span: DurationHistogram,
+    pointer_tick_lateness: DurationHistogram,
+    send_gap: DurationHistogram,
+    send_latency: DurationHistogram,
+}
+
+impl ServerActivationDiagnostics {
+    fn record_capture_batch(
+        &mut self,
+        captured_events: u64,
+        queue_depth: usize,
+        queued_at: Instant,
+        last_updated_at: Instant,
+        dequeued_at: Instant,
+    ) {
+        self.captured_motion_events += captured_events;
+        self.capture_batches += 1;
+        self.coalesced_capture_events += captured_events.saturating_sub(1);
+        self.pending_capture_events += captured_events;
+        self.max_capture_queue_depth = self.max_capture_queue_depth.max(queue_depth);
+        self.capture_queue_residence
+            .record(dequeued_at.saturating_duration_since(queued_at));
+        self.capture_coalescing_span
+            .record(last_updated_at.saturating_duration_since(queued_at));
+        if let Some(previous) = self.last_capture_batch {
+            self.capture_batch_gap
+                .record(dequeued_at.saturating_duration_since(previous));
+        }
+        self.last_capture_batch = Some(dequeued_at);
+    }
+
+    fn record_send(&mut self, started_at: Instant, elapsed: Duration) {
+        self.sent_mouse_moves += 1;
+        self.max_capture_events_per_send = self
+            .max_capture_events_per_send
+            .max(self.pending_capture_events);
+        self.pending_capture_events = 0;
+        if let Some(previous) = self.last_send {
+            self.send_gap
+                .record(started_at.saturating_duration_since(previous));
+        }
+        self.last_send = Some(started_at);
+        self.send_latency.record(elapsed);
+    }
+}
+
+#[derive(Default)]
 struct InputQueueState {
     items: VecDeque<InputQueueItem>,
     terminal_queued: bool,
@@ -341,8 +400,8 @@ fn server_session_is_locked(lock_source: &dyn LocalSessionLockSource) -> bool {
 }
 
 fn require_layer_shell_event(
-    event: Option<crate::input::wayland_layer_shell::LayerShellEvent>,
-) -> Result<crate::input::wayland_layer_shell::LayerShellEvent> {
+    event: Option<crate::input::wayland_layer_shell::ReceivedLayerShellEvent>,
+) -> Result<crate::input::wayland_layer_shell::ReceivedLayerShellEvent> {
     event.ok_or_else(|| eyre!("layer-shell capture stopped"))
 }
 
@@ -1069,7 +1128,9 @@ async fn handle_server_connection(
     .flatten();
     #[cfg(not(target_os = "linux"))]
     let layer_shell: Option<(
-        tokio::sync::mpsc::UnboundedReceiver<crate::input::wayland_layer_shell::LayerShellEvent>,
+        tokio::sync::mpsc::UnboundedReceiver<
+            crate::input::wayland_layer_shell::ReceivedLayerShellEvent,
+        >,
         tokio::sync::mpsc::UnboundedSender<crate::input::wayland_layer_shell::LayerShellCommand>,
         u32,
         u32,
@@ -1138,7 +1199,12 @@ async fn handle_server_connection(
     layer_shell_key_poll_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut pointer_send_interval = time::interval(POINTER_FRAME_INTERVAL);
     pointer_send_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut input_diagnostic_interval = time::interval(CLIENT_LATENCY_CHECK_INTERVAL);
+    input_diagnostic_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut pending_layer_shell_motion = (0.0f64, 0.0f64);
+    let mut activation_started: Option<Instant> = None;
+    let mut activation_started_unix_ms: u64 = 0;
+    let mut activation_diagnostics = ServerActivationDiagnostics::default();
     let mut debug_counter: u64 = 0;
     let mut last_screen_w = screen_w;
     let mut last_screen_h = screen_h;
@@ -1190,6 +1256,9 @@ async fn handle_server_connection(
                     ServerOutput::Activate { messages, grab } => {
                         info!("Edge detected — switching to remote");
                         pending_layer_shell_motion = (0.0, 0.0);
+                        activation_started = Some(Instant::now());
+                        activation_started_unix_ms = unix_millis();
+                        activation_diagnostics = ServerActivationDiagnostics::default();
                         capturer.lock().unwrap().set_grab(grab).ok();
                         let mut sender = input_send.lock().await;
                         for msg in messages {
@@ -1213,13 +1282,30 @@ async fn handle_server_connection(
                         let mut sender = input_send.lock().await;
                         for msg in messages {
                             if let Message::MouseMove { x, y } = msg {
+                                let captured_at = Instant::now();
+                                if activation_started.is_some() {
+                                    activation_diagnostics.record_capture_batch(
+                                        1,
+                                        1,
+                                        captured_at,
+                                        captured_at,
+                                        captured_at,
+                                    );
+                                }
                                 pending_layer_shell_motion.0 += f64::from(x);
                                 pending_layer_shell_motion.1 += f64::from(y);
                                 continue;
                             }
-                            if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
-                                send_message_uni(&mut sender, &motion).await.ok();
-                            }
+                            let diagnostics = activation_started
+                                .is_some()
+                                .then_some(&mut activation_diagnostics);
+                            send_accumulated_motion(
+                                &mut sender,
+                                &mut pending_layer_shell_motion,
+                                diagnostics,
+                            )
+                            .await
+                            .ok();
                             if let Err(e) = send_message_uni(&mut sender, &msg).await {
                                 warn!("Failed to send: {}", e);
                                 transition.deactivate();
@@ -1231,9 +1317,16 @@ async fn handle_server_connection(
                     ServerOutput::ShortcutRelease { messages } => {
                         info!("Shortcut switch back — releasing grab");
                         let mut sender = input_send.lock().await;
-                        if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
-                            send_message_uni(&mut sender, &motion).await.ok();
-                        }
+                        let diagnostics = activation_started
+                            .is_some()
+                            .then_some(&mut activation_diagnostics);
+                        send_accumulated_motion(
+                            &mut sender,
+                            &mut pending_layer_shell_motion,
+                            diagnostics,
+                        )
+                        .await
+                        .ok();
                         for msg in messages {
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
@@ -1242,9 +1335,16 @@ async fn handle_server_connection(
                     ServerOutput::ForceRelease { messages } => {
                         warn!("Safety escape (Ctrl+Alt+Escape) — releasing grab");
                         let mut sender = input_send.lock().await;
-                        if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
-                            send_message_uni(&mut sender, &motion).await.ok();
-                        }
+                        let diagnostics = activation_started
+                            .is_some()
+                            .then_some(&mut activation_diagnostics);
+                        send_accumulated_motion(
+                            &mut sender,
+                            &mut pending_layer_shell_motion,
+                            diagnostics,
+                        )
+                        .await
+                        .ok();
                         for msg in messages {
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
@@ -1283,9 +1383,16 @@ async fn handle_server_connection(
                     ServerOutput::ShortcutRelease { messages } => {
                         info!("Shortcut switch back — releasing layer-shell grab");
                         let mut sender = input_send.lock().await;
-                        if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
-                            send_message_uni(&mut sender, &motion).await.ok();
-                        }
+                        let diagnostics = activation_started
+                            .is_some()
+                            .then_some(&mut activation_diagnostics);
+                        send_accumulated_motion(
+                            &mut sender,
+                            &mut pending_layer_shell_motion,
+                            diagnostics,
+                        )
+                        .await
+                        .ok();
                         for msg in messages {
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
@@ -1299,9 +1406,16 @@ async fn handle_server_connection(
                     ServerOutput::Forward { messages } => {
                         if !messages.is_empty() {
                             let mut sender = input_send.lock().await;
-                            if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
-                                send_message_uni(&mut sender, &motion).await.ok();
-                            }
+                            let diagnostics = activation_started
+                                .is_some()
+                                .then_some(&mut activation_diagnostics);
+                            send_accumulated_motion(
+                                &mut sender,
+                                &mut pending_layer_shell_motion,
+                                diagnostics,
+                            )
+                            .await
+                            .ok();
                             for msg in messages {
                                 if let Err(e) = send_message_uni(&mut sender, &msg).await {
                                     warn!("Failed to send key event: {}", e);
@@ -1320,9 +1434,16 @@ async fn handle_server_connection(
                     ServerOutput::ForceRelease { messages } => {
                         warn!("Safety escape (Ctrl+Alt+Escape) — releasing layer-shell grab");
                         let mut sender = input_send.lock().await;
-                        if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
-                            send_message_uni(&mut sender, &motion).await.ok();
-                        }
+                        let diagnostics = activation_started
+                            .is_some()
+                            .then_some(&mut activation_diagnostics);
+                        send_accumulated_motion(
+                            &mut sender,
+                            &mut pending_layer_shell_motion,
+                            diagnostics,
+                        )
+                        .await
+                        .ok();
                         for msg in messages {
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
@@ -1338,10 +1459,20 @@ async fn handle_server_connection(
             // Send at most one accumulated pointer movement per frame. If the
             // network or peer is slow, newer deltas merge into this position
             // instead of forming an unbounded queue of stale movements.
-            _ = pointer_send_interval.tick(), if transition.is_active() => {
+            scheduled = pointer_send_interval.tick(), if transition.is_active() => {
+                if activation_started.is_some() {
+                    activation_diagnostics.pointer_tick_lateness.record(
+                        Instant::now().saturating_duration_since(scheduled),
+                    );
+                }
                 if let Some(message) = take_accumulated_motion(&mut pending_layer_shell_motion) {
                     let mut sender = input_send.lock().await;
-                    if let Err(e) = send_message_uni(&mut sender, &message).await {
+                    let send_started = Instant::now();
+                    let result = send_message_uni(&mut sender, &message).await;
+                    if activation_started.is_some() {
+                        activation_diagnostics.record_send(send_started, send_started.elapsed());
+                    }
+                    if let Err(e) = result {
                         warn!("Failed to send accumulated mouse move: {}", e);
                         transition.deactivate();
                         if use_layer_shell {
@@ -1364,19 +1495,32 @@ async fn handle_server_connection(
                     None => std::future::pending().await,
                 }
             }, if use_layer_shell => {
-                use crate::input::wayland_layer_shell::{LayerShellEvent, LayerShellCommand};
-                let event = match require_layer_shell_event(event) {
+                use crate::input::wayland_layer_shell::{
+                    LayerShellCommand, LayerShellEvent, ReceivedLayerShellEvent,
+                };
+                let received = match require_layer_shell_event(event) {
                     Ok(event) => event,
                     Err(error) => {
                         warn!("{}; ending the connection so capture can be recreated", error);
                         break;
                     }
                 };
+                let dequeued_at = Instant::now();
+                let ReceivedLayerShellEvent {
+                    event,
+                    queued_at,
+                    last_updated_at,
+                    coalesced_motion_events,
+                    depth_after_push,
+                } = received;
                 send_user_activity(peer.as_ref(), &mut last_user_activity_sent).await;
 
                 match event {
                     LayerShellEvent::EdgeEnter { direction } => {
                         pending_layer_shell_motion = (0.0, 0.0);
+                        activation_started = Some(Instant::now());
+                        activation_started_unix_ms = unix_millis();
+                        activation_diagnostics = ServerActivationDiagnostics::default();
                         let messages = transition.activate_instant(direction);
                         info!("Layer-shell edge enter ({:?}) — switching to remote", direction);
                         match capturer.lock().unwrap().set_keyboard_grab(true) {
@@ -1408,6 +1552,15 @@ async fn handle_server_connection(
                     }
                     LayerShellEvent::MouseMove { dx, dy } => {
                         if transition.is_active() {
+                            if activation_started.is_some() {
+                                activation_diagnostics.record_capture_batch(
+                                    coalesced_motion_events,
+                                    depth_after_push,
+                                    queued_at.into(),
+                                    last_updated_at.into(),
+                                    dequeued_at,
+                                );
+                            }
                             pending_layer_shell_motion.0 += dx;
                             pending_layer_shell_motion.1 += dy;
                         }
@@ -1421,9 +1574,16 @@ async fn handle_server_connection(
                             transition.update_button(btn_id, pressed);
                             let msg = Message::MouseButton { button: btn_id, pressed };
                             let mut sender = input_send.lock().await;
-                            if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
-                                send_message_uni(&mut sender, &motion).await.ok();
-                            }
+                            let diagnostics = activation_started
+                                .is_some()
+                                .then_some(&mut activation_diagnostics);
+                            send_accumulated_motion(
+                                &mut sender,
+                                &mut pending_layer_shell_motion,
+                                diagnostics,
+                            )
+                            .await
+                            .ok();
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
                     }
@@ -1437,9 +1597,16 @@ async fn handle_server_connection(
                             };
                             let msg = Message::MouseScroll { dx, dy, phase };
                             let mut sender = input_send.lock().await;
-                            if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
-                                send_message_uni(&mut sender, &motion).await.ok();
-                            }
+                            let diagnostics = activation_started
+                                .is_some()
+                                .then_some(&mut activation_diagnostics);
+                            send_accumulated_motion(
+                                &mut sender,
+                                &mut pending_layer_shell_motion,
+                                diagnostics,
+                            )
+                            .await
+                            .ok();
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
                     }
@@ -1451,9 +1618,16 @@ async fn handle_server_connection(
                                 phase: crate::net::protocol::ScrollPhase::Ended,
                             };
                             let mut sender = input_send.lock().await;
-                            if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
-                                send_message_uni(&mut sender, &motion).await.ok();
-                            }
+                            let diagnostics = activation_started
+                                .is_some()
+                                .then_some(&mut activation_diagnostics);
+                            send_accumulated_motion(
+                                &mut sender,
+                                &mut pending_layer_shell_motion,
+                                diagnostics,
+                            )
+                            .await
+                            .ok();
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
                     }
@@ -1464,9 +1638,16 @@ async fn handle_server_connection(
                                 warn!("Safety escape (Ctrl+Alt+Escape) — releasing layer-shell grab");
                                 let messages = transition.deactivate_for_shortcut();
                                 let mut sender = input_send.lock().await;
-                                if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
-                                    send_message_uni(&mut sender, &motion).await.ok();
-                                }
+                                let diagnostics = activation_started
+                                    .is_some()
+                                    .then_some(&mut activation_diagnostics);
+                                send_accumulated_motion(
+                                    &mut sender,
+                                    &mut pending_layer_shell_motion,
+                                    diagnostics,
+                                )
+                                .await
+                                .ok();
                                 for msg in messages {
                                     send_message_uni(&mut sender, &msg).await.ok();
                                 }
@@ -1477,9 +1658,16 @@ async fn handle_server_connection(
                                 info!("Shortcut switch back — releasing layer-shell grab");
                                 let messages = transition.deactivate_for_shortcut();
                                 let mut sender = input_send.lock().await;
-                                if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
-                                    send_message_uni(&mut sender, &motion).await.ok();
-                                }
+                                let diagnostics = activation_started
+                                    .is_some()
+                                    .then_some(&mut activation_diagnostics);
+                                send_accumulated_motion(
+                                    &mut sender,
+                                    &mut pending_layer_shell_motion,
+                                    diagnostics,
+                                )
+                                .await
+                                .ok();
                                 for msg in messages {
                                     send_message_uni(&mut sender, &msg).await.ok();
                                 }
@@ -1491,9 +1679,16 @@ async fn handle_server_connection(
                             } else {
                                 let msg = Message::KeyEvent { keycode, pressed, modifiers: 0 };
                                 let mut sender = input_send.lock().await;
-                                if let Some(motion) = take_accumulated_motion(&mut pending_layer_shell_motion) {
-                                    send_message_uni(&mut sender, &motion).await.ok();
-                                }
+                                let diagnostics = activation_started
+                                    .is_some()
+                                    .then_some(&mut activation_diagnostics);
+                                send_accumulated_motion(
+                                    &mut sender,
+                                    &mut pending_layer_shell_motion,
+                                    diagnostics,
+                                )
+                                .await
+                                .ok();
                                 send_message_uni(&mut sender, &msg).await.ok();
                             }
                         }
@@ -1571,6 +1766,38 @@ async fn handle_server_connection(
                         info!("Peer {} transport closed", remote);
                         break;
                     }
+                }
+            }
+            _ = input_diagnostic_interval.tick() => {
+                if activation_started.is_some_and(|started| started.elapsed() >= Duration::from_secs(10)) {
+                    let elapsed = activation_started.unwrap().elapsed();
+                    info!(
+                        "Server input diagnostics: {:.0}s summary: session_id={} activation_unix_ms={} captured_motion_events={} capture_batches={} coalesced_capture_events={} sent_mouse_moves={} pending_capture_events={} max_capture_events_per_send={} max_capture_queue_depth={} bucket_upper_bounds_us={:?} capture_batch_gap_buckets={:?} capture_batch_gap_max_us={} capture_queue_residence_buckets={:?} capture_queue_residence_max_us={} capture_coalescing_span_buckets={:?} capture_coalescing_span_max_us={} pointer_tick_lateness_buckets={:?} pointer_tick_lateness_max_us={} send_gap_buckets={:?} send_gap_max_us={} send_latency_buckets={:?} send_latency_max_us={}",
+                        elapsed.as_secs_f64(),
+                        session_id,
+                        activation_started_unix_ms,
+                        activation_diagnostics.captured_motion_events,
+                        activation_diagnostics.capture_batches,
+                        activation_diagnostics.coalesced_capture_events,
+                        activation_diagnostics.sent_mouse_moves,
+                        activation_diagnostics.pending_capture_events,
+                        activation_diagnostics.max_capture_events_per_send,
+                        activation_diagnostics.max_capture_queue_depth,
+                        INPUT_DIAGNOSTIC_BUCKET_UPPER_BOUNDS_US,
+                        activation_diagnostics.capture_batch_gap.buckets,
+                        activation_diagnostics.capture_batch_gap.max_us,
+                        activation_diagnostics.capture_queue_residence.buckets,
+                        activation_diagnostics.capture_queue_residence.max_us,
+                        activation_diagnostics.capture_coalescing_span.buckets,
+                        activation_diagnostics.capture_coalescing_span.max_us,
+                        activation_diagnostics.pointer_tick_lateness.buckets,
+                        activation_diagnostics.pointer_tick_lateness.max_us,
+                        activation_diagnostics.send_gap.buckets,
+                        activation_diagnostics.send_gap.max_us,
+                        activation_diagnostics.send_latency.buckets,
+                        activation_diagnostics.send_latency.max_us,
+                    );
+                    activation_started = None;
                 }
             }
             _ = local_lock_check.tick(), if transition.is_active() => {
@@ -2927,6 +3154,24 @@ async fn send_message_uni(send: &mut TypedServerInputGuard, msg: &Message) -> Re
     send_server_input_messages(send.peer.as_ref(), [msg.clone()]).await
 }
 
+async fn send_accumulated_motion(
+    send: &mut TypedServerInputGuard,
+    pending: &mut (f64, f64),
+    diagnostics: Option<&mut ServerActivationDiagnostics>,
+) -> Result<bool> {
+    let Some(message) = take_accumulated_motion(pending) else {
+        return Ok(false);
+    };
+
+    let started_at = Instant::now();
+    let result = send_message_uni(send, &message).await;
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.record_send(started_at, started_at.elapsed());
+    }
+    result?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod input_coalescing_tests {
     use super::*;
@@ -3013,6 +3258,31 @@ mod input_coalescing_tests {
 
         assert_eq!(histogram.buckets, [1; 8]);
         assert_eq!(histogram.max_us, 64_000);
+    }
+
+    #[test]
+    fn server_diagnostics_track_capture_coalescing_and_send_latency() {
+        let started = Instant::now();
+        let mut diagnostics = ServerActivationDiagnostics::default();
+        diagnostics.record_capture_batch(
+            3,
+            4,
+            started,
+            started + Duration::from_millis(2),
+            started + Duration::from_millis(5),
+        );
+        diagnostics.record_send(started + Duration::from_millis(6), Duration::from_millis(3));
+
+        assert_eq!(diagnostics.captured_motion_events, 3);
+        assert_eq!(diagnostics.capture_batches, 1);
+        assert_eq!(diagnostics.coalesced_capture_events, 2);
+        assert_eq!(diagnostics.sent_mouse_moves, 1);
+        assert_eq!(diagnostics.pending_capture_events, 0);
+        assert_eq!(diagnostics.max_capture_events_per_send, 3);
+        assert_eq!(diagnostics.max_capture_queue_depth, 4);
+        assert_eq!(diagnostics.capture_queue_residence.max_us, 5_000);
+        assert_eq!(diagnostics.capture_coalescing_span.max_us, 2_000);
+        assert_eq!(diagnostics.send_latency.max_us, 3_000);
     }
 
     #[test]

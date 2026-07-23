@@ -43,6 +43,15 @@ pub mod wayland_layer_shell {
     }
 
     #[derive(Debug)]
+    pub struct ReceivedLayerShellEvent {
+        pub event: LayerShellEvent,
+        pub queued_at: std::time::Instant,
+        pub last_updated_at: std::time::Instant,
+        pub coalesced_motion_events: u64,
+        pub depth_after_push: usize,
+    }
+
+    #[derive(Debug)]
     pub enum LayerShellCommand {
         Release,
         Shutdown,
