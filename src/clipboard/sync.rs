@@ -315,17 +315,42 @@ pub(super) fn read_clipboard() -> Result<String> {
 }
 
 #[cfg(target_os = "linux")]
+fn write_linux_selection_with_runner(
+    runner: &dyn crate::ports::CommandRunner,
+    text: &str,
+    primary: bool,
+) -> Result<()> {
+    let (wl_args, xclip_selection): (&[&str], &str) = if primary {
+        (&["--primary"], "primary")
+    } else {
+        (&[], "clipboard")
+    };
+
+    // wl-copy and xclip may fork a long-lived clipboard owner. Capturing
+    // output here would leave the runner waiting forever for EOF on descriptors
+    // inherited by that owner after the short-lived parent exits.
+    if write_text_with_runner_options(runner, "wl-copy", wl_args, text, true).is_ok() {
+        return Ok(());
+    }
+    write_text_with_runner_options(
+        runner,
+        "xclip",
+        &["-selection", xclip_selection],
+        text,
+        true,
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn write_linux_clipboard_with_runner(
     runner: &dyn crate::ports::CommandRunner,
     text: &str,
 ) -> Result<()> {
-    // wl-copy and xclip may fork a long-lived clipboard owner. Capturing
-    // output here would leave the runner waiting forever for EOF on descriptors
-    // inherited by that owner after the short-lived parent exits.
-    if write_text_with_runner_options(runner, "wl-copy", &[], text, true).is_ok() {
-        return Ok(());
+    write_linux_selection_with_runner(runner, text, false)?;
+    if let Err(error) = write_linux_selection_with_runner(runner, text, true) {
+        warn!("Failed to mirror clipboard into primary selection: {error}");
     }
-    write_text_with_runner_options(runner, "xclip", &["-selection", "clipboard"], text, true)
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -609,6 +634,51 @@ mod tests {
         assert!(requests[0].args.is_empty());
         assert_eq!(requests[1].program, "wl-copy");
         assert_eq!(requests[1].args, ["--primary"]);
+        assert!(requests
+            .iter()
+            .all(|request| request.stdin == b"from peer" && request.discard_output));
+        assert_eq!(runner.remaining_actions(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_clipboard_write_falls_back_to_both_x11_selections() {
+        use crate::ports::CommandOutput;
+        use crate::testing::{CommandObservation, ScriptedCommandRunner};
+
+        let runner = ScriptedCommandRunner::new();
+        for success in [false, true, false, true] {
+            runner.push_output(CommandOutput {
+                success,
+                code: Some(if success { 0 } else { 1 }),
+                signal: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            });
+        }
+
+        write_linux_clipboard_with_runner(&runner, "from peer").unwrap();
+
+        let requests = runner
+            .observations()
+            .snapshot()
+            .into_iter()
+            .filter_map(|entry| match entry.event {
+                CommandObservation::Run(request) => Some(request),
+                CommandObservation::Failed(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].program, "wl-copy");
+        assert!(requests[0].args.is_empty());
+        assert_eq!(requests[1].program, "xclip");
+        assert_eq!(requests[1].args, ["-selection", "clipboard"]);
+        assert_eq!(requests[2].program, "wl-copy");
+        assert_eq!(requests[2].args, ["--primary"]);
+        assert_eq!(requests[3].program, "xclip");
+        assert_eq!(requests[3].args, ["-selection", "primary"]);
         assert!(requests
             .iter()
             .all(|request| request.stdin == b"from peer" && request.discard_output));
