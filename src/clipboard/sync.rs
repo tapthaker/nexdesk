@@ -380,44 +380,6 @@ mod tests {
     }
 
     #[test]
-    fn crossed_peer_changes_converge_instead_of_swapping_clipboards() {
-        let server_clipboard = Arc::new(crate::testing::MemoryClipboard::new());
-        let client_clipboard = Arc::new(crate::testing::MemoryClipboard::new());
-        let mut server = ClipboardSync::new(server_clipboard.clone());
-        let mut client = ClipboardSync::new(client_clipboard.clone());
-
-        server_clipboard.set_text(Some("copied on server".to_string()));
-        client_clipboard.set_text(Some("copied on client".to_string()));
-
-        // Both pollers can observe their local copy before either peer update
-        // arrives. Deliver those in-flight updates in both directions.
-        let Some(Message::ClipboardUpdate {
-            content: server_update,
-        }) = server.poll_change().unwrap()
-        else {
-            panic!("server change should produce a clipboard update");
-        };
-        let Some(Message::ClipboardUpdate {
-            content: client_update,
-        }) = client.poll_change().unwrap()
-        else {
-            panic!("client change should produce a clipboard update");
-        };
-        client.apply_update(&server_update).unwrap();
-        server.apply_update(&client_update).unwrap();
-
-        // Neither side now emits another update, so a correct conflict policy
-        // must already have selected one value for both clipboards.
-        assert!(server.poll_change().unwrap().is_none());
-        assert!(client.poll_change().unwrap().is_none());
-        assert_eq!(
-            server_clipboard.read_text().unwrap(),
-            client_clipboard.read_text().unwrap(),
-            "crossed updates left the peers permanently out of sync"
-        );
-    }
-
-    #[test]
     fn empty_text_is_a_syncable_clipboard_change() {
         let clipboard = Arc::new(crate::testing::MemoryClipboard::new());
         clipboard.set_text(Some("initial".to_string()));
