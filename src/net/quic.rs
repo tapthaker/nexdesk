@@ -52,6 +52,10 @@ const LOCAL_LOCK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const CLIENT_LATENCY_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const CLIENT_LATENCY_RESTART_THRESHOLD: Duration = Duration::from_secs(3);
 const CLIENT_LATENCY_RESTART_STRIKES: u8 = 3;
+/// A wall-clock gap this large between watchdog checks usually means that the
+/// process was suspended for system sleep. This is diagnostic only and does
+/// not alter connection recovery behavior.
+const CLIENT_DIAGNOSTIC_TIMER_GAP_THRESHOLD_MS: u64 = 5_000;
 
 #[derive(Debug)]
 enum InputQueueItem {
@@ -551,6 +555,11 @@ fn system_time_millis_u64(time: std::time::SystemTime) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn diagnostic_timer_gap_ms(previous_unix_ms: u64, current_unix_ms: u64) -> Option<u64> {
+    let gap_ms = current_unix_ms.saturating_sub(previous_unix_ms);
+    (gap_ms >= CLIENT_DIAGNOSTIC_TIMER_GAP_THRESHOLD_MS).then_some(gap_ms)
+}
+
 fn validated_peer_screen(screen: PeerScreen) -> Option<ScreenLayout> {
     (screen.width > 0 && screen.height > 0).then_some(ScreenLayout {
         width: screen.width,
@@ -755,7 +764,14 @@ async fn serve_with_dependencies(
             }
         };
         let remote = connection.remote_address();
+        let session_id = connection.stable_id();
         info!("New connection from {}", remote);
+        info!(
+            "Transport diagnostics: side=server event=connection_accepted unix_ms={} session_id={} peer={}",
+            unix_millis(),
+            session_id,
+            remote
+        );
 
         let edge = trigger_edge;
         let otp = otp.clone();
@@ -764,6 +780,7 @@ async fn serve_with_dependencies(
         let lock_source = lock_source.clone();
         let display_control = display_control.clone();
         tokio::spawn(async move {
+            let diagnostic_connection = connection.clone();
             if let Err(e) = handle_server_connection(
                 connection,
                 edge,
@@ -776,6 +793,14 @@ async fn serve_with_dependencies(
             .await
             {
                 error!("Connection from {} error: {}", remote, e);
+                error!(
+                    "Transport diagnostics: side=server event=session_error unix_ms={} session_id={} peer={} quic_close_reason={:?} error={}",
+                    unix_millis(),
+                    session_id,
+                    remote,
+                    diagnostic_connection.close_reason(),
+                    e
+                );
             }
         });
     }
@@ -793,6 +818,8 @@ async fn handle_server_connection(
     display_control: Arc<dyn DisplaySessionControl>,
 ) -> Result<()> {
     let remote = connection.remote_address();
+    let session_id = connection.stable_id();
+    let session_started = Instant::now();
 
     // Create input capturer
     let (capturer, (screen_w, screen_h)) = create_server_capturer(capture_factory)?;
@@ -867,6 +894,14 @@ async fn handle_server_connection(
     let peer: Arc<dyn ServerPeerLink> =
         Arc::new(QuinnServerPeerLink::open(&connection, control_send, control_recv).await?);
     info!("Typed server channels opened");
+    info!(
+        "Transport diagnostics: side=server event=session_ready unix_ms={} session_id={} peer={} handshake_ms={} quic_rtt_ms={}",
+        unix_millis(),
+        session_id,
+        remote,
+        session_started.elapsed().as_millis(),
+        connection.rtt().as_millis()
+    );
     let input_send = TypedServerInputSender { peer: peer.clone() };
     let mut connection_tasks = tokio::task::JoinSet::new();
 
@@ -1367,6 +1402,14 @@ async fn handle_server_connection(
             event = peer.next_event() => {
                 match event {
                     Some(ServerTransportEvent::Control(ServerControlEvent::Heartbeat { timestamp })) => {
+                        debug!(
+                            "Transport diagnostics: side=server event=heartbeat_received unix_ms={} session_id={} peer={} ping_unix_ms={} quic_rtt_ms={}",
+                            unix_millis(),
+                            session_id,
+                            remote,
+                            timestamp,
+                            connection.rtt().as_millis()
+                        );
                         peer.send_control(ServerControlCommand::AcknowledgeHeartbeat { timestamp }).await?;
                     }
                     Some(ServerTransportEvent::Control(ServerControlEvent::SwitchBackRequested { direction })) => {
@@ -1482,6 +1525,15 @@ async fn handle_server_connection(
     }
 
     // Always release grab when connection ends (client crash, disconnect, etc.)
+    info!(
+        "Transport diagnostics: side=server event=session_end unix_ms={} session_id={} peer={} session_ms={} quic_rtt_ms={} quic_close_reason={:?}",
+        unix_millis(),
+        session_id,
+        remote,
+        session_started.elapsed().as_millis(),
+        connection.rtt().as_millis(),
+        connection.close_reason()
+    );
     info!("Connection ended, releasing input grab");
     let mut runtime = RuntimeStatus::new("server", "listening");
     runtime.peer_addr = Some(format!("last disconnected: {}", remote));
@@ -1588,9 +1640,12 @@ impl ClientReconnectDriver for ProductionClientDriver {
     }
 
     async fn run_session(&mut self, connected: Self::Connected) -> Result<SessionExit> {
-        run_client_session(
+        let session_id = connected.connection.stable_id();
+        let addr = connected.addr;
+        let diagnostic_connection = connected.connection.clone();
+        let result = run_client_session(
             connected.connection,
-            connected.addr,
+            addr,
             self.injector_factory.as_ref(),
             self.display_control.as_ref(),
             self.trust_store.as_ref(),
@@ -1600,7 +1655,18 @@ impl ClientReconnectDriver for ProductionClientDriver {
             self.clipboard.clone(),
             self.status_sink.as_ref(),
         )
-        .await
+        .await;
+        if let Err(error) = &result {
+            warn!(
+                "Transport diagnostics: side=client event=session_error unix_ms={} session_id={} peer={} quic_close_reason={:?} error={}",
+                unix_millis(),
+                session_id,
+                addr,
+                diagnostic_connection.close_reason(),
+                error
+            );
+        }
+        result
     }
 
     fn record_disconnected(&mut self, addr: SocketAddr) {
@@ -1768,6 +1834,16 @@ async fn run_client_session(
     clipboard_port: Arc<dyn Clipboard>,
     status_sink: &dyn StatusSink,
 ) -> Result<SessionExit> {
+    let session_id = connection.stable_id();
+    let session_started = Instant::now();
+    info!(
+        "Transport diagnostics: side=client event=session_start unix_ms={} session_id={} peer={} quic_rtt_ms={}",
+        unix_millis(),
+        session_id,
+        addr,
+        connection.rtt().as_millis()
+    );
+
     let tls_fingerprint = tls::peer_fingerprint(&connection)
         .ok_or_else(|| eyre!("Server did not present a certificate"))?;
 
@@ -1910,6 +1986,14 @@ async fn run_client_session(
     let peer: Arc<dyn ClientPeerLink> =
         Arc::new(QuinnClientPeerLink::open(&connection, control_send, control_recv).await?);
     info!("Typed control, input, and clipboard channels accepted");
+    info!(
+        "Transport diagnostics: side=client event=session_ready unix_ms={} session_id={} peer={} handshake_ms={} quic_rtt_ms={}",
+        unix_millis(),
+        session_id,
+        addr,
+        session_started.elapsed().as_millis(),
+        connection.rtt().as_millis()
+    );
 
     // Shutdown signal for background tasks
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
@@ -2050,6 +2134,9 @@ async fn run_client_session(
     let mut pointer_injection_interval = time::interval(POINTER_FRAME_INTERVAL);
     pointer_injection_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut latency_watchdog = ClientLatencyWatchdog::default();
+    let mut last_latency_check_unix_ms = unix_millis();
+    let mut last_heartbeat_ack_unix_ms: Option<u64> = None;
+    let mut diagnostic_timer_gap_active = false;
     let mut restart_for_latency = false;
     let mut injected_keys: HashSet<u32> = HashSet::new();
     let mut injected_buttons: HashSet<u8> = HashSet::new();
@@ -2204,7 +2291,22 @@ async fn run_client_session(
                     Some(ClientTransportEvent::Control(
                         ClientControlEvent::HeartbeatAcknowledged { timestamp },
                     )) => {
+                        let acknowledged_unix_ms = unix_millis();
                         if let Some(rtt) = latency_watchdog.acknowledge(timestamp, Instant::now()) {
+                            last_heartbeat_ack_unix_ms = Some(acknowledged_unix_ms);
+                            if diagnostic_timer_gap_active {
+                                info!(
+                                    "Transport diagnostics: side=client event=post_gap_heartbeat_ack unix_ms={} session_id={} peer={} ping_unix_ms={} wall_rtt_ms={} watchdog_rtt_ms={} quic_rtt_ms={}",
+                                    acknowledged_unix_ms,
+                                    session_id,
+                                    addr,
+                                    timestamp,
+                                    acknowledged_unix_ms.saturating_sub(timestamp),
+                                    rtt.as_millis(),
+                                    connection.rtt().as_millis()
+                                );
+                                diagnostic_timer_gap_active = false;
+                            }
                             if rtt > CLIENT_LATENCY_RESTART_THRESHOLD {
                                 warn!(
                                     "Client latency watchdog: RTT {:.0}ms (strike {}/{})",
@@ -2264,6 +2366,33 @@ async fn run_client_session(
                 }
             }
             _ = latency_check.tick() => {
+                let check_unix_ms = unix_millis();
+                if let Some(gap_ms) =
+                    diagnostic_timer_gap_ms(last_latency_check_unix_ms, check_unix_ms)
+                {
+                    diagnostic_timer_gap_active = true;
+                    let pending_ping_unix_ms = latency_watchdog
+                        .pending
+                        .map(|(timestamp, _)| timestamp);
+                    let pending_ping_age_ms = pending_ping_unix_ms
+                        .map(|timestamp| check_unix_ms.saturating_sub(timestamp));
+                    let last_ack_age_ms = last_heartbeat_ack_unix_ms
+                        .map(|timestamp| check_unix_ms.saturating_sub(timestamp));
+                    warn!(
+                        "Transport diagnostics: side=client event=timer_gap unix_ms={} session_id={} peer={} gap_ms={} pending_ping_unix_ms={:?} pending_ping_age_ms={:?} last_ack_age_ms={:?} quic_rtt_ms={} quic_close_reason={:?}",
+                        check_unix_ms,
+                        session_id,
+                        addr,
+                        gap_ms,
+                        pending_ping_unix_ms,
+                        pending_ping_age_ms,
+                        last_ack_age_ms,
+                        connection.rtt().as_millis(),
+                        connection.close_reason()
+                    );
+                }
+                last_latency_check_unix_ms = check_unix_ms;
+
                 if activation_started.is_some_and(|started| started.elapsed() >= Duration::from_secs(10)) {
                     let elapsed = activation_started.unwrap().elapsed();
                     info!(
@@ -2276,12 +2405,28 @@ async fn run_client_session(
                     activation_started = None;
                 }
 
+                let expired_ping_unix_ms = latency_watchdog
+                    .pending
+                    .map(|(timestamp, _)| timestamp);
                 if let Some(elapsed) = latency_watchdog.expire_pending(Instant::now()) {
                     warn!(
                         "Client latency watchdog: heartbeat pending for {:.0}ms (strike {}/{})",
                         elapsed.as_secs_f64() * 1000.0,
                         latency_watchdog.strikes,
                         CLIENT_LATENCY_RESTART_STRIKES
+                    );
+                    warn!(
+                        "Transport diagnostics: side=client event=heartbeat_timeout unix_ms={} session_id={} peer={} ping_unix_ms={:?} wall_pending_ms={:?} watchdog_pending_ms={} strike={} quic_rtt_ms={} quic_close_reason={:?}",
+                        check_unix_ms,
+                        session_id,
+                        addr,
+                        expired_ping_unix_ms,
+                        expired_ping_unix_ms
+                            .map(|timestamp| check_unix_ms.saturating_sub(timestamp)),
+                        elapsed.as_millis(),
+                        latency_watchdog.strikes,
+                        connection.rtt().as_millis(),
+                        connection.close_reason()
                     );
                 }
 
@@ -2293,11 +2438,29 @@ async fn run_client_session(
 
                 if latency_watchdog.needs_ping() {
                     let timestamp = unix_millis();
+                    if diagnostic_timer_gap_active {
+                        info!(
+                            "Transport diagnostics: side=client event=post_gap_heartbeat_send unix_ms={} session_id={} peer={} quic_rtt_ms={} quic_close_reason={:?}",
+                            timestamp,
+                            session_id,
+                            addr,
+                            connection.rtt().as_millis(),
+                            connection.close_reason()
+                        );
+                    }
                     if let Err(error) = peer
                         .send_control(ClientControlCommand::Heartbeat { timestamp })
                         .await
                     {
                         warn!("Client latency watchdog failed to send heartbeat: {}", error);
+                        warn!(
+                            "Transport diagnostics: side=client event=heartbeat_send_failed unix_ms={} session_id={} peer={} quic_close_reason={:?} error={}",
+                            unix_millis(),
+                            session_id,
+                            addr,
+                            connection.close_reason(),
+                            error
+                        );
                         break;
                     }
                     latency_watchdog.record_ping(timestamp, Instant::now());
@@ -2325,6 +2488,20 @@ async fn run_client_session(
             }
         }
     }
+
+    let session_end_unix_ms = unix_millis();
+    info!(
+        "Transport diagnostics: side=client event=session_end unix_ms={} session_id={} peer={} session_ms={} latency_restart={} last_ack_age_ms={:?} quic_rtt_ms={} quic_close_reason={:?}",
+        session_end_unix_ms,
+        session_id,
+        addr,
+        session_started.elapsed().as_millis(),
+        restart_for_latency,
+        last_heartbeat_ack_unix_ms
+            .map(|timestamp| session_end_unix_ms.saturating_sub(timestamp)),
+        connection.rtt().as_millis(),
+        connection.close_reason()
+    );
 
     // Release any synthetic input that may still be down if the stream ended
     // before key-up/button-up events were processed (for example during display sleep).
@@ -3684,6 +3861,14 @@ mod lifecycle_tests {
             ),
             u64::MAX
         );
+    }
+
+    #[test]
+    fn diagnostic_timer_gap_only_reports_wake_sized_wall_clock_gaps() {
+        assert_eq!(diagnostic_timer_gap_ms(10_000, 14_999), None);
+        assert_eq!(diagnostic_timer_gap_ms(10_000, 15_000), Some(5_000));
+        assert_eq!(diagnostic_timer_gap_ms(10_000, 70_000), Some(60_000));
+        assert_eq!(diagnostic_timer_gap_ms(10_000, 9_000), None);
     }
 
     #[test]
