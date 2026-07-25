@@ -401,181 +401,172 @@ impl WaylandCapturer {
         let sw = self.screen_width as f64;
         let sh = self.screen_height as f64;
 
+        // One fetch per pointer per poll bounds work even when a high-rate
+        // device continuously replenishes its kernel queue.
         for pdev in &mut self.devices {
-            loop {
-                match pdev.device.fetch_events() {
-                    Ok(events) => {
-                        let mut got_any = false;
-                        for event in events {
-                            got_any = true;
-                            match event.kind() {
-                                InputEventKind::RelAxis(axis) => {
-                                    let val = event.value();
-                                    match axis {
-                                        RelativeAxisType::REL_X => {
-                                            self.cursor_x += val;
-                                        }
-                                        RelativeAxisType::REL_Y => {
-                                            self.cursor_y += val;
-                                        }
-                                        RelativeAxisType::REL_WHEEL => {
-                                            // Vertical scroll: positive = up
-                                            self.scroll_acc_y += val as f64 * Self::WHEEL_PIXELS;
-                                        }
-                                        RelativeAxisType::REL_HWHEEL => {
-                                            // Horizontal scroll: positive = right
-                                            self.scroll_acc_x += val as f64 * Self::WHEEL_PIXELS;
-                                        }
-                                        _ => {}
+            match pdev.device.fetch_events() {
+                Ok(events) => {
+                    for event in events {
+                        match event.kind() {
+                            InputEventKind::RelAxis(axis) => {
+                                let val = event.value();
+                                match axis {
+                                    RelativeAxisType::REL_X => {
+                                        self.cursor_x += val;
                                     }
-                                }
-                                InputEventKind::AbsAxis(axis) => {
-                                    if let PointerKind::Absolute {
-                                        abs_x_range,
-                                        abs_y_range,
-                                    } = &pdev.kind
-                                    {
-                                        // Only track movement while finger is touching
-                                        if !pdev.touching {
-                                            continue;
-                                        }
-                                        let val = event.value();
-
-                                        if pdev.finger_count >= 2 {
-                                            // Two-finger scroll mode: ABS deltas → scroll
-                                            match axis {
-                                                AbsoluteAxisType::ABS_X => {
-                                                    if let Some(prev) = pdev.last_abs_x {
-                                                        let delta = (val - prev) as f64
-                                                            / abs_x_range
-                                                            * sw
-                                                            * Self::TOUCHPAD_SCROLL_SPEED;
-                                                        self.scroll_acc_x += delta;
-                                                    }
-                                                    pdev.last_abs_x = Some(val);
-                                                }
-                                                AbsoluteAxisType::ABS_Y => {
-                                                    if let Some(prev) = pdev.last_abs_y {
-                                                        let delta = (val - prev) as f64
-                                                            / abs_y_range
-                                                            * sh
-                                                            * Self::TOUCHPAD_SCROLL_SPEED;
-                                                        // Negate: finger moving down → content scrolls up (natural scrolling)
-                                                        self.scroll_acc_y -= delta;
-                                                    }
-                                                    pdev.last_abs_y = Some(val);
-                                                }
-                                                _ => {}
-                                            }
-                                        } else {
-                                            // Single-finger cursor movement
-                                            match axis {
-                                                AbsoluteAxisType::ABS_X => {
-                                                    if let Some(prev) = pdev.last_abs_x {
-                                                        let delta = (val - prev) as f64
-                                                            / abs_x_range
-                                                            * sw
-                                                            * Self::TOUCHPAD_SPEED;
-                                                        self.cursor_x += delta as i32;
-                                                    }
-                                                    pdev.last_abs_x = Some(val);
-                                                }
-                                                AbsoluteAxisType::ABS_Y => {
-                                                    if let Some(prev) = pdev.last_abs_y {
-                                                        let delta = (val - prev) as f64
-                                                            / abs_y_range
-                                                            * sh
-                                                            * Self::TOUCHPAD_SPEED;
-                                                        self.cursor_y += delta as i32;
-                                                    }
-                                                    pdev.last_abs_y = Some(val);
-                                                }
-                                                _ => {}
-                                            }
-                                        }
+                                    RelativeAxisType::REL_Y => {
+                                        self.cursor_y += val;
                                     }
-                                }
-                                InputEventKind::Key(key) => {
-                                    let code = key.code() as u32;
-                                    let pressed = event.value() != 0;
-
-                                    match key {
-                                        Key::BTN_TOUCH => {
-                                            // Finger down/up on touchpad — reset tracking
-                                            pdev.touching = pressed;
-                                            if !pressed {
-                                                pdev.last_abs_x = None;
-                                                pdev.last_abs_y = None;
-                                                pdev.finger_count = 0;
-                                            }
-                                        }
-                                        Key::BTN_TOOL_FINGER => {
-                                            // Single finger on pad
-                                            if pressed {
-                                                pdev.finger_count = 1;
-                                            }
-                                        }
-                                        Key::BTN_TOOL_DOUBLETAP => {
-                                            // Two fingers on pad — switch to scroll mode
-                                            if pressed {
-                                                pdev.finger_count = 2;
-                                            } else if pdev.finger_count == 2 {
-                                                pdev.finger_count = 1;
-                                            }
-                                            // Reset position tracking to avoid jump
-                                            pdev.last_abs_x = None;
-                                            pdev.last_abs_y = None;
-                                        }
-                                        Key::BTN_TOOL_TRIPLETAP => {
-                                            if pressed {
-                                                pdev.finger_count = 3;
-                                            } else if pdev.finger_count == 3 {
-                                                pdev.finger_count = 1;
-                                            }
-                                            pdev.last_abs_x = None;
-                                            pdev.last_abs_y = None;
-                                        }
-                                        Key::BTN_LEFT => {
-                                            if pressed {
-                                                self.buttons |= 1;
-                                            } else {
-                                                self.buttons &= !1;
-                                            }
-                                        }
-                                        Key::BTN_RIGHT => {
-                                            if pressed {
-                                                self.buttons |= 2;
-                                            } else {
-                                                self.buttons &= !2;
-                                            }
-                                        }
-                                        Key::BTN_MIDDLE => {
-                                            if pressed {
-                                                self.buttons |= 4;
-                                            } else {
-                                                self.buttons &= !4;
-                                            }
-                                        }
-                                        _ => {
-                                            record_key_event(
-                                                &mut self.pressed_keys,
-                                                &mut self.pending_key_events,
-                                                code,
-                                                event.value(),
-                                            );
-                                        }
+                                    RelativeAxisType::REL_WHEEL => {
+                                        // Vertical scroll: positive = up
+                                        self.scroll_acc_y += val as f64 * Self::WHEEL_PIXELS;
                                     }
+                                    RelativeAxisType::REL_HWHEEL => {
+                                        // Horizontal scroll: positive = right
+                                        self.scroll_acc_x += val as f64 * Self::WHEEL_PIXELS;
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
-                        }
-                        if !got_any {
-                            break;
+                            InputEventKind::AbsAxis(axis) => {
+                                if let PointerKind::Absolute {
+                                    abs_x_range,
+                                    abs_y_range,
+                                } = &pdev.kind
+                                {
+                                    // Only track movement while finger is touching
+                                    if !pdev.touching {
+                                        continue;
+                                    }
+                                    let val = event.value();
+
+                                    if pdev.finger_count >= 2 {
+                                        // Two-finger scroll mode: ABS deltas → scroll
+                                        match axis {
+                                            AbsoluteAxisType::ABS_X => {
+                                                if let Some(prev) = pdev.last_abs_x {
+                                                    let delta = (val - prev) as f64 / abs_x_range
+                                                        * sw
+                                                        * Self::TOUCHPAD_SCROLL_SPEED;
+                                                    self.scroll_acc_x += delta;
+                                                }
+                                                pdev.last_abs_x = Some(val);
+                                            }
+                                            AbsoluteAxisType::ABS_Y => {
+                                                if let Some(prev) = pdev.last_abs_y {
+                                                    let delta = (val - prev) as f64 / abs_y_range
+                                                        * sh
+                                                        * Self::TOUCHPAD_SCROLL_SPEED;
+                                                    // Negate: finger moving down → content scrolls up (natural scrolling)
+                                                    self.scroll_acc_y -= delta;
+                                                }
+                                                pdev.last_abs_y = Some(val);
+                                            }
+                                            _ => {}
+                                        }
+                                    } else {
+                                        // Single-finger cursor movement
+                                        match axis {
+                                            AbsoluteAxisType::ABS_X => {
+                                                if let Some(prev) = pdev.last_abs_x {
+                                                    let delta = (val - prev) as f64 / abs_x_range
+                                                        * sw
+                                                        * Self::TOUCHPAD_SPEED;
+                                                    self.cursor_x += delta as i32;
+                                                }
+                                                pdev.last_abs_x = Some(val);
+                                            }
+                                            AbsoluteAxisType::ABS_Y => {
+                                                if let Some(prev) = pdev.last_abs_y {
+                                                    let delta = (val - prev) as f64 / abs_y_range
+                                                        * sh
+                                                        * Self::TOUCHPAD_SPEED;
+                                                    self.cursor_y += delta as i32;
+                                                }
+                                                pdev.last_abs_y = Some(val);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                            InputEventKind::Key(key) => {
+                                let code = key.code() as u32;
+                                let pressed = event.value() != 0;
+
+                                match key {
+                                    Key::BTN_TOUCH => {
+                                        // Finger down/up on touchpad — reset tracking
+                                        pdev.touching = pressed;
+                                        if !pressed {
+                                            pdev.last_abs_x = None;
+                                            pdev.last_abs_y = None;
+                                            pdev.finger_count = 0;
+                                        }
+                                    }
+                                    Key::BTN_TOOL_FINGER => {
+                                        // Single finger on pad
+                                        if pressed {
+                                            pdev.finger_count = 1;
+                                        }
+                                    }
+                                    Key::BTN_TOOL_DOUBLETAP => {
+                                        // Two fingers on pad — switch to scroll mode
+                                        if pressed {
+                                            pdev.finger_count = 2;
+                                        } else if pdev.finger_count == 2 {
+                                            pdev.finger_count = 1;
+                                        }
+                                        // Reset position tracking to avoid jump
+                                        pdev.last_abs_x = None;
+                                        pdev.last_abs_y = None;
+                                    }
+                                    Key::BTN_TOOL_TRIPLETAP => {
+                                        if pressed {
+                                            pdev.finger_count = 3;
+                                        } else if pdev.finger_count == 3 {
+                                            pdev.finger_count = 1;
+                                        }
+                                        pdev.last_abs_x = None;
+                                        pdev.last_abs_y = None;
+                                    }
+                                    Key::BTN_LEFT => {
+                                        if pressed {
+                                            self.buttons |= 1;
+                                        } else {
+                                            self.buttons &= !1;
+                                        }
+                                    }
+                                    Key::BTN_RIGHT => {
+                                        if pressed {
+                                            self.buttons |= 2;
+                                        } else {
+                                            self.buttons &= !2;
+                                        }
+                                    }
+                                    Key::BTN_MIDDLE => {
+                                        if pressed {
+                                            self.buttons |= 4;
+                                        } else {
+                                            self.buttons &= !4;
+                                        }
+                                    }
+                                    _ => {
+                                        record_key_event(
+                                            &mut self.pressed_keys,
+                                            &mut self.pending_key_events,
+                                            code,
+                                            event.value(),
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => warn!("Failed to read pointer events: {}", error),
             }
         }
 
