@@ -53,6 +53,9 @@ const USER_ACTIVITY_INTERVAL: Duration = Duration::from_secs(20);
 const LOCAL_LOCK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const SCREEN_SIZE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const SERVER_BLOCKING_PROBE_WARN_THRESHOLD: Duration = Duration::from_millis(10);
+const SERVER_INPUT_QUEUE_CAPACITY: usize = 256;
+const SERVER_INPUT_SEND_TIMEOUT: Duration = Duration::from_millis(250);
+const SERVER_INPUT_SLOW_PATH_THRESHOLD: Duration = Duration::from_millis(10);
 const CLIENT_LATENCY_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const CLIENT_LATENCY_RESTART_THRESHOLD: Duration = Duration::from_secs(3);
 const CLIENT_LATENCY_RESTART_STRIKES: u8 = 3;
@@ -699,21 +702,218 @@ async fn send_server_input_messages(
     Ok(())
 }
 
+struct QueuedServerInput {
+    command: ServerInputCommand,
+    queued_at: Instant,
+    depth_after_push: usize,
+    coalesced_moves: u64,
+}
+
+enum ServerInputQueueItem {
+    Command(QueuedServerInput),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+#[derive(Default)]
+struct ServerInputQueueState {
+    items: VecDeque<ServerInputQueueItem>,
+    closed: bool,
+    failure: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct ServerInputQueue {
+    state: Arc<StdMutex<ServerInputQueueState>>,
+    notify: Arc<Notify>,
+}
+
+impl ServerInputQueue {
+    fn push(&self, command: ServerInputCommand) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(error) = &state.failure {
+            return Err(eyre!("Input sender failed: {}", error));
+        }
+        if state.closed {
+            return Err(eyre!("Input sender is closed"));
+        }
+
+        if let ServerInputCommand::MouseMoved { x, y } = command {
+            if let Some(ServerInputQueueItem::Command(QueuedServerInput {
+                command:
+                    ServerInputCommand::MouseMoved {
+                        x: pending_x,
+                        y: pending_y,
+                    },
+                coalesced_moves,
+                ..
+            })) = state.items.back_mut()
+            {
+                *pending_x = pending_x.saturating_add(x);
+                *pending_y = pending_y.saturating_add(y);
+                *coalesced_moves += 1;
+                return Ok(());
+            }
+            return self.push_locked(&mut state, ServerInputCommand::MouseMoved { x, y });
+        }
+
+        self.push_locked(&mut state, command)
+    }
+
+    fn push_locked(
+        &self,
+        state: &mut ServerInputQueueState,
+        command: ServerInputCommand,
+    ) -> Result<()> {
+        if state.items.len() >= SERVER_INPUT_QUEUE_CAPACITY {
+            return Err(eyre!(
+                "Input sender queue reached its {} item limit",
+                SERVER_INPUT_QUEUE_CAPACITY
+            ));
+        }
+        let depth_after_push = state.items.len() + 1;
+        state
+            .items
+            .push_back(ServerInputQueueItem::Command(QueuedServerInput {
+                command,
+                queued_at: Instant::now(),
+                depth_after_push,
+                coalesced_moves: 0,
+            }));
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<()> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        {
+            let mut state = self.state.lock().unwrap();
+            if let Some(error) = &state.failure {
+                return Err(eyre!("Input sender failed: {}", error));
+            }
+            if state.closed {
+                return Err(eyre!("Input sender is closed"));
+            }
+            if state.items.len() >= SERVER_INPUT_QUEUE_CAPACITY {
+                return Err(eyre!("Input sender queue is full during flush"));
+            }
+            state.items.push_back(ServerInputQueueItem::Flush(send));
+        }
+        self.notify.notify_one();
+        time::timeout(SERVER_INPUT_SEND_TIMEOUT, receive)
+            .await
+            .wrap_err("Timed out flushing input sender")?
+            .wrap_err("Input sender stopped during flush")?;
+        Ok(())
+    }
+
+    fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.notify.notify_waiters();
+    }
+
+    fn fail(&self, error: String) {
+        let mut state = self.state.lock().unwrap();
+        state.failure = Some(error);
+        state.closed = true;
+        state.items.clear();
+        drop(state);
+        self.notify.notify_waiters();
+    }
+
+    async fn recv(&self) -> Option<ServerInputQueueItem> {
+        loop {
+            let notified = self.notify.notified();
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(item) = state.items.pop_front() {
+                    return Some(item);
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
 #[derive(Clone)]
 struct TypedServerInputSender {
-    peer: Arc<dyn ServerPeerLink>,
+    queue: ServerInputQueue,
 }
 
 impl TypedServerInputSender {
     async fn lock(&self) -> TypedServerInputGuard {
         TypedServerInputGuard {
-            peer: self.peer.clone(),
+            queue: self.queue.clone(),
         }
+    }
+
+    async fn flush(&self) -> Result<()> {
+        self.queue.flush().await
+    }
+
+    fn close(&self) {
+        self.queue.close();
     }
 }
 
 struct TypedServerInputGuard {
+    queue: ServerInputQueue,
+}
+
+async fn run_server_input_sender(
+    queue: ServerInputQueue,
     peer: Arc<dyn ServerPeerLink>,
+    failure_tx: tokio::sync::mpsc::Sender<String>,
+) {
+    while let Some(item) = queue.recv().await {
+        let queued = match item {
+            ServerInputQueueItem::Command(queued) => queued,
+            ServerInputQueueItem::Flush(completed) => {
+                completed.send(()).ok();
+                continue;
+            }
+        };
+        let residence = queued.queued_at.elapsed();
+        if residence >= SERVER_INPUT_SLOW_PATH_THRESHOLD {
+            warn!(
+                "Server input sender diagnostics: event=slow_queue queue_residence_us={} depth_after_push={} coalesced_moves={}",
+                residence.as_micros(),
+                queued.depth_after_push,
+                queued.coalesced_moves
+            );
+        }
+
+        let send_started = Instant::now();
+        let send_result =
+            time::timeout(SERVER_INPUT_SEND_TIMEOUT, peer.send_input(queued.command)).await;
+        let send_elapsed = send_started.elapsed();
+        if send_elapsed >= SERVER_INPUT_SLOW_PATH_THRESHOLD {
+            warn!(
+                "Server input sender diagnostics: event=slow_send send_latency_us={} queue_residence_us={} depth_after_push={}",
+                send_elapsed.as_micros(),
+                residence.as_micros(),
+                queued.depth_after_push
+            );
+        }
+
+        let failure = match send_result {
+            Ok(Ok(())) => continue,
+            Ok(Err(error)) => format!("Input transport send failed: {}", error),
+            Err(_) => format!(
+                "Input transport send timed out after {}ms",
+                SERVER_INPUT_SEND_TIMEOUT.as_millis()
+            ),
+        };
+        warn!(
+            "Server input sender diagnostics: event=failed error={}",
+            failure
+        );
+        queue.fail(failure.clone());
+        failure_tx.send(failure).await.ok();
+        return;
+    }
 }
 
 fn unix_millis() -> u64 {
@@ -1106,8 +1306,18 @@ async fn handle_server_connection(
         session_started.elapsed().as_millis(),
         connection.rtt().as_millis()
     );
-    let input_send = TypedServerInputSender { peer: peer.clone() };
     let mut connection_tasks = tokio::task::JoinSet::new();
+    let input_queue = ServerInputQueue::default();
+    let input_send = TypedServerInputSender {
+        queue: input_queue.clone(),
+    };
+    let (input_failure_tx, mut input_failure_rx) = tokio::sync::mpsc::channel(1);
+    let input_peer = peer.clone();
+    connection_tasks.spawn(run_server_input_sender(
+        input_queue,
+        input_peer,
+        input_failure_tx,
+    ));
 
     // Session-lock and display APIs may launch subprocesses or perform display
     // server round trips. Keep them off the latency-sensitive input loop and
@@ -1768,6 +1978,13 @@ async fn handle_server_connection(
                     }
                 }
             }
+            failure = input_failure_rx.recv() => {
+                match failure {
+                    Some(error) => warn!("Input sender stopped; reclaiming local input: {}", error),
+                    None => warn!("Input sender stopped unexpectedly; reclaiming local input"),
+                }
+                break;
+            }
             // Branch: typed peer events
             event = peer.next_event() => {
                 match event {
@@ -1964,6 +2181,10 @@ async fn handle_server_connection(
             tx.send(LayerShellCommand::Shutdown).ok();
         }
     }
+    if let Err(error) = input_send.flush().await {
+        warn!("Failed to flush queued input during cleanup: {}", error);
+    }
+    input_send.close();
     let release_messages = {
         let mut capturer = capturer.lock().unwrap();
         restore_server_input_state(&mut **capturer, use_layer_shell, &mut transition)
@@ -3232,7 +3453,7 @@ async fn connect_with_retry(endpoint: &Endpoint, addr: SocketAddr) -> Result<qui
 }
 
 async fn send_message_uni(send: &mut TypedServerInputGuard, msg: &Message) -> Result<()> {
-    send_server_input_messages(send.peer.as_ref(), [msg.clone()]).await
+    send.queue.push(server_input_command(msg.clone())?)
 }
 
 async fn send_accumulated_motion(
@@ -3415,6 +3636,80 @@ mod input_coalescing_tests {
         assert_eq!(capture.keyboard_only_polls, 1);
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], Message::KeyEvent { keycode: 30, .. }));
+    }
+
+    #[tokio::test]
+    async fn outbound_input_queue_coalesces_only_adjacent_pointer_moves() {
+        let queue = ServerInputQueue::default();
+        queue
+            .push(ServerInputCommand::MouseMoved { x: 4, y: -2 })
+            .unwrap();
+        queue
+            .push(ServerInputCommand::MouseMoved { x: 3, y: 7 })
+            .unwrap();
+        queue
+            .push(ServerInputCommand::KeyChanged {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            })
+            .unwrap();
+        queue
+            .push(ServerInputCommand::MouseMoved { x: 8, y: 9 })
+            .unwrap();
+
+        let Some(ServerInputQueueItem::Command(first)) = queue.recv().await else {
+            panic!("expected first pointer command");
+        };
+        assert_eq!(first.command, ServerInputCommand::MouseMoved { x: 7, y: 5 });
+        assert_eq!(first.coalesced_moves, 1);
+
+        let Some(ServerInputQueueItem::Command(second)) = queue.recv().await else {
+            panic!("expected key barrier");
+        };
+        assert!(matches!(
+            second.command,
+            ServerInputCommand::KeyChanged { keycode: 30, .. }
+        ));
+
+        let Some(ServerInputQueueItem::Command(third)) = queue.recv().await else {
+            panic!("expected pointer command after key barrier");
+        };
+        assert_eq!(third.command, ServerInputCommand::MouseMoved { x: 8, y: 9 });
+    }
+
+    #[tokio::test]
+    async fn blocked_input_transport_does_not_block_input_producers() {
+        let peer = Arc::new(crate::testing::ScriptedServerPeerLink::new());
+        let blocked = peer.block_next_send(crate::testing::ServerSendOperation::Input);
+        peer.succeed_next_send(crate::testing::ServerSendOperation::Input);
+        let queue = ServerInputQueue::default();
+        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
+        let worker = tokio::spawn(run_server_input_sender(queue.clone(), peer, failure_tx));
+
+        queue
+            .push(ServerInputCommand::MouseMoved { x: 4, y: -2 })
+            .unwrap();
+        blocked.wait_until_entered().await;
+
+        queue
+            .push(ServerInputCommand::KeyChanged {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            })
+            .unwrap();
+        let marker = tokio::spawn(async { "producer progressed" });
+        assert_eq!(marker.await.unwrap(), "producer progressed");
+
+        blocked.release();
+        queue.flush().await.unwrap();
+        queue.close();
+        worker.await.unwrap();
+        assert!(matches!(
+            failure_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 
     struct GatedLockSource {
