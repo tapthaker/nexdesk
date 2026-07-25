@@ -856,6 +856,15 @@ fn poll_server_capture(
     Ok((x, y, width, height, buttons, key_events))
 }
 
+fn poll_layer_shell_keys(capturer: &mut dyn InputCapture) -> Result<Vec<Message>> {
+    capturer.poll_key_events_only().map(|events| {
+        events
+            .into_iter()
+            .filter(|message| matches!(message, Message::KeyEvent { .. }))
+            .collect()
+    })
+}
+
 fn validate_listen_port(port: u16) -> Result<()> {
     if port == 0 {
         return Err(eyre!(
@@ -1358,12 +1367,7 @@ async fn handle_server_connection(
             _ = layer_shell_key_poll_interval.tick(), if use_layer_shell && layer_shell_keyboard_grabbed && transition.is_active() => {
                 let key_events = {
                     let mut cap = capturer.lock().unwrap();
-                    cap.poll_key_events().map(|events| {
-                        events
-                            .into_iter()
-                            .filter(|msg| matches!(msg, Message::KeyEvent { .. }))
-                            .collect::<Vec<_>>()
-                    })
+                    poll_layer_shell_keys(&mut **cap)
                 };
                 let key_events = match key_events {
                     Ok(events) => events,
@@ -3283,6 +3287,57 @@ mod input_coalescing_tests {
         assert_eq!(diagnostics.capture_queue_residence.max_us, 5_000);
         assert_eq!(diagnostics.capture_coalescing_span.max_us, 2_000);
         assert_eq!(diagnostics.send_latency.max_us, 3_000);
+    }
+
+    struct SplitInputCapture {
+        full_polls: usize,
+        keyboard_only_polls: usize,
+    }
+
+    impl InputCapture for SplitInputCapture {
+        fn mouse_position(&self) -> Result<(i32, i32)> {
+            Ok((0, 0))
+        }
+
+        fn screen_size(&self) -> Result<(u32, u32)> {
+            Ok((1920, 1080))
+        }
+
+        fn mouse_buttons(&self) -> Result<u8> {
+            Ok(0)
+        }
+
+        fn poll_key_events(&mut self) -> Result<Vec<Message>> {
+            self.full_polls += 1;
+            Ok(vec![Message::MouseMove { x: 10, y: 5 }])
+        }
+
+        fn poll_key_events_only(&mut self) -> Result<Vec<Message>> {
+            self.keyboard_only_polls += 1;
+            Ok(vec![
+                Message::KeyEvent {
+                    keycode: 30,
+                    pressed: true,
+                    modifiers: 0,
+                },
+                Message::MouseMove { x: 99, y: 99 },
+            ])
+        }
+    }
+
+    #[test]
+    fn layer_shell_poll_uses_only_keyboard_backend_and_filters_pointer_events() {
+        let mut capture = SplitInputCapture {
+            full_polls: 0,
+            keyboard_only_polls: 0,
+        };
+
+        let events = poll_layer_shell_keys(&mut capture).unwrap();
+
+        assert_eq!(capture.full_polls, 0);
+        assert_eq!(capture.keyboard_only_polls, 1);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], Message::KeyEvent { keycode: 30, .. }));
     }
 
     #[test]

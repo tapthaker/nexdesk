@@ -9,7 +9,99 @@ use x11rb::connection::Connection;
 
 use crate::input::capture::InputCapture;
 use crate::input::inject::InputInjector;
-use crate::net::protocol::Message;
+use crate::net::protocol::{Message, MAX_KEYCODE};
+
+fn record_key_event(
+    pressed_keys: &mut HashSet<u32>,
+    pending: &mut Vec<Message>,
+    code: u32,
+    value: i32,
+) {
+    if code > MAX_KEYCODE {
+        return;
+    }
+
+    match value {
+        0 => {
+            pressed_keys.remove(&code);
+            pending.push(Message::KeyEvent {
+                keycode: code,
+                pressed: false,
+                modifiers: 0,
+            });
+        }
+        1 => {
+            pressed_keys.insert(code);
+            pending.push(Message::KeyEvent {
+                keycode: code,
+                pressed: true,
+                modifiers: 0,
+            });
+        }
+        // Preserve the source machine's evdev repeat timing. Injected macOS
+        // key-down events do not initiate native repeat on their own.
+        2 if pressed_keys.contains(&code) => pending.push(Message::KeyEvent {
+            keycode: code,
+            pressed: true,
+            modifiers: 0,
+        }),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evdev_key_events_preserve_order_repeats_and_held_state() {
+        let mut pressed = HashSet::new();
+        let mut events = Vec::new();
+
+        record_key_event(&mut pressed, &mut events, 30, 1);
+        record_key_event(&mut pressed, &mut events, 30, 2);
+        record_key_event(&mut pressed, &mut events, 30, 0);
+        record_key_event(&mut pressed, &mut events, 30, 2);
+
+        assert!(!pressed.contains(&30));
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[0],
+            Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[1],
+            Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[2],
+            Message::KeyEvent {
+                keycode: 30,
+                pressed: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn evdev_key_events_reject_protocol_unsupported_keycodes() {
+        let mut pressed = HashSet::new();
+        let mut events = Vec::new();
+
+        record_key_event(&mut pressed, &mut events, MAX_KEYCODE + 1, 1);
+
+        assert!(pressed.is_empty());
+        assert!(events.is_empty());
+    }
+}
 
 #[derive(Debug, Clone)]
 enum PointerKind {
@@ -195,6 +287,7 @@ pub struct WaylandCapturer {
     screen_width: u32,
     screen_height: u32,
     pressed_keys: HashSet<u32>,
+    pending_key_events: Vec<Message>,
     buttons: u8,
     /// Accumulated scroll deltas (pixels) since last poll
     scroll_acc_x: f64,
@@ -261,6 +354,7 @@ impl WaylandCapturer {
             screen_width,
             screen_height,
             pressed_keys: HashSet::new(),
+            pending_key_events: Vec::new(),
             buttons: 0,
             scroll_acc_x: 0.0,
             scroll_acc_y: 0.0,
@@ -277,6 +371,30 @@ impl WaylandCapturer {
 
     /// Touchpad scroll sensitivity (fraction of screen per full-pad swipe).
     const TOUCHPAD_SCROLL_SPEED: f64 = 0.8;
+
+    /// Read one currently available batch from each keyboard. Avoid looping
+    /// until WouldBlock: a high-rate device can keep refilling its queue and
+    /// monopolize the async connection task.
+    fn drain_keyboard_events(&mut self) {
+        for device in &mut self.keyboard_devices {
+            match device.fetch_events() {
+                Ok(events) => {
+                    for event in events {
+                        if let InputEventKind::Key(key) = event.kind() {
+                            record_key_event(
+                                &mut self.pressed_keys,
+                                &mut self.pending_key_events,
+                                key.code() as u32,
+                                event.value(),
+                            );
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => warn!("Failed to read keyboard events: {}", error),
+            }
+        }
+    }
 
     /// Process all pending events from all devices.
     fn drain_events(&mut self) {
@@ -439,12 +557,12 @@ impl WaylandCapturer {
                                             }
                                         }
                                         _ => {
-                                            // Keyboard key tracking
-                                            if pressed {
-                                                self.pressed_keys.insert(code);
-                                            } else {
-                                                self.pressed_keys.remove(&code);
-                                            }
+                                            record_key_event(
+                                                &mut self.pressed_keys,
+                                                &mut self.pending_key_events,
+                                                code,
+                                                event.value(),
+                                            );
                                         }
                                     }
                                 }
@@ -465,33 +583,7 @@ impl WaylandCapturer {
         // when sharing to a remote screen. The server loop clamps as needed
         // for local edge detection.
 
-        // Drain keyboard devices for key events
-        for kdev in &mut self.keyboard_devices {
-            loop {
-                match kdev.fetch_events() {
-                    Ok(events) => {
-                        let mut got_any = false;
-                        for event in events {
-                            got_any = true;
-                            if let InputEventKind::Key(key) = event.kind() {
-                                let code = key.code() as u32;
-                                let pressed = event.value() != 0;
-                                if pressed {
-                                    self.pressed_keys.insert(code);
-                                } else {
-                                    self.pressed_keys.remove(&code);
-                                }
-                            }
-                        }
-                        if !got_any {
-                            break;
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
-                }
-            }
-        }
+        self.drain_keyboard_events();
     }
 }
 
@@ -554,30 +646,9 @@ impl InputCapture for WaylandCapturer {
     }
 
     fn poll_key_events(&mut self) -> Result<Vec<Message>> {
-        // Drain all pending events first — this updates cursor position, buttons, keys, and scroll
-        let old_keys: HashSet<u32> = self.pressed_keys.clone();
+        // Preserve kernel event order, including EV_KEY value 2 repeats.
         self.drain_events();
-
-        // Compute key state changes
-        let mut events = Vec::new();
-        for &code in &self.pressed_keys {
-            if !old_keys.contains(&code) {
-                events.push(Message::KeyEvent {
-                    keycode: code,
-                    pressed: true,
-                    modifiers: 0,
-                });
-            }
-        }
-        for &code in &old_keys {
-            if !self.pressed_keys.contains(&code) {
-                events.push(Message::KeyEvent {
-                    keycode: code,
-                    pressed: false,
-                    modifiers: 0,
-                });
-            }
-        }
+        let mut events = std::mem::take(&mut self.pending_key_events);
 
         // Emit accumulated scroll events (discrete mouse wheel — no phase)
         let sx = self.scroll_acc_x;
@@ -593,6 +664,11 @@ impl InputCapture for WaylandCapturer {
         }
 
         Ok(events)
+    }
+
+    fn poll_key_events_only(&mut self) -> Result<Vec<Message>> {
+        self.drain_keyboard_events();
+        Ok(std::mem::take(&mut self.pending_key_events))
     }
 }
 

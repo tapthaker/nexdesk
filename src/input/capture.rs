@@ -17,6 +17,13 @@ pub trait InputCapture: Send {
     /// Poll for keyboard state changes. Returns key events since last call.
     fn poll_key_events(&mut self) -> Result<Vec<Message>>;
 
+    /// Poll only keyboard devices when pointer events are already supplied by
+    /// another backend such as Wayland layer-shell. Other backends may use the
+    /// regular polling implementation.
+    fn poll_key_events_only(&mut self) -> Result<Vec<Message>> {
+        self.poll_key_events()
+    }
+
     /// Grab or ungrab input devices. When grabbed, the local desktop
     /// does not receive the events (exclusive access for remote sharing).
     fn set_grab(&mut self, _grab: bool) -> Result<()> {
