@@ -57,6 +57,7 @@ const SERVER_INPUT_QUEUE_CAPACITY: usize = 256;
 const SERVER_CONTROL_QUEUE_CAPACITY: usize = 64;
 const SERVER_INPUT_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 const SERVER_INPUT_SLOW_PATH_THRESHOLD: Duration = Duration::from_millis(10);
+const SERVER_LOOP_STALL_WARN_THRESHOLD: Duration = Duration::from_millis(64);
 const CLIENT_LATENCY_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const CLIENT_LATENCY_RESTART_THRESHOLD: Duration = Duration::from_secs(3);
 const CLIENT_LATENCY_RESTART_STRIKES: u8 = 3;
@@ -134,18 +135,22 @@ struct ServerActivationDiagnostics {
     captured_motion_events: u64,
     capture_batches: u64,
     coalesced_capture_events: u64,
-    sent_mouse_moves: u64,
+    enqueued_mouse_moves: u64,
     pending_capture_events: u64,
-    max_capture_events_per_send: u64,
+    max_capture_events_per_enqueue: u64,
     max_capture_queue_depth: usize,
     last_capture_batch: Option<Instant>,
-    last_send: Option<Instant>,
+    last_enqueue: Option<Instant>,
     capture_batch_gap: DurationHistogram,
     capture_queue_residence: DurationHistogram,
     capture_coalescing_span: DurationHistogram,
+    capture_poll_latency: DurationHistogram,
+    keyboard_poll_latency: DurationHistogram,
+    layer_event_handler_latency: DurationHistogram,
+    event_loop_tick_lateness: DurationHistogram,
     pointer_tick_lateness: DurationHistogram,
-    send_gap: DurationHistogram,
-    send_latency: DurationHistogram,
+    enqueue_gap: DurationHistogram,
+    enqueue_latency: DurationHistogram,
 }
 
 impl ServerActivationDiagnostics {
@@ -173,19 +178,29 @@ impl ServerActivationDiagnostics {
         self.last_capture_batch = Some(dequeued_at);
     }
 
-    fn record_send(&mut self, started_at: Instant, elapsed: Duration) {
-        self.sent_mouse_moves += 1;
-        self.max_capture_events_per_send = self
-            .max_capture_events_per_send
+    fn record_enqueue(&mut self, started_at: Instant, elapsed: Duration) {
+        self.enqueued_mouse_moves += 1;
+        self.max_capture_events_per_enqueue = self
+            .max_capture_events_per_enqueue
             .max(self.pending_capture_events);
         self.pending_capture_events = 0;
-        if let Some(previous) = self.last_send {
-            self.send_gap
+        if let Some(previous) = self.last_enqueue {
+            self.enqueue_gap
                 .record(started_at.saturating_duration_since(previous));
         }
-        self.last_send = Some(started_at);
-        self.send_latency.record(elapsed);
+        self.last_enqueue = Some(started_at);
+        self.enqueue_latency.record(elapsed);
     }
+}
+
+#[derive(Default)]
+struct ServerSenderDiagnostics {
+    sent_commands: u64,
+    sent_mouse_moves: u64,
+    coalesced_mouse_moves: u64,
+    max_queue_depth: usize,
+    queue_residence: DurationHistogram,
+    send_latency: DurationHistogram,
 }
 
 #[derive(Default)]
@@ -452,6 +467,21 @@ fn validate_discovered_fingerprint(expected: Option<&str>, actual: &str) -> Resu
         }
     }
     Ok(actual)
+}
+
+fn record_server_input_stage(
+    operation: &'static str,
+    elapsed: Duration,
+    histogram: &mut DurationHistogram,
+) {
+    histogram.record(elapsed);
+    if elapsed >= SERVER_INPUT_SLOW_PATH_THRESHOLD {
+        warn!(
+            "Server input stage diagnostics: operation={} elapsed_us={}",
+            operation,
+            elapsed.as_micros()
+        );
+    }
 }
 
 fn inject_with_timing(
@@ -864,6 +894,7 @@ async fn run_server_input_sender(
     queue: ServerInputQueue,
     peer: Arc<dyn ServerPeerLink>,
     failure_tx: tokio::sync::mpsc::Sender<String>,
+    diagnostics: Arc<StdMutex<ServerSenderDiagnostics>>,
 ) {
     while let Some(item) = queue.recv().await {
         let queued = match item {
@@ -874,6 +905,9 @@ async fn run_server_input_sender(
             }
         };
         let residence = queued.queued_at.elapsed();
+        let is_mouse_move = matches!(&queued.command, ServerInputCommand::MouseMoved { .. });
+        let depth_after_push = queued.depth_after_push;
+        let coalesced_moves = queued.coalesced_moves;
         if residence >= SERVER_INPUT_SLOW_PATH_THRESHOLD {
             warn!(
                 "Server input sender diagnostics: event=slow_queue queue_residence_us={} depth_after_push={} coalesced_moves={}",
@@ -887,6 +921,15 @@ async fn run_server_input_sender(
         let send_result =
             time::timeout(SERVER_INPUT_SEND_TIMEOUT, peer.send_input(queued.command)).await;
         let send_elapsed = send_started.elapsed();
+        {
+            let mut diagnostics = diagnostics.lock().unwrap();
+            diagnostics.sent_commands += 1;
+            diagnostics.sent_mouse_moves += u64::from(is_mouse_move);
+            diagnostics.coalesced_mouse_moves += coalesced_moves;
+            diagnostics.max_queue_depth = diagnostics.max_queue_depth.max(depth_after_push);
+            diagnostics.queue_residence.record(residence);
+            diagnostics.send_latency.record(send_elapsed);
+        }
         if send_elapsed >= SERVER_INPUT_SLOW_PATH_THRESHOLD {
             warn!(
                 "Server input sender diagnostics: event=slow_send send_latency_us={} queue_residence_us={} depth_after_push={}",
@@ -1405,12 +1448,14 @@ async fn handle_server_connection(
     let input_send = TypedServerInputSender {
         queue: input_queue.clone(),
     };
+    let sender_diagnostics = Arc::new(StdMutex::new(ServerSenderDiagnostics::default()));
     let (input_failure_tx, mut input_failure_rx) = tokio::sync::mpsc::channel(1);
     let input_peer = peer.clone();
     connection_tasks.spawn(run_server_input_sender(
         input_queue,
         input_peer,
         input_failure_tx,
+        sender_diagnostics.clone(),
     ));
 
     let (control_queue_tx, control_queue_rx) =
@@ -1630,11 +1675,15 @@ async fn handle_server_connection(
     layer_shell_key_poll_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut pointer_send_interval = time::interval(POINTER_FRAME_INTERVAL);
     pointer_send_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut event_loop_tick_interval = time::interval(MOUSE_POLL_INTERVAL);
+    event_loop_tick_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut input_diagnostic_interval = time::interval(CLIENT_LATENCY_CHECK_INTERVAL);
     input_diagnostic_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut pending_layer_shell_motion = (0.0f64, 0.0f64);
     let mut activation_started: Option<Instant> = None;
     let mut activation_started_unix_ms: u64 = 0;
+    let mut diagnostic_window_unix_ms: u64 = 0;
+    let mut diagnostic_window_index: u64 = 0;
     let mut activation_diagnostics = ServerActivationDiagnostics::default();
     let mut debug_counter: u64 = 0;
     let (mut last_screen_w, mut last_screen_h) = layer_shell_screen.unwrap_or((screen_w, screen_h));
@@ -1653,9 +1702,17 @@ async fn handle_server_connection(
                 // Query input state while holding lock briefly.
                 // poll_key_events() is called first because on Wayland (evdev)
                 // it drains pending events and updates the cursor position.
+                let capture_started = Instant::now();
                 let capture = {
                     let mut cap = capturer.lock().unwrap();
                     poll_server_capture(&mut **cap)
+                };
+                if transition.is_active() {
+                    record_server_input_stage(
+                        "full_capture_poll",
+                        capture_started.elapsed(),
+                        &mut activation_diagnostics.capture_poll_latency,
+                    );
                 };
                 let (mx, my, sw, sh, buttons, key_events) = match capture {
                     Ok(snapshot) => snapshot,
@@ -1686,7 +1743,12 @@ async fn handle_server_connection(
                         pending_layer_shell_motion = (0.0, 0.0);
                         activation_started = Some(Instant::now());
                         activation_started_unix_ms = unix_millis();
+                        diagnostic_window_unix_ms = activation_started_unix_ms;
+                        diagnostic_window_index = 0;
                         activation_diagnostics = ServerActivationDiagnostics::default();
+                        *sender_diagnostics.lock().unwrap() = ServerSenderDiagnostics::default();
+                        pointer_send_interval.reset();
+                        event_loop_tick_interval.reset();
                         capturer.lock().unwrap().set_grab(grab).ok();
                         let mut sender = input_send.lock().await;
                         for msg in messages {
@@ -1784,10 +1846,16 @@ async fn handle_server_connection(
             // can consume global shortcuts and media keys before wl_keyboard sees
             // them, so use evdev while the remote screen is active.
             _ = layer_shell_key_poll_interval.tick(), if use_layer_shell && layer_shell_keyboard_grabbed && transition.is_active() => {
+                let poll_started = Instant::now();
                 let key_events = {
                     let mut cap = capturer.lock().unwrap();
                     poll_layer_shell_keys(&mut **cap)
                 };
+                record_server_input_stage(
+                    "keyboard_only_poll",
+                    poll_started.elapsed(),
+                    &mut activation_diagnostics.keyboard_poll_latency,
+                );
                 let key_events = match key_events {
                     Ok(events) => events,
                     Err(error) => {
@@ -1879,6 +1947,19 @@ async fn handle_server_connection(
                     }
                 }
             }
+            // An independent scheduler tick exposes stalls in any select branch,
+            // including periods with no pointer movement to measure.
+            scheduled = event_loop_tick_interval.tick(), if transition.is_active() => {
+                let lateness = Instant::now().saturating_duration_since(scheduled);
+                activation_diagnostics.event_loop_tick_lateness.record(lateness);
+                if lateness >= SERVER_LOOP_STALL_WARN_THRESHOLD {
+                    warn!(
+                        "Server input loop diagnostics: event=late_tick lateness_us={} pending_capture_events={}",
+                        lateness.as_micros(),
+                        activation_diagnostics.pending_capture_events
+                    );
+                }
+            }
             // Send at most one accumulated pointer movement per frame. If the
             // network or peer is slow, newer deltas merge into this position
             // instead of forming an unbounded queue of stale movements.
@@ -1893,7 +1974,7 @@ async fn handle_server_connection(
                     let send_started = Instant::now();
                     let result = send_message_uni(&mut sender, &message).await;
                     if activation_started.is_some() {
-                        activation_diagnostics.record_send(send_started, send_started.elapsed());
+                        activation_diagnostics.record_enqueue(send_started, send_started.elapsed());
                     }
                     if let Err(e) = result {
                         warn!("Failed to send accumulated mouse move: {}", e);
@@ -1918,6 +1999,7 @@ async fn handle_server_connection(
                     None => std::future::pending().await,
                 }
             }, if use_layer_shell => {
+                let handler_started = Instant::now();
                 use crate::input::wayland_layer_shell::{
                     LayerShellCommand, LayerShellEvent, ReceivedLayerShellEvent,
                 };
@@ -1943,7 +2025,12 @@ async fn handle_server_connection(
                         pending_layer_shell_motion = (0.0, 0.0);
                         activation_started = Some(Instant::now());
                         activation_started_unix_ms = unix_millis();
+                        diagnostic_window_unix_ms = activation_started_unix_ms;
+                        diagnostic_window_index = 0;
                         activation_diagnostics = ServerActivationDiagnostics::default();
+                        *sender_diagnostics.lock().unwrap() = ServerSenderDiagnostics::default();
+                        pointer_send_interval.reset();
+                        event_loop_tick_interval.reset();
                         let messages = transition.activate_instant(direction);
                         info!("Layer-shell edge enter ({:?}) — switching to remote", direction);
                         match capturer.lock().unwrap().set_keyboard_grab(true) {
@@ -1976,13 +2063,26 @@ async fn handle_server_connection(
                     LayerShellEvent::MouseMove { dx, dy } => {
                         if transition.is_active() {
                             if activation_started.is_some() {
+                                let queued_at: Instant = queued_at.into();
+                                let last_updated_at: Instant = last_updated_at.into();
+                                let queue_residence = dequeued_at.saturating_duration_since(queued_at);
+                                let coalescing_span = last_updated_at.saturating_duration_since(queued_at);
                                 activation_diagnostics.record_capture_batch(
                                     coalesced_motion_events,
                                     depth_after_push,
-                                    queued_at.into(),
-                                    last_updated_at.into(),
+                                    queued_at,
+                                    last_updated_at,
                                     dequeued_at,
                                 );
+                                if queue_residence >= SERVER_LOOP_STALL_WARN_THRESHOLD {
+                                    warn!(
+                                        "Server capture diagnostics: event=slow_dequeue queue_residence_us={} coalescing_span_us={} coalesced_motion_events={} depth_after_push={}",
+                                        queue_residence.as_micros(),
+                                        coalescing_span.as_micros(),
+                                        coalesced_motion_events,
+                                        depth_after_push
+                                    );
+                                }
                             }
                             pending_layer_shell_motion.0 += dx;
                             pending_layer_shell_motion.1 += dy;
@@ -2120,6 +2220,13 @@ async fn handle_server_connection(
                         // Modifier state is tracked via KeyEvent; modifiers event is informational
                     }
                 }
+                if transition.is_active() {
+                    record_server_input_stage(
+                        "layer_shell_event_handler",
+                        handler_started.elapsed(),
+                        &mut activation_diagnostics.layer_event_handler_latency,
+                    );
+                }
             }
             failure = input_failure_rx.recv() => {
                 match failure {
@@ -2198,20 +2305,29 @@ async fn handle_server_connection(
                 }
             }
             _ = input_diagnostic_interval.tick() => {
-                if activation_started.is_some_and(|started| started.elapsed() >= Duration::from_secs(10)) {
+                if transition.is_active()
+                    && activation_started.is_some_and(|started| started.elapsed() >= Duration::from_secs(10))
+                {
                     let elapsed = activation_started.unwrap().elapsed();
+                    let sender_window = std::mem::take(&mut *sender_diagnostics.lock().unwrap());
                     info!(
-                        "Server input diagnostics: {:.0}s summary: session_id={} activation_unix_ms={} captured_motion_events={} capture_batches={} coalesced_capture_events={} sent_mouse_moves={} pending_capture_events={} max_capture_events_per_send={} max_capture_queue_depth={} bucket_upper_bounds_us={:?} capture_batch_gap_buckets={:?} capture_batch_gap_max_us={} capture_queue_residence_buckets={:?} capture_queue_residence_max_us={} capture_coalescing_span_buckets={:?} capture_coalescing_span_max_us={} pointer_tick_lateness_buckets={:?} pointer_tick_lateness_max_us={} send_gap_buckets={:?} send_gap_max_us={} send_latency_buckets={:?} send_latency_max_us={}",
+                        "Server input diagnostics: window={} {:.0}s summary: session_id={} activation_unix_ms={} window_unix_ms={} captured_motion_events={} capture_batches={} coalesced_capture_events={} enqueued_mouse_moves={} pending_capture_events={} max_capture_events_per_enqueue={} max_capture_queue_depth={} transport_sent_commands={} transport_sent_mouse_moves={} transport_coalesced_mouse_moves={} transport_max_queue_depth={} bucket_upper_bounds_us={:?} capture_batch_gap_buckets={:?} capture_batch_gap_max_us={} capture_queue_residence_buckets={:?} capture_queue_residence_max_us={} capture_coalescing_span_buckets={:?} capture_coalescing_span_max_us={} capture_poll_latency_buckets={:?} capture_poll_latency_max_us={} keyboard_poll_latency_buckets={:?} keyboard_poll_latency_max_us={} layer_event_handler_latency_buckets={:?} layer_event_handler_latency_max_us={} event_loop_tick_lateness_buckets={:?} event_loop_tick_lateness_max_us={} pointer_tick_lateness_buckets={:?} pointer_tick_lateness_max_us={} enqueue_gap_buckets={:?} enqueue_gap_max_us={} enqueue_latency_buckets={:?} enqueue_latency_max_us={} transport_queue_residence_buckets={:?} transport_queue_residence_max_us={} transport_send_latency_buckets={:?} transport_send_latency_max_us={}",
+                        diagnostic_window_index,
                         elapsed.as_secs_f64(),
                         session_id,
                         activation_started_unix_ms,
+                        diagnostic_window_unix_ms,
                         activation_diagnostics.captured_motion_events,
                         activation_diagnostics.capture_batches,
                         activation_diagnostics.coalesced_capture_events,
-                        activation_diagnostics.sent_mouse_moves,
+                        activation_diagnostics.enqueued_mouse_moves,
                         activation_diagnostics.pending_capture_events,
-                        activation_diagnostics.max_capture_events_per_send,
+                        activation_diagnostics.max_capture_events_per_enqueue,
                         activation_diagnostics.max_capture_queue_depth,
+                        sender_window.sent_commands,
+                        sender_window.sent_mouse_moves,
+                        sender_window.coalesced_mouse_moves,
+                        sender_window.max_queue_depth,
                         INPUT_DIAGNOSTIC_BUCKET_UPPER_BOUNDS_US,
                         activation_diagnostics.capture_batch_gap.buckets,
                         activation_diagnostics.capture_batch_gap.max_us,
@@ -2219,14 +2335,29 @@ async fn handle_server_connection(
                         activation_diagnostics.capture_queue_residence.max_us,
                         activation_diagnostics.capture_coalescing_span.buckets,
                         activation_diagnostics.capture_coalescing_span.max_us,
+                        activation_diagnostics.capture_poll_latency.buckets,
+                        activation_diagnostics.capture_poll_latency.max_us,
+                        activation_diagnostics.keyboard_poll_latency.buckets,
+                        activation_diagnostics.keyboard_poll_latency.max_us,
+                        activation_diagnostics.layer_event_handler_latency.buckets,
+                        activation_diagnostics.layer_event_handler_latency.max_us,
+                        activation_diagnostics.event_loop_tick_lateness.buckets,
+                        activation_diagnostics.event_loop_tick_lateness.max_us,
                         activation_diagnostics.pointer_tick_lateness.buckets,
                         activation_diagnostics.pointer_tick_lateness.max_us,
-                        activation_diagnostics.send_gap.buckets,
-                        activation_diagnostics.send_gap.max_us,
-                        activation_diagnostics.send_latency.buckets,
-                        activation_diagnostics.send_latency.max_us,
+                        activation_diagnostics.enqueue_gap.buckets,
+                        activation_diagnostics.enqueue_gap.max_us,
+                        activation_diagnostics.enqueue_latency.buckets,
+                        activation_diagnostics.enqueue_latency.max_us,
+                        sender_window.queue_residence.buckets,
+                        sender_window.queue_residence.max_us,
+                        sender_window.send_latency.buckets,
+                        sender_window.send_latency.max_us,
                     );
-                    activation_started = None;
+                    activation_started = Some(Instant::now());
+                    diagnostic_window_unix_ms = unix_millis();
+                    diagnostic_window_index += 1;
+                    activation_diagnostics = ServerActivationDiagnostics::default();
                 }
             }
             lock_state = local_lock_state_rx.recv() => {
@@ -3615,7 +3746,7 @@ async fn send_accumulated_motion(
     let started_at = Instant::now();
     let result = send_message_uni(send, &message).await;
     if let Some(diagnostics) = diagnostics {
-        diagnostics.record_send(started_at, started_at.elapsed());
+        diagnostics.record_enqueue(started_at, started_at.elapsed());
     }
     result?;
     Ok(true)
@@ -3720,18 +3851,18 @@ mod input_coalescing_tests {
             started + Duration::from_millis(2),
             started + Duration::from_millis(5),
         );
-        diagnostics.record_send(started + Duration::from_millis(6), Duration::from_millis(3));
+        diagnostics.record_enqueue(started + Duration::from_millis(6), Duration::from_millis(3));
 
         assert_eq!(diagnostics.captured_motion_events, 3);
         assert_eq!(diagnostics.capture_batches, 1);
         assert_eq!(diagnostics.coalesced_capture_events, 2);
-        assert_eq!(diagnostics.sent_mouse_moves, 1);
+        assert_eq!(diagnostics.enqueued_mouse_moves, 1);
         assert_eq!(diagnostics.pending_capture_events, 0);
-        assert_eq!(diagnostics.max_capture_events_per_send, 3);
+        assert_eq!(diagnostics.max_capture_events_per_enqueue, 3);
         assert_eq!(diagnostics.max_capture_queue_depth, 4);
         assert_eq!(diagnostics.capture_queue_residence.max_us, 5_000);
         assert_eq!(diagnostics.capture_coalescing_span.max_us, 2_000);
-        assert_eq!(diagnostics.send_latency.max_us, 3_000);
+        assert_eq!(diagnostics.enqueue_latency.max_us, 3_000);
     }
 
     struct SplitInputCapture {
@@ -3826,13 +3957,42 @@ mod input_coalescing_tests {
     }
 
     #[tokio::test]
+    async fn continuous_pointer_input_stays_in_one_bounded_queue_slot() {
+        let queue = ServerInputQueue::default();
+        for _ in 0..10_000 {
+            queue
+                .push(ServerInputCommand::MouseMoved { x: 1, y: -1 })
+                .unwrap();
+        }
+
+        let Some(ServerInputQueueItem::Command(queued)) = queue.recv().await else {
+            panic!("expected coalesced pointer command");
+        };
+        assert_eq!(
+            queued.command,
+            ServerInputCommand::MouseMoved {
+                x: 10_000,
+                y: -10_000,
+            }
+        );
+        assert_eq!(queued.coalesced_moves, 9_999);
+        assert!(queue.state.lock().unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
     async fn blocked_input_transport_does_not_block_input_producers() {
         let peer = Arc::new(crate::testing::ScriptedServerPeerLink::new());
         let blocked = peer.block_next_send(crate::testing::ServerSendOperation::Input);
         peer.succeed_next_send(crate::testing::ServerSendOperation::Input);
         let queue = ServerInputQueue::default();
+        let diagnostics = Arc::new(StdMutex::new(ServerSenderDiagnostics::default()));
         let (failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
-        let worker = tokio::spawn(run_server_input_sender(queue.clone(), peer, failure_tx));
+        let worker = tokio::spawn(run_server_input_sender(
+            queue.clone(),
+            peer,
+            failure_tx,
+            diagnostics.clone(),
+        ));
 
         queue
             .push(ServerInputCommand::MouseMoved { x: 4, y: -2 })
@@ -3853,6 +4013,9 @@ mod input_coalescing_tests {
         queue.flush().await.unwrap();
         queue.close();
         worker.await.unwrap();
+        let diagnostics = diagnostics.lock().unwrap();
+        assert_eq!(diagnostics.sent_commands, 2);
+        assert_eq!(diagnostics.sent_mouse_moves, 1);
         assert!(matches!(
             failure_rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
