@@ -19,6 +19,7 @@ pub mod wayland_layer_shell {
     /// Stub types for non-Linux platforms (never instantiated at runtime).
     #[derive(Debug)]
     pub enum LayerShellEvent {
+        OutputTopologyChanged,
         EdgeEnter {
             direction: crate::net::protocol::Direction,
         },
