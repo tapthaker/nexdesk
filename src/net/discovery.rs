@@ -3,12 +3,13 @@ use std::time::Duration;
 
 use color_eyre::eyre::{eyre, Result};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub use crate::ports::DiscoveredPeer;
 use crate::ports::{DiscoveryBrowse, DiscoveryEvent, DiscoveryFuture, PeerDiscovery};
 
 const SERVICE_TYPE: &str = "_nexdesk._udp.local.";
+const DISCOVERY_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Get the primary local IPv4 address using the routing table (no packets sent).
 fn local_ipv4() -> Option<String> {
@@ -289,46 +290,75 @@ impl PeerDiscovery for MdnsDiscovery {
     }
 }
 
+async fn run_bounded_discovery_task<T, Shutdown>(
+    mut task: tokio::task::JoinHandle<Result<T>>,
+    timeout: Duration,
+    shutdown: Shutdown,
+) -> Result<Option<T>>
+where
+    T: Send + 'static,
+    Shutdown: FnOnce() + Send + 'static,
+{
+    let completion = tokio::time::timeout(timeout, &mut task).await;
+
+    // ServiceDaemon::shutdown is asynchronous. Wait for it on a blocking worker
+    // so every retry releases its multicast sockets before another daemon starts.
+    tokio::task::spawn_blocking(shutdown)
+        .await
+        .map_err(|error| eyre!("mDNS shutdown task failed: {}", error))?;
+
+    match completion {
+        Ok(result) => result
+            .map_err(|error| eyre!("mDNS browse task failed: {}", error))?
+            .map(Some),
+        Err(_) => {
+            // The blocking receiver exits when daemon shutdown closes its event
+            // channel. Join it so timed-out retries cannot accumulate threads.
+            if tokio::time::timeout(DISCOVERY_TASK_SHUTDOWN_TIMEOUT, &mut task)
+                .await
+                .is_err()
+            {
+                warn!("Timed out waiting for the mDNS browse task to stop");
+            }
+            Ok(None)
+        }
+    }
+}
+
 async fn discover_one_attempt(expected_fingerprint: &str, timeout: Duration) -> Result<SocketAddr> {
     let expected_fingerprint = expected_fingerprint.to_uppercase();
     let mdns = ServiceDaemon::new()?;
     let receiver = mdns.browse(SERVICE_TYPE)?;
+    let browse_handle = BrowseHandle { mdns: Some(mdns) };
 
     info!("Searching for nexdesk server on the network...");
 
     let browse_fingerprint = expected_fingerprint.clone();
-    let result = tokio::time::timeout(
-        timeout,
-        tokio::task::spawn_blocking(move || loop {
-            match receiver.recv() {
-                Ok(ServiceEvent::ServiceResolved(info)) => {
-                    if let Some(peer) = discovered_peer(&info) {
-                        if peer.fingerprint == browse_fingerprint {
-                            info!(
-                                "Discovered trusted server '{}' at {} ({})",
-                                peer.name, peer.addr, peer.fingerprint
-                            );
-                            return Ok(peer.addr);
-                        }
-                        debug!(
-                            "Ignoring server '{}' at {} with fingerprint {}",
+    let task = tokio::task::spawn_blocking(move || loop {
+        match receiver.recv() {
+            Ok(ServiceEvent::ServiceResolved(info)) => {
+                if let Some(peer) = discovered_peer(&info) {
+                    if peer.fingerprint == browse_fingerprint {
+                        info!(
+                            "Discovered trusted server '{}' at {} ({})",
                             peer.name, peer.addr, peer.fingerprint
                         );
+                        return Ok(peer.addr);
                     }
+                    debug!(
+                        "Ignoring server '{}' at {} with fingerprint {}",
+                        peer.name, peer.addr, peer.fingerprint
+                    );
                 }
-                Ok(_) => {}
-                Err(_) => return Err(eyre!("mDNS browse channel closed")),
             }
-        }),
-    )
-    .await;
+            Ok(_) => {}
+            Err(_) => return Err(eyre!("mDNS browse channel closed")),
+        }
+    });
 
-    mdns.shutdown().ok();
-
-    match result {
-        Ok(Ok(addr)) => addr,
-        Ok(Err(e)) => Err(e.into()),
-        Err(_) => Err(eyre!(
+    match run_bounded_discovery_task(task, timeout, move || drop(browse_handle)).await? {
+        Some(addr) => Ok(addr),
+        None => Err(eyre!(
             "No nexdesk server with fingerprint {} found within {:?}",
             expected_fingerprint,
             timeout
@@ -395,5 +425,33 @@ mod tests {
     fn mdns_adapter_implements_discovery_port() {
         fn assert_adapter(_: &dyn PeerDiscovery) {}
         assert_adapter(&MdnsDiscovery);
+    }
+
+    #[tokio::test]
+    async fn timed_out_discovery_shuts_down_and_joins_blocking_receiver() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let receiver_exited = Arc::new(AtomicBool::new(false));
+        let (shutdown_send, shutdown_recv) = std::sync::mpsc::channel();
+        let exited = receiver_exited.clone();
+        let task: tokio::task::JoinHandle<Result<()>> = tokio::task::spawn_blocking(move || {
+            shutdown_recv.recv().ok();
+            exited.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let called = shutdown_called.clone();
+
+        let result = run_bounded_discovery_task(task, Duration::from_millis(10), move || {
+            called.store(true, Ordering::SeqCst);
+            shutdown_send.send(()).ok();
+        })
+        .await
+        .unwrap();
+
+        assert!(result.is_none());
+        assert!(shutdown_called.load(Ordering::SeqCst));
+        assert!(receiver_exited.load(Ordering::SeqCst));
     }
 }
