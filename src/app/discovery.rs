@@ -10,32 +10,31 @@ use crate::ports::{DiscoveredPeer, DiscoveryEvent, PeerDiscovery};
 pub async fn resolve_peer_with_retry(
     discovery: &dyn PeerDiscovery,
     expected_fingerprint: &str,
-    timeout: Duration,
+    attempt_timeout: Duration,
     attempts: u32,
     cancellation: &CancellationToken,
 ) -> Result<SocketAddr> {
     if attempts == 0 {
         return Err(eyre!("Discovery requires at least one attempt"));
     }
-    let per_attempt = timeout
-        .checked_div(attempts)
-        .filter(|duration| !duration.is_zero())
-        .unwrap_or(timeout);
     let mut last_error = None;
 
     for _ in 0..attempts {
         let result = tokio::select! {
             _ = cancellation.cancelled() => return Err(eyre!("Discovery cancelled")),
             result = tokio::time::timeout(
-                per_attempt,
-                discovery.resolve_one(expected_fingerprint, per_attempt),
+                attempt_timeout,
+                discovery.resolve_one(expected_fingerprint, attempt_timeout),
             ) => result,
         };
         match result {
             Ok(Ok(addr)) => return Ok(addr),
             Ok(Err(error)) => last_error = Some(error),
             Err(_) => {
-                last_error = Some(eyre!("Discovery attempt timed out after {:?}", per_attempt))
+                last_error = Some(eyre!(
+                    "Discovery attempt timed out after {:?}",
+                    attempt_timeout
+                ))
             }
         }
     }
@@ -89,6 +88,28 @@ mod tests {
         tokio::pin!(resolution);
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(1)).await;
+
+        assert_eq!(resolution.await.unwrap(), addr);
+        assert_eq!(discovery.remaining_resolves(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_applies_to_each_discovery_attempt() {
+        let discovery = ScriptedDiscovery::new();
+        let addr = "192.0.2.10:4242".parse().unwrap();
+        discovery.resolve_after(Duration::from_secs(4), "AA:BB", addr);
+        let cancellation = CancellationToken::new();
+
+        let resolution = resolve_peer_with_retry(
+            &discovery,
+            "AA:BB",
+            Duration::from_secs(6),
+            3,
+            &cancellation,
+        );
+        tokio::pin!(resolution);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(4)).await;
 
         assert_eq!(resolution.await.unwrap(), addr);
         assert_eq!(discovery.remaining_resolves(), 0);
