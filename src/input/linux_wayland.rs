@@ -258,21 +258,27 @@ fn find_keyboard_devices(entries: &[PathBuf], pointer_paths: &HashSet<PathBuf>) 
     found
 }
 
-/// Get screen size from X11 (XWayland provides correct screen dimensions)
-/// or fallback to a DRM-based approach.
-fn get_screen_size() -> (u32, u32) {
-    // Try X11 first (XWayland reports correct size)
-    if let Ok((conn, screen_num)) = x11rb::rust_connection::RustConnection::connect(None) {
-        let screen = &conn.setup().roots[screen_num];
-        let w = screen.width_in_pixels as u32;
-        let h = screen.height_in_pixels as u32;
-        if w > 0 && h > 0 {
-            return (w, h);
-        }
+/// Get screen size from X11. XWayland provides the compositor dimensions.
+pub(crate) fn query_screen_size() -> Result<(u32, u32)> {
+    let (conn, screen_num) = x11rb::rust_connection::RustConnection::connect(None)
+        .wrap_err("Failed to connect to X11 for screen dimensions")?;
+    let screen = &conn.setup().roots[screen_num];
+    let size = (
+        screen.width_in_pixels as u32,
+        screen.height_in_pixels as u32,
+    );
+    if size.0 == 0 || size.1 == 0 {
+        return Err(eyre!(
+            "X11 returned an invalid screen size {}x{}",
+            size.0,
+            size.1
+        ));
     }
+    Ok(size)
+}
 
-    // Fallback
-    (1920, 1080)
+fn get_screen_size() -> (u32, u32) {
+    query_screen_size().unwrap_or((1920, 1080))
 }
 
 /// Evdev-based input capturer for Wayland.

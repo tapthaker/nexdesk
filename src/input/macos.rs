@@ -34,6 +34,14 @@ const MAIN_DISPLAY: CGDirectDisplayID = 0;
 const CORE_GRAPHICS_DIAGNOSTIC_THRESHOLD: Duration = Duration::from_millis(4);
 
 #[cfg(target_os = "macos")]
+pub(crate) fn query_screen_size() -> Result<(u32, u32)> {
+    Ok((
+        CGDisplayPixelsWide(MAIN_DISPLAY) as u32,
+        CGDisplayPixelsHigh(MAIN_DISPLAY) as u32,
+    ))
+}
+
+#[cfg(target_os = "macos")]
 fn log_core_graphics_timing(operation: &str, started: Instant) {
     let elapsed = started.elapsed();
     if elapsed >= CORE_GRAPHICS_DIAGNOSTIC_THRESHOLD {
@@ -99,10 +107,7 @@ impl InputCapture for MacOSCapturer {
     }
 
     fn screen_size(&self) -> Result<(u32, u32)> {
-        Ok((
-            CGDisplayPixelsWide(MAIN_DISPLAY) as u32,
-            CGDisplayPixelsHigh(MAIN_DISPLAY) as u32,
-        ))
+        query_screen_size()
     }
 
     fn mouse_buttons(&self) -> Result<u8> {

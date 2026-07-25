@@ -19,7 +19,9 @@ use crate::app::{
     UpdatePolicy, UpdateSource,
 };
 use crate::clipboard::PlatformClipboard;
-use crate::input::capture::{InputCapture, InputCaptureFactory, PlatformInputCaptureFactory};
+use crate::input::capture::{
+    query_platform_screen_size, InputCapture, InputCaptureFactory, PlatformInputCaptureFactory,
+};
 use crate::input::inject::{InputInjector, InputInjectorFactory, PlatformInputInjectorFactory};
 use crate::input::wake::PlatformDisplaySessionControl;
 use crate::net::discovery;
@@ -49,6 +51,8 @@ const POINTER_FRAME_INTERVAL: Duration = Duration::from_micros(4_167); // ~240 H
 const MOUSE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const USER_ACTIVITY_INTERVAL: Duration = Duration::from_secs(20);
 const LOCAL_LOCK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const SCREEN_SIZE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+const SERVER_BLOCKING_PROBE_WARN_THRESHOLD: Duration = Duration::from_millis(10);
 const CLIENT_LATENCY_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const CLIENT_LATENCY_RESTART_THRESHOLD: Duration = Duration::from_secs(3);
 const CLIENT_LATENCY_RESTART_STRIKES: u8 = 3;
@@ -397,6 +401,32 @@ fn server_session_is_locked(lock_source: &dyn LocalSessionLockSource) -> bool {
             false
         }
     }
+}
+
+async fn run_server_blocking_probe<T, F>(operation: &'static str, probe: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let started = Instant::now();
+    let value = tokio::task::spawn_blocking(probe)
+        .await
+        .wrap_err_with(|| format!("{} worker failed", operation))?;
+    let elapsed = started.elapsed();
+    if elapsed >= SERVER_BLOCKING_PROBE_WARN_THRESHOLD {
+        warn!(
+            "Server worker diagnostics: operation={} elapsed_us={}",
+            operation,
+            elapsed.as_micros()
+        );
+    } else {
+        debug!(
+            "Server worker diagnostics: operation={} elapsed_us={}",
+            operation,
+            elapsed.as_micros()
+        );
+    }
+    Ok(value)
 }
 
 fn require_layer_shell_event(
@@ -963,7 +993,7 @@ async fn serve_with_dependencies(
                 &otp,
                 &fp,
                 capture_factory.as_ref(),
-                lock_source.as_ref(),
+                lock_source,
                 display_control,
             )
             .await
@@ -988,7 +1018,7 @@ async fn handle_server_connection(
     server_otp: &str,
     server_fingerprint: &str,
     capture_factory: &dyn InputCaptureFactory,
-    lock_source: &dyn LocalSessionLockSource,
+    lock_source: Arc<dyn LocalSessionLockSource>,
     display_control: Arc<dyn DisplaySessionControl>,
 ) -> Result<()> {
     let remote = connection.remote_address();
@@ -1079,6 +1109,42 @@ async fn handle_server_connection(
     let input_send = TypedServerInputSender { peer: peer.clone() };
     let mut connection_tasks = tokio::task::JoinSet::new();
 
+    // Session-lock and display APIs may launch subprocesses or perform display
+    // server round trips. Keep them off the latency-sensitive input loop and
+    // publish only their latest result through bounded channels.
+    let (local_lock_state_tx, mut local_lock_state_rx) = tokio::sync::mpsc::channel(1);
+    let monitored_lock_source = lock_source.clone();
+    connection_tasks.spawn(async move {
+        let mut interval = time::interval(LOCAL_LOCK_CHECK_INTERVAL);
+        interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let source = monitored_lock_source.clone();
+            let result = run_server_blocking_probe("session_lock_query", move || {
+                server_session_is_locked(source.as_ref())
+            })
+            .await;
+            if local_lock_state_tx.send(result).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let (screen_size_tx, mut screen_size_rx) = tokio::sync::mpsc::channel(1);
+    connection_tasks.spawn(async move {
+        let mut interval = time::interval(SCREEN_SIZE_CHECK_INTERVAL);
+        interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let result = run_server_blocking_probe("screen_size_query", query_platform_screen_size)
+                .await
+                .and_then(|result| result);
+            if screen_size_tx.send(result).await.is_err() {
+                break;
+            }
+        }
+    });
+
     // Keep all clipboard commands on a dedicated worker path. Linux clipboard
     // owners may daemonize or stall, so the server control/input loop must never
     // await a clipboard command (heartbeats and disconnects still need service).
@@ -1145,14 +1211,17 @@ async fn handle_server_connection(
         u32,
     )> = None;
 
-    let (mut capture_rx, capture_tx, use_layer_shell) = match layer_shell {
-        Some((rx, tx, _sw, _sh)) => {
-            info!("Using layer-shell capture (zero-latency edge detection)");
-            (Some(rx), Some(tx), true)
+    let (mut capture_rx, capture_tx, use_layer_shell, layer_shell_screen) = match layer_shell {
+        Some((rx, tx, width, height)) => {
+            info!(
+                "Using layer-shell capture (zero-latency edge detection), screen {}x{}",
+                width, height
+            );
+            (Some(rx), Some(tx), true, Some((width, height)))
         }
         None => {
             info!("Using evdev polling capture");
-            (None, None, false)
+            (None, None, false, None)
         }
     };
 
@@ -1215,10 +1284,7 @@ async fn handle_server_connection(
     let mut activation_started_unix_ms: u64 = 0;
     let mut activation_diagnostics = ServerActivationDiagnostics::default();
     let mut debug_counter: u64 = 0;
-    let mut last_screen_w = screen_w;
-    let mut last_screen_h = screen_h;
-    let mut screen_check = time::interval(Duration::from_secs(5));
-    let mut local_lock_check = time::interval(LOCAL_LOCK_CHECK_INTERVAL);
+    let (mut last_screen_w, mut last_screen_h) = layer_shell_screen.unwrap_or((screen_w, screen_h));
 
     let mut prev_mouse_pos: (i32, i32) = (0, 0);
     let mut last_user_activity_sent = Instant::now() - USER_ACTIVITY_INTERVAL;
@@ -1804,48 +1870,59 @@ async fn handle_server_connection(
                     activation_started = None;
                 }
             }
-            _ = local_lock_check.tick(), if transition.is_active() => {
-                if server_session_is_locked(lock_source) {
-                    warn!("Local session locked while sharing — releasing remote control so Linux can be unlocked locally");
-                    let messages = transition.deactivate_for_shortcut();
-                    notify_after_local_input_release(
-                        || {
-                            if use_layer_shell {
-                                #[cfg(target_os = "linux")]
-                                if let Some(ref tx) = capture_tx {
-                                    use crate::input::wayland_layer_shell::LayerShellCommand;
-                                    tx.send(LayerShellCommand::Release).ok();
+            lock_state = local_lock_state_rx.recv() => {
+                match lock_state {
+                    Some(Ok(true)) if transition.is_active() => {
+                        warn!("Local session locked while sharing — releasing remote control so Linux can be unlocked locally");
+                        let messages = transition.deactivate_for_shortcut();
+                        notify_after_local_input_release(
+                            || {
+                                if use_layer_shell {
+                                    #[cfg(target_os = "linux")]
+                                    if let Some(ref tx) = capture_tx {
+                                        use crate::input::wayland_layer_shell::LayerShellCommand;
+                                        tx.send(LayerShellCommand::Release).ok();
+                                    }
+                                    capturer.lock().unwrap().set_keyboard_grab(false).ok();
+                                    layer_shell_keyboard_grabbed = false;
+                                } else {
+                                    capturer.lock().unwrap().set_grab(false).ok();
                                 }
-                                capturer.lock().unwrap().set_keyboard_grab(false).ok();
-                                layer_shell_keyboard_grabbed = false;
-                            } else {
-                                capturer.lock().unwrap().set_grab(false).ok();
-                            }
-                        },
-                        async {
-                            if !messages.is_empty() {
-                                let mut sender = input_send.lock().await;
-                                for msg in messages {
-                                    send_message_uni(&mut sender, &msg).await.ok();
+                            },
+                            async {
+                                if !messages.is_empty() {
+                                    let mut sender = input_send.lock().await;
+                                    for msg in messages {
+                                        send_message_uni(&mut sender, &msg).await.ok();
+                                    }
                                 }
-                            }
-                            if let Err(error) = peer
-                                .send_control(ServerControlCommand::ReleasePeerControl)
-                                .await
-                            {
-                                warn!("Failed to tell peer that the server reclaimed control: {}", error);
-                            }
-                        },
-                    )
-                    .await;
+                                if let Err(error) = peer
+                                    .send_control(ServerControlCommand::ReleasePeerControl)
+                                    .await
+                                {
+                                    warn!("Failed to tell peer that the server reclaimed control: {}", error);
+                                }
+                            },
+                        )
+                        .await;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => warn!("Session-lock monitor failed: {}", error),
+                    None => {
+                        warn!("Session-lock monitor stopped unexpectedly");
+                        break;
+                    }
                 }
             }
-            _ = screen_check.tick() => {
-                let size = capturer.lock().unwrap().screen_size();
-                let size = match size {
-                    Ok(size) => size,
-                    Err(error) => {
-                        warn!("Screen capture failed: {}", error);
+            screen_result = screen_size_rx.recv() => {
+                let size = match screen_result {
+                    Some(Ok(size)) => size,
+                    Some(Err(error)) => {
+                        warn!("Screen-size monitor failed: {}", error);
+                        continue;
+                    }
+                    None => {
+                        warn!("Screen-size monitor stopped unexpectedly");
                         break;
                     }
                 };
@@ -3338,6 +3415,44 @@ mod input_coalescing_tests {
         assert_eq!(capture.keyboard_only_polls, 1);
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], Message::KeyEvent { keycode: 30, .. }));
+    }
+
+    struct GatedLockSource {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl LocalSessionLockSource for GatedLockSource {
+        fn is_locked(&self) -> Result<bool> {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            Ok(true)
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_lock_query_does_not_block_the_async_runtime() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let source: Arc<dyn LocalSessionLockSource> = Arc::new(GatedLockSource {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+
+        let query = tokio::spawn(run_server_blocking_probe(
+            "test_session_lock_query",
+            move || server_session_is_locked(source.as_ref()),
+        ));
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(1)))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let marker = tokio::spawn(async { "runtime progressed" });
+        assert_eq!(marker.await.unwrap(), "runtime progressed");
+
+        release_tx.send(()).unwrap();
+        assert!(query.await.unwrap().unwrap());
     }
 
     #[test]

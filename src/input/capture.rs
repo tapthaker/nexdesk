@@ -2,6 +2,25 @@ use color_eyre::eyre::Result;
 
 use crate::net::protocol::Message;
 
+/// Query the current primary screen dimensions without borrowing the input
+/// capturer. Call this from a blocking worker, never from the input loop.
+pub fn query_platform_screen_size() -> Result<(u32, u32)> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::input::linux_wayland::query_screen_size()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        crate::input::macos::query_screen_size()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(color_eyre::eyre::eyre!("Unsupported platform"))
+    }
+}
+
 /// Trait for capturing input events from the local machine.
 pub trait InputCapture: Send {
     /// Get the current mouse position.
