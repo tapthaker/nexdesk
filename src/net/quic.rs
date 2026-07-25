@@ -54,6 +54,7 @@ const LOCAL_LOCK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const SCREEN_SIZE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const SERVER_BLOCKING_PROBE_WARN_THRESHOLD: Duration = Duration::from_millis(10);
 const SERVER_INPUT_QUEUE_CAPACITY: usize = 256;
+const SERVER_CONTROL_QUEUE_CAPACITY: usize = 64;
 const SERVER_INPUT_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 const SERVER_INPUT_SLOW_PATH_THRESHOLD: Duration = Duration::from_millis(10);
 const CLIENT_LATENCY_CHECK_INTERVAL: Duration = Duration::from_secs(2);
@@ -640,17 +641,14 @@ fn release_defensive_keyups(injector: &mut dyn InputInjector) {
     }
 }
 
-async fn send_user_activity(peer: &dyn ServerPeerLink, last_sent: &mut Instant) {
+fn send_user_activity(sender: &ServerControlSender, last_sent: &mut Instant) {
     if last_sent.elapsed() < USER_ACTIVITY_INTERVAL {
         return;
     }
 
-    if peer
-        .send_control(ServerControlCommand::WakePeerDisplay)
-        .await
-        .is_ok()
-    {
-        *last_sent = Instant::now();
+    match sender.try_send(ServerControlCommand::WakePeerDisplay) {
+        Ok(()) => *last_sent = Instant::now(),
+        Err(error) => warn!("Failed to queue peer display wake: {}", error),
     }
 }
 
@@ -911,6 +909,102 @@ async fn run_server_input_sender(
             failure
         );
         queue.fail(failure.clone());
+        failure_tx.send(failure).await.ok();
+        return;
+    }
+}
+
+struct QueuedServerControl {
+    command: ServerControlCommand,
+    queued_at: Instant,
+}
+
+enum ServerControlQueueItem {
+    Command(QueuedServerControl),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+#[derive(Clone)]
+struct ServerControlSender {
+    sender: tokio::sync::mpsc::Sender<ServerControlQueueItem>,
+}
+
+impl ServerControlSender {
+    fn try_send(&self, command: ServerControlCommand) -> Result<()> {
+        self.sender
+            .try_send(ServerControlQueueItem::Command(QueuedServerControl {
+                command,
+                queued_at: Instant::now(),
+            }))
+            .map_err(|error| eyre!("Failed to queue server control command: {}", error))
+    }
+
+    async fn send(&self, command: ServerControlCommand) -> Result<()> {
+        self.sender
+            .send(ServerControlQueueItem::Command(QueuedServerControl {
+                command,
+                queued_at: Instant::now(),
+            }))
+            .await
+            .map_err(|_| eyre!("Server control sender stopped"))
+    }
+
+    async fn flush(&self) -> Result<()> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        time::timeout(SERVER_INPUT_SEND_TIMEOUT, async {
+            self.sender
+                .send(ServerControlQueueItem::Flush(send))
+                .await
+                .map_err(|_| eyre!("Server control sender stopped during flush"))?;
+            receive
+                .await
+                .map_err(|_| eyre!("Server control flush was cancelled"))
+        })
+        .await
+        .wrap_err("Timed out flushing server control sender")??;
+        Ok(())
+    }
+}
+
+async fn run_server_control_sender(
+    mut receiver: tokio::sync::mpsc::Receiver<ServerControlQueueItem>,
+    peer: Arc<dyn ServerPeerLink>,
+    failure_tx: tokio::sync::mpsc::Sender<String>,
+) {
+    while let Some(item) = receiver.recv().await {
+        let queued = match item {
+            ServerControlQueueItem::Command(queued) => queued,
+            ServerControlQueueItem::Flush(completed) => {
+                completed.send(()).ok();
+                continue;
+            }
+        };
+        let residence = queued.queued_at.elapsed();
+        let send_started = Instant::now();
+        let result =
+            time::timeout(SERVER_INPUT_SEND_TIMEOUT, peer.send_control(queued.command)).await;
+        let send_elapsed = send_started.elapsed();
+        if residence >= SERVER_INPUT_SLOW_PATH_THRESHOLD
+            || send_elapsed >= SERVER_INPUT_SLOW_PATH_THRESHOLD
+        {
+            warn!(
+                "Server control sender diagnostics: queue_residence_us={} send_latency_us={}",
+                residence.as_micros(),
+                send_elapsed.as_micros()
+            );
+        }
+        let failure = match result {
+            Ok(Ok(())) => continue,
+            Ok(Err(error)) => format!("Control transport send failed: {}", error),
+            Err(_) => format!(
+                "Control transport send timed out after {}ms",
+                SERVER_INPUT_SEND_TIMEOUT.as_millis()
+            ),
+        };
+        warn!(
+            "Server control sender diagnostics: event=failed error={}",
+            failure
+        );
         failure_tx.send(failure).await.ok();
         return;
     }
@@ -1319,6 +1413,55 @@ async fn handle_server_connection(
         input_failure_tx,
     ));
 
+    let (control_queue_tx, control_queue_rx) =
+        tokio::sync::mpsc::channel(SERVER_CONTROL_QUEUE_CAPACITY);
+    let control_send = ServerControlSender {
+        sender: control_queue_tx,
+    };
+    let (control_failure_tx, mut control_failure_rx) = tokio::sync::mpsc::channel(1);
+    let control_peer = peer.clone();
+    connection_tasks.spawn(run_server_control_sender(
+        control_queue_rx,
+        control_peer,
+        control_failure_tx,
+    ));
+
+    // Drain transport events independently of input capture. Heartbeats are
+    // acknowledged here so an input-loop stall cannot delay control liveness.
+    let (server_event_tx, mut server_event_rx) =
+        tokio::sync::mpsc::channel(SERVER_CONTROL_QUEUE_CAPACITY);
+    let event_peer = peer.clone();
+    let heartbeat_sender = control_send.clone();
+    let heartbeat_connection = connection.clone();
+    connection_tasks.spawn(async move {
+        while let Some(event) = event_peer.next_event().await {
+            match event {
+                ServerTransportEvent::Control(ServerControlEvent::Heartbeat { timestamp }) => {
+                    debug!(
+                        "Transport diagnostics: side=server event=heartbeat_received unix_ms={} session_id={} peer={} ping_unix_ms={} quic_rtt_ms={}",
+                        unix_millis(),
+                        session_id,
+                        remote,
+                        timestamp,
+                        heartbeat_connection.rtt().as_millis()
+                    );
+                    if let Err(error) = heartbeat_sender
+                        .send(ServerControlCommand::AcknowledgeHeartbeat { timestamp })
+                        .await
+                    {
+                        warn!("Failed to queue heartbeat acknowledgement: {}", error);
+                        break;
+                    }
+                }
+                event => {
+                    if server_event_tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
     // Session-lock and display APIs may launch subprocesses or perform display
     // server round trips. Keep them off the latency-sensitive input loop and
     // publish only their latest result through bounded channels.
@@ -1524,7 +1667,7 @@ async fn handle_server_connection(
 
                 let has_input = (mx, my) != prev_mouse_pos || !key_events.is_empty() || buttons != 0;
                 if has_input {
-                    send_user_activity(peer.as_ref(), &mut last_user_activity_sent).await;
+                    send_user_activity(&control_send, &mut last_user_activity_sent);
                     prev_mouse_pos = (mx, my);
                 }
 
@@ -1654,7 +1797,7 @@ async fn handle_server_connection(
                 };
 
                 if !key_events.is_empty() {
-                    send_user_activity(peer.as_ref(), &mut last_user_activity_sent).await;
+                    send_user_activity(&control_send, &mut last_user_activity_sent);
                 }
 
                 match transition.poll_active_keys(key_events) {
@@ -1793,7 +1936,7 @@ async fn handle_server_connection(
                     coalesced_motion_events,
                     depth_after_push,
                 } = received;
-                send_user_activity(peer.as_ref(), &mut last_user_activity_sent).await;
+                send_user_activity(&control_send, &mut last_user_activity_sent);
 
                 match event {
                     LayerShellEvent::EdgeEnter { direction } => {
@@ -1985,20 +2128,16 @@ async fn handle_server_connection(
                 }
                 break;
             }
-            // Branch: typed peer events
-            event = peer.next_event() => {
+            failure = control_failure_rx.recv() => {
+                match failure {
+                    Some(error) => warn!("Control sender stopped; reclaiming local input: {}", error),
+                    None => warn!("Control sender stopped unexpectedly; reclaiming local input"),
+                }
+                break;
+            }
+            // Branch: typed peer events dispatched by the independent reader.
+            event = server_event_rx.recv() => {
                 match event {
-                    Some(ServerTransportEvent::Control(ServerControlEvent::Heartbeat { timestamp })) => {
-                        debug!(
-                            "Transport diagnostics: side=server event=heartbeat_received unix_ms={} session_id={} peer={} ping_unix_ms={} quic_rtt_ms={}",
-                            unix_millis(),
-                            session_id,
-                            remote,
-                            timestamp,
-                            connection.rtt().as_millis()
-                        );
-                        peer.send_control(ServerControlCommand::AcknowledgeHeartbeat { timestamp }).await?;
-                    }
                     Some(ServerTransportEvent::Control(ServerControlEvent::SwitchBackRequested { direction })) => {
                         request_server_display_wake(display_control.clone());
                         pending_layer_shell_motion = (0.0, 0.0);
@@ -2028,6 +2167,9 @@ async fn handle_server_connection(
                             width: screen.width,
                             height: screen.height,
                         });
+                    }
+                    Some(ServerTransportEvent::Control(ServerControlEvent::Heartbeat { .. })) => {
+                        warn!("Heartbeat unexpectedly reached the server input loop");
                     }
                     Some(ServerTransportEvent::Clipboard(ServerClipboardEvent::TextChanged(text))) => {
                         if clipboard_update_tx
@@ -2113,11 +2255,10 @@ async fn handle_server_connection(
                                         send_message_uni(&mut sender, &msg).await.ok();
                                     }
                                 }
-                                if let Err(error) = peer
-                                    .send_control(ServerControlCommand::ReleasePeerControl)
-                                    .await
+                                if let Err(error) = control_send
+                                    .try_send(ServerControlCommand::ReleasePeerControl)
                                 {
-                                    warn!("Failed to tell peer that the server reclaimed control: {}", error);
+                                    warn!("Failed to queue remote-control release: {}", error);
                                 }
                             },
                         )
@@ -2151,8 +2292,8 @@ async fn handle_server_connection(
                         width: size.0,
                         height: size.1,
                     });
-                    if let Err(e) = peer.send_control(resize).await {
-                        warn!("Failed to send screen resize: {}", e);
+                    if let Err(error) = control_send.try_send(resize) {
+                        warn!("Failed to queue screen resize: {}", error);
                         break;
                     }
                 }
@@ -2185,6 +2326,12 @@ async fn handle_server_connection(
         warn!("Failed to flush queued input during cleanup: {}", error);
     }
     input_send.close();
+    if let Err(error) = control_send.flush().await {
+        warn!(
+            "Failed to flush queued control messages during cleanup: {}",
+            error
+        );
+    }
     let release_messages = {
         let mut capturer = capturer.lock().unwrap();
         restore_server_input_state(&mut **capturer, use_layer_shell, &mut transition)
@@ -3705,6 +3852,33 @@ mod input_coalescing_tests {
         blocked.release();
         queue.flush().await.unwrap();
         queue.close();
+        worker.await.unwrap();
+        assert!(matches!(
+            failure_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn blocked_control_transport_does_not_block_session_progress() {
+        let peer = Arc::new(crate::testing::ScriptedServerPeerLink::new());
+        let blocked = peer.block_next_send(crate::testing::ServerSendOperation::Control);
+        let (sender, receiver) = tokio::sync::mpsc::channel(SERVER_CONTROL_QUEUE_CAPACITY);
+        let control = ServerControlSender { sender };
+        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
+        let worker = tokio::spawn(run_server_control_sender(receiver, peer, failure_tx));
+
+        control
+            .try_send(ServerControlCommand::WakePeerDisplay)
+            .unwrap();
+        blocked.wait_until_entered().await;
+
+        let marker = tokio::spawn(async { "session progressed" });
+        assert_eq!(marker.await.unwrap(), "session progressed");
+
+        blocked.release();
+        control.flush().await.unwrap();
+        drop(control);
         worker.await.unwrap();
         assert!(matches!(
             failure_rx.try_recv(),
