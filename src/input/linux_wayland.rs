@@ -1,10 +1,11 @@
 use std::collections::HashSet;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use evdev::{AbsoluteAxisType, Device, InputEventKind, Key, RelativeAxisType};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use x11rb::connection::Connection;
 
 use crate::input::capture::InputCapture;
@@ -101,6 +102,25 @@ mod tests {
         assert!(pressed.is_empty());
         assert!(events.is_empty());
     }
+
+    #[test]
+    fn keyboard_device_topology_ignores_order_but_detects_hotplug() {
+        let first = vec![
+            PathBuf::from("/dev/input/event1"),
+            PathBuf::from("/dev/input/event2"),
+        ];
+        let reordered = vec![
+            PathBuf::from("/dev/input/event2"),
+            PathBuf::from("/dev/input/event1"),
+        ];
+        let replaced = vec![
+            PathBuf::from("/dev/input/event2"),
+            PathBuf::from("/dev/input/event3"),
+        ];
+
+        assert!(!keyboard_device_paths_changed(&first, &reordered));
+        assert!(keyboard_device_paths_changed(&first, &replaced));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +144,29 @@ struct PointerDevice {
     touching: bool,
     /// Number of fingers on the touchpad (1 = move, 2 = scroll)
     finger_count: u32,
+}
+
+struct KeyboardDevice {
+    path: PathBuf,
+    device: Device,
+}
+
+fn keyboard_device_paths_changed(current: &[PathBuf], discovered: &[PathBuf]) -> bool {
+    current.len() != discovered.len() || current.iter().any(|path| !discovered.contains(path))
+}
+
+fn open_keyboard_device(path: &PathBuf) -> Result<KeyboardDevice> {
+    let device = Device::open(path)
+        .wrap_err_with(|| format!("Failed to open keyboard {}", path.display()))?;
+    let fd = device.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    Ok(KeyboardDevice {
+        path: path.clone(),
+        device,
+    })
 }
 
 /// Collect all /dev/input/event* entries once for reuse.
@@ -286,10 +329,12 @@ fn get_screen_size() -> (u32, u32) {
 /// forwards deltas to the remote when grabbed (active sharing).
 pub struct WaylandCapturer {
     devices: Vec<PointerDevice>,
-    keyboard_devices: Vec<Device>,
+    keyboard_devices: Vec<KeyboardDevice>,
     cursor_x: i32,
     cursor_y: i32,
     grabbed: bool,
+    keyboard_grabbed: bool,
+    last_keyboard_refresh: Instant,
     screen_width: u32,
     screen_height: u32,
     pressed_keys: HashSet<u32>,
@@ -328,14 +373,7 @@ impl WaylandCapturer {
         let kb_paths = find_keyboard_devices(&entries, &pointer_paths);
         let mut keyboard_devices = Vec::new();
         for path in &kb_paths {
-            let device = Device::open(path)
-                .wrap_err_with(|| format!("Failed to open keyboard {}", path.display()))?;
-            let fd = device.as_raw_fd();
-            unsafe {
-                let flags = libc::fcntl(fd, libc::F_GETFL);
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
-            keyboard_devices.push(device);
+            keyboard_devices.push(open_keyboard_device(path)?);
         }
 
         let (screen_width, screen_height) = get_screen_size();
@@ -357,6 +395,8 @@ impl WaylandCapturer {
             cursor_x,
             cursor_y,
             grabbed: false,
+            keyboard_grabbed: false,
+            last_keyboard_refresh: Instant::now(),
             screen_width,
             screen_height,
             pressed_keys: HashSet::new(),
@@ -366,6 +406,8 @@ impl WaylandCapturer {
             scroll_acc_y: 0.0,
         })
     }
+
+    const KEYBOARD_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
     /// Touchpad-to-screen speed multiplier.
     /// Slightly below compositor speed so edge detection triggers
@@ -378,12 +420,56 @@ impl WaylandCapturer {
     /// Touchpad scroll sensitivity (fraction of screen per full-pad swipe).
     const TOUCHPAD_SCROLL_SPEED: f64 = 0.8;
 
+    fn refresh_keyboard_devices(&mut self, force: bool) -> Result<()> {
+        self.last_keyboard_refresh = Instant::now();
+        let entries = input_event_entries()?;
+        let pointer_paths = find_pointer_devices(&entries)
+            .map(|(_, paths)| paths)
+            .unwrap_or_default();
+        let discovered = find_keyboard_devices(&entries, &pointer_paths);
+        let current = self
+            .keyboard_devices
+            .iter()
+            .map(|keyboard| keyboard.path.clone())
+            .collect::<Vec<_>>();
+        if !force && !keyboard_device_paths_changed(&current, &discovered) {
+            return Ok(());
+        }
+
+        let mut replacements = Vec::new();
+        for path in &discovered {
+            let mut keyboard = open_keyboard_device(path)?;
+            if self.keyboard_grabbed {
+                keyboard
+                    .device
+                    .grab()
+                    .wrap_err_with(|| format!("Failed to grab keyboard {}", path.display()))?;
+            }
+            replacements.push(keyboard);
+        }
+
+        for keycode in self.pressed_keys.drain() {
+            self.pending_key_events.push(Message::KeyEvent {
+                keycode,
+                pressed: false,
+                modifiers: 0,
+            });
+        }
+        self.keyboard_devices = replacements;
+        info!(
+            "Refreshed Wayland keyboard devices after input hotplug ({} device(s))",
+            self.keyboard_devices.len()
+        );
+        Ok(())
+    }
+
     /// Read one currently available batch from each keyboard. Avoid looping
     /// until WouldBlock: a high-rate device can keep refilling its queue and
     /// monopolize the async connection task.
-    fn drain_keyboard_events(&mut self) {
-        for device in &mut self.keyboard_devices {
-            match device.fetch_events() {
+    fn drain_keyboard_events(&mut self) -> Result<()> {
+        let mut refresh_required = false;
+        for keyboard in &mut self.keyboard_devices {
+            match keyboard.device.fetch_events() {
                 Ok(events) => {
                     for event in events {
                         if let InputEventKind::Key(key) = event.kind() {
@@ -397,9 +483,22 @@ impl WaylandCapturer {
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => warn!("Failed to read keyboard events: {}", error),
+                Err(error) => {
+                    warn!(
+                        "Keyboard device {} became unavailable: {}",
+                        keyboard.path.display(),
+                        error
+                    );
+                    refresh_required = true;
+                }
             }
         }
+        if refresh_required {
+            self.refresh_keyboard_devices(true)?;
+        } else if self.last_keyboard_refresh.elapsed() >= Self::KEYBOARD_REFRESH_INTERVAL {
+            self.refresh_keyboard_devices(false)?;
+        }
+        Ok(())
     }
 
     /// Process all pending events from all devices.
@@ -580,7 +679,9 @@ impl WaylandCapturer {
         // when sharing to a remote screen. The server loop clamps as needed
         // for local edge detection.
 
-        self.drain_keyboard_events();
+        if let Err(error) = self.drain_keyboard_events() {
+            warn!("Failed to refresh keyboard devices: {}", error);
+        }
     }
 }
 
@@ -598,6 +699,9 @@ impl InputCapture for WaylandCapturer {
     }
 
     fn set_grab(&mut self, grab: bool) -> Result<()> {
+        if grab {
+            self.refresh_keyboard_devices(true)?;
+        }
         for pdev in &mut self.devices {
             if grab {
                 pdev.device
@@ -609,14 +713,21 @@ impl InputCapture for WaylandCapturer {
                     .wrap_err("Failed to ungrab pointer device")?;
             }
         }
-        for kdev in &mut self.keyboard_devices {
+        for keyboard in &mut self.keyboard_devices {
             if grab {
-                kdev.grab().wrap_err("Failed to grab keyboard device")?;
+                keyboard
+                    .device
+                    .grab()
+                    .wrap_err("Failed to grab keyboard device")?;
             } else {
-                kdev.ungrab().wrap_err("Failed to ungrab keyboard device")?;
+                keyboard
+                    .device
+                    .ungrab()
+                    .wrap_err("Failed to ungrab keyboard device")?;
             }
         }
         self.grabbed = grab;
+        self.keyboard_grabbed = grab;
         debug!(
             "Input devices {} ({} pointers, {} keyboards)",
             if grab { "grabbed" } else { "ungrabbed" },
@@ -627,13 +738,23 @@ impl InputCapture for WaylandCapturer {
     }
 
     fn set_keyboard_grab(&mut self, grab: bool) -> Result<()> {
-        for kdev in &mut self.keyboard_devices {
+        if grab {
+            self.refresh_keyboard_devices(true)?;
+        }
+        for keyboard in &mut self.keyboard_devices {
             if grab {
-                kdev.grab().wrap_err("Failed to grab keyboard device")?;
+                keyboard
+                    .device
+                    .grab()
+                    .wrap_err("Failed to grab keyboard device")?;
             } else {
-                kdev.ungrab().wrap_err("Failed to ungrab keyboard device")?;
+                keyboard
+                    .device
+                    .ungrab()
+                    .wrap_err("Failed to ungrab keyboard device")?;
             }
         }
+        self.keyboard_grabbed = grab;
         debug!(
             "Keyboard devices {} ({})",
             if grab { "grabbed" } else { "ungrabbed" },
@@ -664,7 +785,7 @@ impl InputCapture for WaylandCapturer {
     }
 
     fn poll_key_events_only(&mut self) -> Result<Vec<Message>> {
-        self.drain_keyboard_events();
+        self.drain_keyboard_events()?;
         Ok(std::mem::take(&mut self.pending_key_events))
     }
 }
