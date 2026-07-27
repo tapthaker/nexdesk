@@ -75,6 +75,18 @@ enum PostMode {
     LegacyQuartz,
 }
 
+#[cfg(target_os = "macos")]
+const FIXED_POINT_SCALE: f64 = 65_536.0;
+
+#[cfg(target_os = "macos")]
+fn scroll_delta_fields(delta: f64) -> (i32, i64) {
+    let delta = -delta;
+    (
+        delta.round() as i32,
+        (delta * FIXED_POINT_SCALE).round() as i64,
+    )
+}
+
 /// macOS input capturer using CoreGraphics.
 #[cfg(target_os = "macos")]
 pub struct MacOSCapturer {
@@ -435,40 +447,58 @@ impl InputInjector for MacOSInjector {
             Message::MouseScroll { dx, dy, phase } => {
                 use crate::net::protocol::ScrollPhase;
 
-                let source = self.event_source()?;
-
                 if self.post_mode == PostMode::LegacyQuartz {
                     self.post_legacy_scroll(*dx, *dy);
                     return Ok(());
                 }
 
-                // Vertical scroll: pixel-based events without the continuous
-                // flag. This works in all apps including Firefox.
-                if *dy != 0.0 {
-                    let event = CGEvent::new_scroll_wheel_event2(
-                        Some(&source),
-                        CGScrollEventUnit::Pixel,
-                        1,
-                        -*dy as i32,
-                        0,
-                        0,
-                    )
-                    .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create scroll event"))?;
-                    self.post_event(&event);
-                }
+                let source = self.event_source()?;
+                let (pixel_x, fixed_x) = scroll_delta_fields(*dx);
+                let (pixel_y, fixed_y) = scroll_delta_fields(*dy);
+                let continuous = *phase != ScrollPhase::None;
+                let cg_phase: i64 = match phase {
+                    ScrollPhase::Began => 1,
+                    ScrollPhase::Changed => 2,
+                    ScrollPhase::Ended => 4,
+                    ScrollPhase::None => 0,
+                };
 
-                // Horizontal scroll: continuous trackpad events with phases.
-                // This is what triggers swipe-to-navigate in browsers/Finder.
-                if *dx != 0.0 || (*phase == ScrollPhase::Ended && *dy == 0.0) {
-                    let event = CGEvent::new_scroll_wheel_event2(
-                        Some(&source),
-                        CGScrollEventUnit::Pixel,
-                        2,
-                        0,
-                        -*dx as i32,
-                        0,
-                    )
-                    .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create scroll event"))?;
+                // Replay a trackpad gesture as one two-axis event. Keeping both
+                // axes continuous and carrying Began/Changed/Ended lets macOS
+                // and applications derive velocity from the incoming cadence.
+                // The 16.16 fields retain sub-pixel deltas that would otherwise
+                // be truncated and make slow gestures feel stepped.
+                let wheel_count = if *dx != 0.0 || continuous { 2 } else { 1 };
+                let event = CGEvent::new_scroll_wheel_event2(
+                    Some(&source),
+                    CGScrollEventUnit::Pixel,
+                    wheel_count,
+                    pixel_y,
+                    pixel_x,
+                    0,
+                )
+                .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create scroll event"))?;
+                CGEvent::set_integer_value_field(
+                    Some(&event),
+                    CGEventField::ScrollWheelEventPointDeltaAxis1,
+                    i64::from(pixel_y),
+                );
+                CGEvent::set_integer_value_field(
+                    Some(&event),
+                    CGEventField::ScrollWheelEventPointDeltaAxis2,
+                    i64::from(pixel_x),
+                );
+                CGEvent::set_integer_value_field(
+                    Some(&event),
+                    CGEventField::ScrollWheelEventFixedPtDeltaAxis1,
+                    fixed_y,
+                );
+                CGEvent::set_integer_value_field(
+                    Some(&event),
+                    CGEventField::ScrollWheelEventFixedPtDeltaAxis2,
+                    fixed_x,
+                );
+                if continuous {
                     CGEvent::set_integer_value_field(
                         Some(&event),
                         CGEventField::ScrollWheelEventIsContinuous,
@@ -476,22 +506,11 @@ impl InputInjector for MacOSInjector {
                     );
                     CGEvent::set_integer_value_field(
                         Some(&event),
-                        CGEventField::ScrollWheelEventPointDeltaAxis2,
-                        -*dx as i64,
-                    );
-                    let cg_phase: i64 = match phase {
-                        ScrollPhase::Began => 1,
-                        ScrollPhase::Changed => 2,
-                        ScrollPhase::Ended => 4,
-                        ScrollPhase::None => 0,
-                    };
-                    CGEvent::set_integer_value_field(
-                        Some(&event),
                         CGEventField::ScrollWheelEventScrollPhase,
                         cg_phase,
                     );
-                    self.post_event(&event);
                 }
+                self.post_event(&event);
             }
             Message::KeyEvent {
                 keycode, pressed, ..
@@ -582,5 +601,16 @@ impl InputInjector for MacOSInjector {
             CGDisplayPixelsWide(MAIN_DISPLAY) as u32,
             CGDisplayPixelsHigh(MAIN_DISPLAY) as u32,
         ))
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scroll_delta_fields_preserve_direction_and_fractional_motion() {
+        assert_eq!(scroll_delta_fields(2.5), (-3, -163_840));
+        assert_eq!(scroll_delta_fields(-0.25), (0, 16_384));
     }
 }
