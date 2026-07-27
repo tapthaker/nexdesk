@@ -40,6 +40,7 @@ use crate::net::protocol::Direction;
 /// Events sent from the Wayland capture task to the server loop.
 #[derive(Debug)]
 pub enum LayerShellEvent {
+    OutputTopologyChanged,
     EdgeEnter { direction: Direction },
     MouseMove { dx: f64, dy: f64 },
     MouseButton { button: u32, pressed: bool },
@@ -382,9 +383,35 @@ pub fn try_create(trigger_edge: Direction) -> Result<Option<LayerShellCapture>> 
 // --- Internal Types ---
 
 struct OutputInfo {
+    global_name: u32,
     wl_output: wl_output::WlOutput,
     logical_width: i32,
     logical_height: i32,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum OutputRegistryChange {
+    Added(u32),
+    Removed(u32),
+}
+
+fn output_registry_change(
+    event: &wl_registry::Event,
+    known_output_names: &[u32],
+) -> Option<OutputRegistryChange> {
+    match event {
+        wl_registry::Event::Global {
+            name, interface, ..
+        } if interface == "wl_output" => Some(OutputRegistryChange::Added(*name)),
+        wl_registry::Event::GlobalRemove { name } if known_output_names.contains(name) => {
+            Some(OutputRegistryChange::Removed(*name))
+        }
+        _ => None,
+    }
+}
+
+fn logical_output_size_changed(previous: (i32, i32), current: (i32, i32)) -> bool {
+    previous.0 > 0 && previous.1 > 0 && previous != current
 }
 
 struct EdgeSurface {
@@ -626,6 +653,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
         _conn: &Connection,
         qh: &QueueHandle<Self>,
     ) {
+        let output_names = state
+            .outputs
+            .iter()
+            .map(|output| output.global_name)
+            .collect::<Vec<_>>();
+        let output_change = output_registry_change(&event, &output_names);
+
         if let wl_registry::Event::Global {
             name,
             interface,
@@ -698,6 +732,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                     let output =
                         registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qh, ());
                     state.outputs.push(OutputInfo {
+                        global_name: name,
                         wl_output: output,
                         logical_width: 0,
                         logical_height: 0,
@@ -705,6 +740,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                 }
                 _ => {}
             }
+        }
+
+        if let Some(change) = output_change {
+            if let OutputRegistryChange::Removed(name) = change {
+                state.outputs.retain(|output| output.global_name != name);
+            }
+            state.send_event(LayerShellEvent::OutputTopologyChanged);
         }
     }
 }
@@ -875,13 +917,21 @@ impl Dispatch<zxdg_output_v1::ZxdgOutputV1, wl_output::WlOutput> for WaylandStat
         _qh: &QueueHandle<Self>,
     ) {
         if let zxdg_output_v1::Event::LogicalSize { width, height } = event {
+            let mut topology_changed = false;
             for o in &mut state.outputs {
                 if o.wl_output == *output {
+                    topology_changed = logical_output_size_changed(
+                        (o.logical_width, o.logical_height),
+                        (width, height),
+                    );
                     o.logical_width = width;
                     o.logical_height = height;
                     debug!("Output logical size: {}x{}", width, height);
                     break;
                 }
+            }
+            if topology_changed {
+                state.send_event(LayerShellEvent::OutputTopologyChanged);
             }
         }
     }
@@ -1037,6 +1087,36 @@ async fn run_event_loop(
 mod tests {
     use super::*;
 
+    #[test]
+    fn output_registry_and_logical_size_changes_are_detected() {
+        let added = wl_registry::Event::Global {
+            name: 7,
+            interface: "wl_output".to_string(),
+            version: 4,
+        };
+        let unrelated = wl_registry::Event::Global {
+            name: 8,
+            interface: "wl_seat".to_string(),
+            version: 9,
+        };
+        let removed = wl_registry::Event::GlobalRemove { name: 7 };
+
+        assert_eq!(
+            output_registry_change(&added, &[]),
+            Some(OutputRegistryChange::Added(7))
+        );
+        assert_eq!(output_registry_change(&unrelated, &[]), None);
+        assert_eq!(
+            output_registry_change(&removed, &[7]),
+            Some(OutputRegistryChange::Removed(7))
+        );
+        assert_eq!(output_registry_change(&removed, &[8]), None);
+
+        assert!(!logical_output_size_changed((0, 0), (1280, 800)));
+        assert!(!logical_output_size_changed((1280, 800), (1280, 800)));
+        assert!(logical_output_size_changed((1280, 800), (2560, 1440)));
+    }
+
     #[tokio::test]
     async fn event_queue_accumulates_motion_and_preserves_barriers() {
         let (sender, mut receiver) = layer_shell_event_channel();
@@ -1046,6 +1126,7 @@ mod tests {
             button: 0x110,
             pressed: true,
         });
+        sender.send(LayerShellEvent::OutputTopologyChanged);
         sender.send(LayerShellEvent::MouseMove { dx: 2.0, dy: 3.0 });
         drop(sender);
 
@@ -1072,9 +1153,17 @@ mod tests {
         assert!(matches!(
             receiver.recv().await,
             Some(ReceivedLayerShellEvent {
+                event: LayerShellEvent::OutputTopologyChanged,
+                depth_after_push: 3,
+                ..
+            })
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ReceivedLayerShellEvent {
                 event: LayerShellEvent::MouseMove { dx, dy },
                 coalesced_motion_events: 1,
-                depth_after_push: 3,
+                depth_after_push: 4,
                 ..
             }) if dx == 2.0 && dy == 3.0
         ));

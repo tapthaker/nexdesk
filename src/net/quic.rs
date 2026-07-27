@@ -454,6 +454,15 @@ fn require_layer_shell_event(
     event.ok_or_else(|| eyre!("layer-shell capture stopped"))
 }
 
+fn layer_shell_topology_changed(
+    event: &crate::input::wayland_layer_shell::LayerShellEvent,
+) -> bool {
+    matches!(
+        event,
+        crate::input::wayland_layer_shell::LayerShellEvent::OutputTopologyChanged
+    )
+}
+
 fn validate_discovered_fingerprint(expected: Option<&str>, actual: &str) -> Result<String> {
     let actual = actual.to_uppercase();
     if let Some(expected) = expected {
@@ -1694,6 +1703,7 @@ async fn handle_server_connection(
     // Track scroll gesture state for proper Began/Changed/Ended phases.
     let mut scroll_active = false;
     let mut layer_shell_keyboard_grabbed = false;
+    let mut layer_shell_recreate_requested = false;
 
     loop {
         tokio::select! {
@@ -2018,9 +2028,17 @@ async fn handle_server_connection(
                     coalesced_motion_events,
                     depth_after_push,
                 } = received;
+                if layer_shell_topology_changed(&event) {
+                    warn!("Wayland output topology changed; ending the connection so layer-shell capture can be recreated");
+                    layer_shell_recreate_requested = true;
+                    break;
+                }
                 send_user_activity(&control_send, &mut last_user_activity_sent);
 
                 match event {
+                    LayerShellEvent::OutputTopologyChanged => unreachable!(
+                        "output topology changes are handled before input event dispatch"
+                    ),
                     LayerShellEvent::EdgeEnter { direction } => {
                         pending_layer_shell_motion = (0.0, 0.0);
                         activation_started = Some(Instant::now());
@@ -2481,6 +2499,9 @@ async fn handle_server_connection(
     }
 
     shutdown_server_connection_tasks(&mut connection_tasks, peer.as_ref()).await;
+    if layer_shell_recreate_requested {
+        connection.close(0u32.into(), b"display topology changed");
+    }
     Ok(())
 }
 
@@ -4883,10 +4904,16 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn closed_layer_shell_capture_ends_the_server_session() {
+    fn closed_or_stale_layer_shell_capture_ends_the_server_session() {
         let error = require_layer_shell_event(None).unwrap_err();
-
         assert_eq!(error.to_string(), "layer-shell capture stopped");
+
+        assert!(layer_shell_topology_changed(
+            &crate::input::wayland_layer_shell::LayerShellEvent::OutputTopologyChanged
+        ));
+        assert!(!layer_shell_topology_changed(
+            &crate::input::wayland_layer_shell::LayerShellEvent::KeyModifiers
+        ));
     }
 
     #[tokio::test]
