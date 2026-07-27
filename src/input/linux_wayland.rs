@@ -104,7 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_device_topology_ignores_order_but_detects_hotplug() {
+    fn input_topology_refresh_is_order_insensitive_and_detects_hotplug() {
         let first = vec![
             PathBuf::from("/dev/input/event1"),
             PathBuf::from("/dev/input/event2"),
@@ -118,8 +118,9 @@ mod tests {
             PathBuf::from("/dev/input/event3"),
         ];
 
-        assert!(!keyboard_device_paths_changed(&first, &reordered));
-        assert!(keyboard_device_paths_changed(&first, &replaced));
+        assert!(!input_topology_requires_refresh(false, &first, &reordered));
+        assert!(input_topology_requires_refresh(false, &first, &replaced));
+        assert!(input_topology_requires_refresh(true, &first, &reordered));
     }
 }
 
@@ -151,8 +152,16 @@ struct KeyboardDevice {
     device: Device,
 }
 
-fn keyboard_device_paths_changed(current: &[PathBuf], discovered: &[PathBuf]) -> bool {
+fn device_paths_changed(current: &[PathBuf], discovered: &[PathBuf]) -> bool {
     current.len() != discovered.len() || current.iter().any(|path| !discovered.contains(path))
+}
+
+fn input_topology_requires_refresh(
+    force: bool,
+    current: &[PathBuf],
+    discovered: &[PathBuf],
+) -> bool {
+    force || device_paths_changed(current, discovered)
 }
 
 fn open_keyboard_device(path: &PathBuf) -> Result<KeyboardDevice> {
@@ -335,6 +344,7 @@ pub struct WaylandCapturer {
     grabbed: bool,
     keyboard_grabbed: bool,
     last_keyboard_refresh: Instant,
+    input_event_paths: Vec<PathBuf>,
     screen_width: u32,
     screen_height: u32,
     pressed_keys: HashSet<u32>,
@@ -397,6 +407,7 @@ impl WaylandCapturer {
             grabbed: false,
             keyboard_grabbed: false,
             last_keyboard_refresh: Instant::now(),
+            input_event_paths: entries,
             screen_width,
             screen_height,
             pressed_keys: HashSet::new(),
@@ -423,6 +434,14 @@ impl WaylandCapturer {
     fn refresh_keyboard_devices(&mut self, force: bool) -> Result<()> {
         self.last_keyboard_refresh = Instant::now();
         let entries = input_event_entries()?;
+
+        // Reading the directory is cheap. Probing every evdev device is not:
+        // capability ioctls can take hundreds of milliseconds on some HID
+        // devices, so only do the expensive discovery after actual hotplug.
+        if !input_topology_requires_refresh(force, &self.input_event_paths, &entries) {
+            return Ok(());
+        }
+
         let pointer_paths = find_pointer_devices(&entries)
             .map(|(_, paths)| paths)
             .unwrap_or_default();
@@ -432,7 +451,8 @@ impl WaylandCapturer {
             .iter()
             .map(|keyboard| keyboard.path.clone())
             .collect::<Vec<_>>();
-        if !force && !keyboard_device_paths_changed(&current, &discovered) {
+        self.input_event_paths = entries;
+        if !force && !device_paths_changed(&current, &discovered) {
             return Ok(());
         }
 
