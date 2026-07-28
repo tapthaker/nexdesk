@@ -12,6 +12,8 @@ use objc2_core_graphics::{
 };
 
 #[cfg(target_os = "macos")]
+use std::cell::Cell;
+#[cfg(target_os = "macos")]
 use std::os::raw::{c_int, c_uint};
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
@@ -184,11 +186,41 @@ fn evdev_to_media_key(evdev: u32) -> Option<i32> {
     }
 }
 
+#[cfg(target_os = "macos")]
+struct ScreenSizeCache {
+    width: Cell<u32>,
+    height: Cell<u32>,
+}
+
+#[cfg(target_os = "macos")]
+impl ScreenSizeCache {
+    fn new(width: u32, height: u32) -> Self {
+        Self {
+            width: Cell::new(width),
+            height: Cell::new(height),
+        }
+    }
+
+    fn get(&self) -> (u32, u32) {
+        (self.width.get(), self.height.get())
+    }
+
+    fn update(&self, width: u32, height: u32) {
+        self.width.set(width);
+        self.height.set(height);
+    }
+
+    fn refresh(&self) -> Result<(u32, u32)> {
+        let (width, height) = query_screen_size()?;
+        self.update(width, height);
+        Ok((width, height))
+    }
+}
+
 /// macOS input injector using CoreGraphics.
 #[cfg(target_os = "macos")]
 pub struct MacOSInjector {
-    screen_width: u32,
-    screen_height: u32,
+    screen_size: ScreenSizeCache,
     /// Tracked modifier flags for synthesized key events
     modifier_flags: CGEventFlags,
     /// Bitmask of currently pressed mouse buttons (bit 0=left, 1=right, 2=middle)
@@ -242,8 +274,7 @@ impl MacOSInjector {
         );
 
         Ok(Self {
-            screen_width,
-            screen_height,
+            screen_size: ScreenSizeCache::new(screen_width, screen_height),
             modifier_flags: CGEventFlags::empty(),
             buttons_down: 0,
             last_click: None,
@@ -563,12 +594,12 @@ impl InputInjector for MacOSInjector {
     }
 
     fn move_mouse(&mut self, x: i32, y: i32) -> Result<()> {
-        let started = Instant::now();
-        let sw = CGDisplayPixelsWide(MAIN_DISPLAY) as i32;
-        let sh = CGDisplayPixelsHigh(MAIN_DISPLAY) as i32;
-        log_core_graphics_timing("CGDisplayPixelDimensions", started);
-        let x = x.clamp(0, sw - 1) as f64;
-        let y = y.clamp(0, sh - 1) as f64;
+        // The client session refreshes this cache through screen_size() every
+        // five seconds. Pointer frames must not synchronously query
+        // WindowServer for dimensions on every movement.
+        let (sw, sh) = self.screen_size.get();
+        let x = x.clamp(0, sw as i32 - 1) as f64;
+        let y = y.clamp(0, sh as i32 - 1) as f64;
         // macOS requires drag event types when a button is held, otherwise
         // the move is not recognized as part of a drag operation.
         let (event_type, button) = if self.buttons_down & 1 != 0 {
@@ -597,10 +628,7 @@ impl InputInjector for MacOSInjector {
     }
 
     fn screen_size(&self) -> Result<(u32, u32)> {
-        Ok((
-            CGDisplayPixelsWide(MAIN_DISPLAY) as u32,
-            CGDisplayPixelsHigh(MAIN_DISPLAY) as u32,
-        ))
+        self.screen_size.refresh()
     }
 }
 
@@ -612,5 +640,14 @@ mod tests {
     fn scroll_delta_fields_preserve_direction_and_fractional_motion() {
         assert_eq!(scroll_delta_fields(2.5), (-3, -163_840));
         assert_eq!(scroll_delta_fields(-0.25), (0, 16_384));
+    }
+
+    #[test]
+    fn screen_size_cache_reflects_updated_dimensions() {
+        let cache = ScreenSizeCache::new(1920, 1080);
+
+        assert_eq!(cache.get(), (1920, 1080));
+        cache.update(2560, 1440);
+        assert_eq!(cache.get(), (2560, 1440));
     }
 }
