@@ -720,7 +720,10 @@ impl InputCapture for WaylandCapturer {
 
     fn set_grab(&mut self, grab: bool) -> Result<()> {
         if grab {
-            self.refresh_keyboard_devices(true)?;
+            // Check the cheap /dev/input topology snapshot first. Reopening and
+            // probing every device on every activation can block input handoff
+            // for hundreds of milliseconds even when nothing was hotplugged.
+            self.refresh_keyboard_devices(false)?;
         }
         for pdev in &mut self.devices {
             if grab {
@@ -759,7 +762,10 @@ impl InputCapture for WaylandCapturer {
 
     fn set_keyboard_grab(&mut self, grab: bool) -> Result<()> {
         if grab {
-            self.refresh_keyboard_devices(true)?;
+            // Periodic polling maintains input_event_paths, so activation only
+            // needs the inexpensive topology check. A real path change still
+            // triggers a full keyboard refresh before devices are grabbed.
+            self.refresh_keyboard_devices(false)?;
         }
         for keyboard in &mut self.keyboard_devices {
             if grab {
