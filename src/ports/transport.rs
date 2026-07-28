@@ -28,6 +28,9 @@ pub enum PeerScrollPhase {
     Began,
     Changed,
     Ended,
+    MomentumBegan,
+    MomentumChanged,
+    MomentumEnded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

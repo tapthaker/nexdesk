@@ -89,6 +89,22 @@ fn scroll_delta_fields(delta: f64) -> (i32, i64) {
     )
 }
 
+#[cfg(target_os = "macos")]
+fn scroll_phase_fields(phase: crate::net::protocol::ScrollPhase) -> (bool, i64, i64) {
+    use crate::net::protocol::ScrollPhase;
+
+    match phase {
+        ScrollPhase::None => (false, 0, 0),
+        ScrollPhase::Began => (true, 1, 0),
+        ScrollPhase::Changed => (true, 2, 0),
+        ScrollPhase::Ended => (true, 4, 0),
+        ScrollPhase::MomentumBegan => (true, 0, 1),
+        ScrollPhase::MomentumChanged => (true, 0, 2),
+        // CGMomentumScrollPhase uses 3 for End, unlike CGScrollPhase's 4.
+        ScrollPhase::MomentumEnded => (true, 0, 3),
+    }
+}
+
 /// macOS input capturer using CoreGraphics.
 #[cfg(target_os = "macos")]
 pub struct MacOSCapturer;
@@ -478,8 +494,6 @@ impl InputInjector for MacOSInjector {
                 self.post_event(&event);
             }
             Message::MouseScroll { dx, dy, phase } => {
-                use crate::net::protocol::ScrollPhase;
-
                 if self.post_mode == PostMode::LegacyQuartz {
                     self.post_legacy_scroll(*dx, *dy);
                     return Ok(());
@@ -487,13 +501,7 @@ impl InputInjector for MacOSInjector {
 
                 let (pixel_x, fixed_x) = scroll_delta_fields(*dx);
                 let (pixel_y, fixed_y) = scroll_delta_fields(*dy);
-                let continuous = *phase != ScrollPhase::None;
-                let cg_phase: i64 = match phase {
-                    ScrollPhase::Began => 1,
-                    ScrollPhase::Changed => 2,
-                    ScrollPhase::Ended => 4,
-                    ScrollPhase::None => 0,
-                };
+                let (continuous, cg_phase, cg_momentum_phase) = scroll_phase_fields(*phase);
 
                 // Replay a trackpad gesture as one two-axis event. Keeping both
                 // axes continuous and carrying Began/Changed/Ended lets macOS
@@ -540,6 +548,11 @@ impl InputInjector for MacOSInjector {
                         Some(&event),
                         CGEventField::ScrollWheelEventScrollPhase,
                         cg_phase,
+                    );
+                    CGEvent::set_integer_value_field(
+                        Some(&event),
+                        CGEventField::ScrollWheelEventMomentumPhase,
+                        cg_momentum_phase,
                     );
                 }
                 self.post_event(&event);
@@ -647,6 +660,25 @@ mod tests {
     fn scroll_delta_fields_preserve_direction_and_fractional_motion() {
         assert_eq!(scroll_delta_fields(2.5), (-3, -163_840));
         assert_eq!(scroll_delta_fields(-0.25), (0, 16_384));
+    }
+
+    #[test]
+    fn momentum_scroll_phases_use_native_core_graphics_values() {
+        use crate::net::protocol::ScrollPhase;
+
+        assert_eq!(scroll_phase_fields(ScrollPhase::Began), (true, 1, 0));
+        assert_eq!(
+            scroll_phase_fields(ScrollPhase::MomentumBegan),
+            (true, 0, 1)
+        );
+        assert_eq!(
+            scroll_phase_fields(ScrollPhase::MomentumChanged),
+            (true, 0, 2)
+        );
+        assert_eq!(
+            scroll_phase_fields(ScrollPhase::MomentumEnded),
+            (true, 0, 3)
+        );
     }
 
     #[test]

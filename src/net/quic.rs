@@ -279,6 +279,72 @@ fn layer_shell_button_to_protocol(button: u32) -> Option<u8> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ScrollGestureState {
+    #[default]
+    Idle,
+    Direct,
+    Momentum,
+}
+
+fn finger_scroll_messages(
+    state: &mut ScrollGestureState,
+    dx: f64,
+    dy: f64,
+    contact: Option<bool>,
+) -> Vec<Message> {
+    use protocol::ScrollPhase;
+
+    let mut messages = Vec::with_capacity(2);
+    let phase = match (*state, contact) {
+        (ScrollGestureState::Idle, Some(false)) => {
+            *state = ScrollGestureState::Momentum;
+            ScrollPhase::MomentumBegan
+        }
+        (ScrollGestureState::Idle, _) => {
+            *state = ScrollGestureState::Direct;
+            ScrollPhase::Began
+        }
+        (ScrollGestureState::Direct, Some(false)) => {
+            messages.push(Message::MouseScroll {
+                dx: 0.0,
+                dy: 0.0,
+                phase: ScrollPhase::Ended,
+            });
+            *state = ScrollGestureState::Momentum;
+            ScrollPhase::MomentumBegan
+        }
+        (ScrollGestureState::Direct, _) => ScrollPhase::Changed,
+        (ScrollGestureState::Momentum, Some(true)) => {
+            messages.push(Message::MouseScroll {
+                dx: 0.0,
+                dy: 0.0,
+                phase: ScrollPhase::MomentumEnded,
+            });
+            *state = ScrollGestureState::Direct;
+            ScrollPhase::Began
+        }
+        (ScrollGestureState::Momentum, _) => ScrollPhase::MomentumChanged,
+    };
+    messages.push(Message::MouseScroll { dx, dy, phase });
+    messages
+}
+
+fn finish_finger_scroll(state: &mut ScrollGestureState) -> Option<Message> {
+    use protocol::ScrollPhase;
+
+    let phase = match std::mem::take(state) {
+        ScrollGestureState::Idle => return None,
+        ScrollGestureState::Direct => ScrollPhase::Ended,
+        ScrollGestureState::Momentum => ScrollPhase::MomentumEnded,
+    };
+    Some(Message::MouseScroll {
+        dx: 0.0,
+        dy: 0.0,
+        phase,
+    })
+}
+
 fn take_accumulated_motion(pending: &mut (f64, f64)) -> Option<Message> {
     let dx = pending.0.trunc() as i32;
     let dy = pending.1.trunc() as i32;
@@ -705,6 +771,9 @@ fn server_input_command(message: Message) -> Result<ServerInputCommand> {
                 protocol::ScrollPhase::Began => PeerScrollPhase::Began,
                 protocol::ScrollPhase::Changed => PeerScrollPhase::Changed,
                 protocol::ScrollPhase::Ended => PeerScrollPhase::Ended,
+                protocol::ScrollPhase::MomentumBegan => PeerScrollPhase::MomentumBegan,
+                protocol::ScrollPhase::MomentumChanged => PeerScrollPhase::MomentumChanged,
+                protocol::ScrollPhase::MomentumEnded => PeerScrollPhase::MomentumEnded,
             },
         },
         Message::KeyEvent {
@@ -1117,6 +1186,9 @@ fn protocol_input_message(event: ClientInputEvent) -> Message {
                 PeerScrollPhase::Began => protocol::ScrollPhase::Began,
                 PeerScrollPhase::Changed => protocol::ScrollPhase::Changed,
                 PeerScrollPhase::Ended => protocol::ScrollPhase::Ended,
+                PeerScrollPhase::MomentumBegan => protocol::ScrollPhase::MomentumBegan,
+                PeerScrollPhase::MomentumChanged => protocol::ScrollPhase::MomentumChanged,
+                PeerScrollPhase::MomentumEnded => protocol::ScrollPhase::MomentumEnded,
             },
         },
         ClientInputEvent::KeyChanged {
@@ -1682,6 +1754,8 @@ async fn handle_server_connection(
     poll_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut layer_shell_key_poll_interval = time::interval(MOUSE_POLL_INTERVAL);
     layer_shell_key_poll_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut scroll_contact_poll_interval = time::interval(MOUSE_POLL_INTERVAL);
+    scroll_contact_poll_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut pointer_send_interval = time::interval(POINTER_FRAME_INTERVAL);
     pointer_send_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut event_loop_tick_interval = time::interval(MOUSE_POLL_INTERVAL);
@@ -1700,8 +1774,9 @@ async fn handle_server_connection(
     let mut prev_mouse_pos: (i32, i32) = (0, 0);
     let mut last_user_activity_sent = Instant::now() - USER_ACTIVITY_INTERVAL;
 
-    // Track scroll gesture state for proper Began/Changed/Ended phases.
-    let mut scroll_active = false;
+    // Track direct-touch and compositor momentum portions of finger scrolling.
+    let mut scroll_gesture = ScrollGestureState::Idle;
+    let mut scroll_contact = None;
     let mut layer_shell_keyboard_grabbed = false;
     let mut layer_shell_recreate_requested = false;
 
@@ -1751,6 +1826,8 @@ async fn handle_server_connection(
                     ServerOutput::Activate { messages, grab } => {
                         info!("Edge detected — switching to remote");
                         pending_layer_shell_motion = (0.0, 0.0);
+                        scroll_gesture = ScrollGestureState::Idle;
+                        scroll_contact = None;
                         activation_started = Some(Instant::now());
                         activation_started_unix_ms = unix_millis();
                         diagnostic_window_unix_ms = activation_started_unix_ms;
@@ -1850,6 +1927,16 @@ async fn handle_server_connection(
                         }
                         capturer.lock().unwrap().set_grab(false).ok();
                     }
+                }
+            }
+            // Keep touchpad contact state current even while sharing is idle.
+            // The evdev queue is finite, so waiting until a gesture starts could
+            // replay stale contact transitions and misclassify momentum.
+            _ = scroll_contact_poll_interval.tick(), if use_layer_shell => {
+                let mut cap = capturer.lock().unwrap();
+                match cap.poll_scroll_contact() {
+                    Ok(contact) => scroll_contact = contact,
+                    Err(error) => warn!("Failed to poll touchpad contact state: {}", error),
                 }
             }
             // Branch: keyboard polling for layer-shell mode. Wayland compositors
@@ -2041,6 +2128,8 @@ async fn handle_server_connection(
                     ),
                     LayerShellEvent::EdgeEnter { direction } => {
                         pending_layer_shell_motion = (0.0, 0.0);
+                        scroll_gesture = ScrollGestureState::Idle;
+                        scroll_contact = None;
                         activation_started = Some(Instant::now());
                         activation_started_unix_ms = unix_millis();
                         diagnostic_window_unix_ms = activation_started_unix_ms;
@@ -2131,17 +2220,15 @@ async fn handle_server_connection(
                     LayerShellEvent::MouseScroll { dx, dy, source } => {
                         if transition.is_active() {
                             use crate::input::wayland_layer_shell::LayerShellScrollSource;
-                            let phase = if source == LayerShellScrollSource::Finger {
-                                if scroll_active {
-                                    crate::net::protocol::ScrollPhase::Changed
-                                } else {
-                                    scroll_active = true;
-                                    crate::net::protocol::ScrollPhase::Began
-                                }
+                            let messages = if source == LayerShellScrollSource::Finger {
+                                finger_scroll_messages(&mut scroll_gesture, dx, dy, scroll_contact)
                             } else {
-                                crate::net::protocol::ScrollPhase::None
+                                vec![Message::MouseScroll {
+                                    dx,
+                                    dy,
+                                    phase: crate::net::protocol::ScrollPhase::None,
+                                }]
                             };
-                            let msg = Message::MouseScroll { dx, dy, phase };
                             let mut sender = input_send.lock().await;
                             let diagnostics = activation_started
                                 .is_some()
@@ -2153,28 +2240,27 @@ async fn handle_server_connection(
                             )
                             .await
                             .ok();
-                            send_message_uni(&mut sender, &msg).await.ok();
+                            for message in messages {
+                                send_message_uni(&mut sender, &message).await.ok();
+                            }
                         }
                     }
                     LayerShellEvent::ScrollEnd => {
-                        if transition.is_active() && scroll_active {
-                            scroll_active = false;
-                            let msg = Message::MouseScroll {
-                                dx: 0.0, dy: 0.0,
-                                phase: crate::net::protocol::ScrollPhase::Ended,
-                            };
-                            let mut sender = input_send.lock().await;
-                            let diagnostics = activation_started
-                                .is_some()
-                                .then_some(&mut activation_diagnostics);
-                            send_accumulated_motion(
-                                &mut sender,
-                                &mut pending_layer_shell_motion,
-                                diagnostics,
-                            )
-                            .await
-                            .ok();
-                            send_message_uni(&mut sender, &msg).await.ok();
+                        if transition.is_active() {
+                            if let Some(message) = finish_finger_scroll(&mut scroll_gesture) {
+                                let mut sender = input_send.lock().await;
+                                let diagnostics = activation_started
+                                    .is_some()
+                                    .then_some(&mut activation_diagnostics);
+                                send_accumulated_motion(
+                                    &mut sender,
+                                    &mut pending_layer_shell_motion,
+                                    diagnostics,
+                                )
+                                .await
+                                .ok();
+                                send_message_uni(&mut sender, &message).await.ok();
+                            }
                         }
                     }
                     LayerShellEvent::KeyEvent { keycode, pressed } => {
@@ -2271,6 +2357,8 @@ async fn handle_server_connection(
                     Some(ServerTransportEvent::Control(ServerControlEvent::SwitchBackRequested { direction })) => {
                         request_server_display_wake(display_control.clone());
                         pending_layer_shell_motion = (0.0, 0.0);
+                        scroll_gesture = ScrollGestureState::Idle;
+                        scroll_contact = None;
                         info!("Client requested switch back: {:?}", direction);
                         let messages = transition.on_switch_back();
                         if !messages.is_empty() {
@@ -3853,6 +3941,54 @@ mod input_coalescing_tests {
             })
         ));
         assert!(matches!(queue.recv().await, InputQueueItem::Closed));
+    }
+
+    #[test]
+    fn finger_scroll_transitions_from_direct_contact_to_momentum() {
+        use protocol::ScrollPhase;
+
+        let mut state = ScrollGestureState::Idle;
+        let began = finger_scroll_messages(&mut state, 0.0, 4.0, Some(true));
+        assert!(matches!(
+            began.as_slice(),
+            [Message::MouseScroll {
+                phase: ScrollPhase::Began,
+                ..
+            }]
+        ));
+
+        let momentum = finger_scroll_messages(&mut state, 0.0, 3.0, Some(false));
+        assert!(matches!(
+            momentum.as_slice(),
+            [
+                Message::MouseScroll {
+                    phase: ScrollPhase::Ended,
+                    ..
+                },
+                Message::MouseScroll {
+                    dy: 3.0,
+                    phase: ScrollPhase::MomentumBegan,
+                    ..
+                }
+            ]
+        ));
+
+        let changed = finger_scroll_messages(&mut state, 0.0, 2.0, Some(false));
+        assert!(matches!(
+            changed.as_slice(),
+            [Message::MouseScroll {
+                phase: ScrollPhase::MomentumChanged,
+                ..
+            }]
+        ));
+        assert!(matches!(
+            finish_finger_scroll(&mut state),
+            Some(Message::MouseScroll {
+                phase: ScrollPhase::MomentumEnded,
+                ..
+            })
+        ));
+        assert_eq!(state, ScrollGestureState::Idle);
     }
 
     #[test]

@@ -43,6 +43,12 @@ pub trait InputCapture: Send {
         self.poll_key_events()
     }
 
+    /// Poll whether a touchpad currently has at least two fingers in contact.
+    /// Backends that cannot observe contact state return `None`.
+    fn poll_scroll_contact(&mut self) -> Result<Option<bool>> {
+        Ok(None)
+    }
+
     /// Grab or ungrab input devices. When grabbed, the local desktop
     /// does not receive the events (exclusive access for remote sharing).
     fn set_grab(&mut self, _grab: bool) -> Result<()> {

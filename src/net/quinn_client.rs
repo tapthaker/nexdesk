@@ -260,6 +260,9 @@ fn map_scroll_phase(phase: ScrollPhase) -> PeerScrollPhase {
         ScrollPhase::Began => PeerScrollPhase::Began,
         ScrollPhase::Changed => PeerScrollPhase::Changed,
         ScrollPhase::Ended => PeerScrollPhase::Ended,
+        ScrollPhase::MomentumBegan => PeerScrollPhase::MomentumBegan,
+        ScrollPhase::MomentumChanged => PeerScrollPhase::MomentumChanged,
+        ScrollPhase::MomentumEnded => PeerScrollPhase::MomentumEnded,
     }
 }
 

@@ -17,6 +17,15 @@ pub mod wayland_layer_shell;
 #[allow(dead_code)]
 pub mod wayland_layer_shell {
     /// Stub types for non-Linux platforms (never instantiated at runtime).
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum LayerShellScrollSource {
+        Wheel,
+        Finger,
+        Continuous,
+        WheelTilt,
+        Unknown,
+    }
+
     #[derive(Debug)]
     pub enum LayerShellEvent {
         OutputTopologyChanged,
@@ -34,6 +43,7 @@ pub mod wayland_layer_shell {
         MouseScroll {
             dx: f64,
             dy: f64,
+            source: LayerShellScrollSource,
         },
         ScrollEnd,
         KeyEvent {

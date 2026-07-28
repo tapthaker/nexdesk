@@ -104,6 +104,41 @@ mod tests {
     }
 
     #[test]
+    fn touch_contact_state_tracks_two_finger_scroll_lifetime() {
+        let mut touching = false;
+        let mut fingers = 0;
+
+        assert!(update_touch_contact_state(
+            &mut touching,
+            &mut fingers,
+            Key::BTN_TOUCH,
+            true,
+        ));
+        assert!(update_touch_contact_state(
+            &mut touching,
+            &mut fingers,
+            Key::BTN_TOOL_DOUBLETAP,
+            true,
+        ));
+        assert!(touching && fingers == 2);
+
+        assert!(update_touch_contact_state(
+            &mut touching,
+            &mut fingers,
+            Key::BTN_TOOL_DOUBLETAP,
+            false,
+        ));
+        assert!(touching && fingers == 1);
+        assert!(update_touch_contact_state(
+            &mut touching,
+            &mut fingers,
+            Key::BTN_TOUCH,
+            false,
+        ));
+        assert!(!touching && fingers == 0);
+    }
+
+    #[test]
     fn input_topology_refresh_is_order_insensitive_and_detects_hotplug() {
         let first = vec![
             PathBuf::from("/dev/input/event1"),
@@ -150,6 +185,45 @@ struct PointerDevice {
 struct KeyboardDevice {
     path: PathBuf,
     device: Device,
+}
+
+fn update_touch_contact_state(
+    touching: &mut bool,
+    finger_count: &mut u32,
+    key: Key,
+    pressed: bool,
+) -> bool {
+    match key {
+        Key::BTN_TOUCH => {
+            *touching = pressed;
+            if !pressed {
+                *finger_count = 0;
+            }
+        }
+        Key::BTN_TOOL_FINGER => {
+            if pressed {
+                *finger_count = 1;
+            } else if *finger_count == 1 {
+                *finger_count = 0;
+            }
+        }
+        Key::BTN_TOOL_DOUBLETAP => {
+            if pressed {
+                *finger_count = 2;
+            } else if *finger_count == 2 {
+                *finger_count = 1;
+            }
+        }
+        Key::BTN_TOOL_TRIPLETAP => {
+            if pressed {
+                *finger_count = 3;
+            } else if *finger_count == 3 {
+                *finger_count = 1;
+            }
+        }
+        _ => return false,
+    }
+    true
 }
 
 fn device_paths_changed(current: &[PathBuf], discovered: &[PathBuf]) -> bool {
@@ -483,6 +557,42 @@ impl WaylandCapturer {
         Ok(())
     }
 
+    /// Read one available touchpad batch to keep physical finger contact
+    /// synchronized with compositor-provided scroll frames.
+    fn drain_scroll_contact_events(&mut self) -> Result<Option<bool>> {
+        let mut has_touchpad = false;
+        for pdev in &mut self.devices {
+            if !matches!(pdev.kind, PointerKind::Absolute { .. }) {
+                continue;
+            }
+            has_touchpad = true;
+            match pdev.device.fetch_events() {
+                Ok(events) => {
+                    for event in events {
+                        if let InputEventKind::Key(key) = event.kind() {
+                            if update_touch_contact_state(
+                                &mut pdev.touching,
+                                &mut pdev.finger_count,
+                                key,
+                                event.value() != 0,
+                            ) {
+                                pdev.last_abs_x = None;
+                                pdev.last_abs_y = None;
+                            }
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => warn!("Failed to read touchpad contact state: {}", error),
+            }
+        }
+        Ok(has_touchpad.then(|| {
+            self.devices
+                .iter()
+                .any(|pdev| pdev.touching && pdev.finger_count >= 2)
+        }))
+    }
+
     /// Read one currently available batch from each keyboard. Avoid looping
     /// until WouldBlock: a high-rate device can keep refilling its queue and
     /// monopolize the async connection task.
@@ -619,42 +729,20 @@ impl WaylandCapturer {
                                 let code = key.code() as u32;
                                 let pressed = event.value() != 0;
 
+                                if update_touch_contact_state(
+                                    &mut pdev.touching,
+                                    &mut pdev.finger_count,
+                                    key,
+                                    pressed,
+                                ) {
+                                    // Reset position tracking across contact-mode changes to
+                                    // avoid a cursor or scroll jump.
+                                    pdev.last_abs_x = None;
+                                    pdev.last_abs_y = None;
+                                    continue;
+                                }
+
                                 match key {
-                                    Key::BTN_TOUCH => {
-                                        // Finger down/up on touchpad — reset tracking
-                                        pdev.touching = pressed;
-                                        if !pressed {
-                                            pdev.last_abs_x = None;
-                                            pdev.last_abs_y = None;
-                                            pdev.finger_count = 0;
-                                        }
-                                    }
-                                    Key::BTN_TOOL_FINGER => {
-                                        // Single finger on pad
-                                        if pressed {
-                                            pdev.finger_count = 1;
-                                        }
-                                    }
-                                    Key::BTN_TOOL_DOUBLETAP => {
-                                        // Two fingers on pad — switch to scroll mode
-                                        if pressed {
-                                            pdev.finger_count = 2;
-                                        } else if pdev.finger_count == 2 {
-                                            pdev.finger_count = 1;
-                                        }
-                                        // Reset position tracking to avoid jump
-                                        pdev.last_abs_x = None;
-                                        pdev.last_abs_y = None;
-                                    }
-                                    Key::BTN_TOOL_TRIPLETAP => {
-                                        if pressed {
-                                            pdev.finger_count = 3;
-                                        } else if pdev.finger_count == 3 {
-                                            pdev.finger_count = 1;
-                                        }
-                                        pdev.last_abs_x = None;
-                                        pdev.last_abs_y = None;
-                                    }
                                     Key::BTN_LEFT => {
                                         if pressed {
                                             self.buttons |= 1;
@@ -813,6 +901,10 @@ impl InputCapture for WaylandCapturer {
     fn poll_key_events_only(&mut self) -> Result<Vec<Message>> {
         self.drain_keyboard_events()?;
         Ok(std::mem::take(&mut self.pending_key_events))
+    }
+
+    fn poll_scroll_contact(&mut self) -> Result<Option<bool>> {
+        self.drain_scroll_contact_events()
     }
 }
 

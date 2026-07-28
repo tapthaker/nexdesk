@@ -25,8 +25,14 @@ pub enum ScrollPhase {
     Began,
     /// Continuous gesture ongoing.
     Changed,
-    /// Continuous gesture ended.
+    /// Continuous finger gesture ended.
     Ended,
+    /// Inertial scrolling started after the fingers lifted.
+    MomentumBegan,
+    /// Inertial scrolling is continuing.
+    MomentumChanged,
+    /// Inertial scrolling ended.
+    MomentumEnded,
 }
 
 /// Clipboard content types.
@@ -139,7 +145,7 @@ pub enum Message {
 }
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Build version string burned in at compile time (e.g. "v0.1.2" or "v0.1.2-3-gabcdef").
 pub const BUILD_VERSION: &str = env!("NEXDESK_VERSION");
