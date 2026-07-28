@@ -78,7 +78,9 @@ enum PostMode {
 }
 
 #[cfg(target_os = "macos")]
-const FIXED_POINT_SCALE: f64 = 65_536.0;
+// Pixel scroll events encode their 16.16 fixed-point fields in tenths of a
+// point. CoreGraphics itself maps a 10-point PointDelta to a 1.0 FixedPtDelta.
+const FIXED_POINT_SCALE: f64 = 65_536.0 / 10.0;
 
 #[cfg(target_os = "macos")]
 fn scroll_delta_fields(delta: f64) -> (i32, i64) {
@@ -538,6 +540,29 @@ impl InputInjector for MacOSInjector {
                     CGEventField::ScrollWheelEventFixedPtDeltaAxis2,
                     fixed_x,
                 );
+                // Wayland's pixel deltas are already accelerated by the source
+                // compositor. Preserve their fractional values in the native
+                // double fields instead of leaving them at zero.
+                CGEvent::set_double_value_field(
+                    Some(&event),
+                    CGEventField::ScrollWheelEventRawDeltaAxis1,
+                    -*dy,
+                );
+                CGEvent::set_double_value_field(
+                    Some(&event),
+                    CGEventField::ScrollWheelEventRawDeltaAxis2,
+                    -*dx,
+                );
+                CGEvent::set_double_value_field(
+                    Some(&event),
+                    CGEventField::ScrollWheelEventAcceleratedDeltaAxis1,
+                    -*dy,
+                );
+                CGEvent::set_double_value_field(
+                    Some(&event),
+                    CGEventField::ScrollWheelEventAcceleratedDeltaAxis2,
+                    -*dx,
+                );
                 if continuous {
                     CGEvent::set_integer_value_field(
                         Some(&event),
@@ -657,9 +682,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scroll_delta_fields_preserve_direction_and_fractional_motion() {
-        assert_eq!(scroll_delta_fields(2.5), (-3, -163_840));
-        assert_eq!(scroll_delta_fields(-0.25), (0, 16_384));
+    fn scroll_delta_fields_match_core_graphics_pixel_units() {
+        assert_eq!(scroll_delta_fields(10.0), (-10, -65_536));
+        assert_eq!(scroll_delta_fields(2.5), (-3, -16_384));
+        assert_eq!(scroll_delta_fields(-0.25), (0, 1_638));
     }
 
     #[test]
