@@ -150,7 +150,7 @@ pub fn evdev_to_macos(evdev: u32) -> Option<u16> {
 
 /// Lookup table: index = macOS virtual keycode, value = evdev keycode.
 /// 0xFFFF means unmapped.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 static MACOS_TO_EVDEV: std::sync::LazyLock<[u32; 256]> = std::sync::LazyLock::new(|| {
     let mut t = [0xFFFFFFFFu32; 256];
     for (evdev, &mac) in EVDEV_TO_MACOS.iter().enumerate() {
@@ -163,8 +163,8 @@ static MACOS_TO_EVDEV: std::sync::LazyLock<[u32; 256]> = std::sync::LazyLock::ne
 
 /// Convert a macOS virtual keycode to an evdev keycode.
 /// Returns `None` for unmapped keys.
-#[cfg(any(target_os = "macos", test))]
-pub fn macos_to_evdev(mac: u16) -> Option<u32> {
+#[cfg(test)]
+fn macos_to_evdev(mac: u16) -> Option<u32> {
     if (mac as usize) < MACOS_TO_EVDEV.len() {
         let ev = MACOS_TO_EVDEV[mac as usize];
         if ev != 0xFFFFFFFF {

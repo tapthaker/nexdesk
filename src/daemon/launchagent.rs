@@ -275,10 +275,6 @@ fn print_command(program: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn run_launchctl(args: &[&str]) -> Result<()> {
-    run_launchctl_with_runner(&RealCommandRunner, args)
-}
-
 fn run_launchctl_with_runner(runner: &dyn CommandRunner, args: &[&str]) -> Result<()> {
     run_checked(runner, "launchctl", args).map(|_| ())
 }

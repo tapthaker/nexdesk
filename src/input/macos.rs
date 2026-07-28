@@ -91,21 +91,14 @@ fn scroll_delta_fields(delta: f64) -> (i32, i64) {
 
 /// macOS input capturer using CoreGraphics.
 #[cfg(target_os = "macos")]
-pub struct MacOSCapturer {
-    screen_width: u32,
-    screen_height: u32,
-}
+pub struct MacOSCapturer;
 
 #[cfg(target_os = "macos")]
 impl MacOSCapturer {
     pub fn new() -> Result<Self> {
-        let screen_width = CGDisplayPixelsWide(MAIN_DISPLAY) as u32;
-        let screen_height = CGDisplayPixelsHigh(MAIN_DISPLAY) as u32;
+        let (screen_width, screen_height) = query_screen_size()?;
         debug!("macOS capturer: screen {}x{}", screen_width, screen_height);
-        Ok(Self {
-            screen_width,
-            screen_height,
-        })
+        Ok(Self)
     }
 }
 
