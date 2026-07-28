@@ -180,6 +180,15 @@ fn evdev_to_media_key(evdev: u32) -> Option<i32> {
 }
 
 #[cfg(target_os = "macos")]
+struct SendableEventSource(CFRetained<CGEventSource>);
+
+// CGEventSource is a Core Foundation value with no thread affinity. The
+// injector owns it exclusively, and InputInjector's mutating operations
+// serialize access. It may therefore move with the injector but is not Sync.
+#[cfg(target_os = "macos")]
+unsafe impl Send for SendableEventSource {}
+
+#[cfg(target_os = "macos")]
 struct ScreenSizeCache {
     width: Cell<u32>,
     height: Cell<u32>,
@@ -222,8 +231,9 @@ pub struct MacOSInjector {
     last_click: Option<(std::time::Instant, u8)>,
     /// Current click count (1=single, 2=double, 3=triple)
     click_count: i64,
-    /// CGEvent source state used for synthesized events.
-    source_state: CGEventSourceStateID,
+    /// Reused source for synthesized events. Creating a source may synchronously
+    /// contact WindowServer, so it must stay off the per-event input path.
+    event_source: SendableEventSource,
     /// CGEvent tap location used for synthesized events.
     tap_location: CGEventTapLocation,
     /// Posting API used for ordinary mouse/keyboard/scroll events.
@@ -261,6 +271,9 @@ impl MacOSInjector {
             "legacy" | "quartz" | "cgpost" => PostMode::LegacyQuartz,
             _ => PostMode::CGEvent,
         };
+        let event_source = CGEventSource::new(source_state)
+            .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
+        CGEventSource::set_local_events_suppression_interval(Some(&event_source), 0.0);
         info!(
             "macOS injector: screen {}x{}, source_state={}, tap_location={}, post_mode={:?}",
             screen_width, screen_height, source_state.0, tap_location.0, post_mode
@@ -272,7 +285,7 @@ impl MacOSInjector {
             buttons_down: 0,
             last_click: None,
             click_count: 0,
-            source_state,
+            event_source: SendableEventSource(event_source),
             tap_location,
             post_mode,
         })
@@ -300,21 +313,6 @@ impl MacOSInjector {
         }
     }
 
-    fn event_source(&self) -> Result<CFRetained<CGEventSource>> {
-        let started = Instant::now();
-        let source = CGEventSource::new(self.source_state)
-            .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
-        log_core_graphics_timing("CGEventSourceCreate", started);
-
-        // Avoid CoreGraphics' default local-event suppression window. This is
-        // documented for remote-operation events and is harmless if the delay is
-        // unrelated, but gives us a cheap A/B point for idle wake sluggishness.
-        let started = Instant::now();
-        CGEventSource::set_local_events_suppression_interval(Some(&source), 0.0);
-        log_core_graphics_timing("CGEventSourceSetLocalEventsSuppressionInterval", started);
-        Ok(source)
-    }
-
     fn post_event(&self, event: &CGEvent) {
         let started = Instant::now();
         CGEvent::post(self.tap_location, Some(event));
@@ -333,8 +331,7 @@ impl MacOSInjector {
         const CG_EVENT_DATA1_FIELD: CGEventField = CGEventField(134);
         const CG_EVENT_DATA2_FIELD: CGEventField = CGEventField(135);
 
-        let source = self.event_source()?;
-        let event = CGEvent::new(Some(&source))
+        let event = CGEvent::new(Some(&self.event_source.0))
             .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEvent"))?;
 
         CGEvent::set_type(Some(&event), CGEventType(NX_SYSDEFINED));
@@ -365,9 +362,8 @@ impl MacOSInjector {
         button: CGMouseButton,
     ) -> Result<()> {
         let point = CGPoint { x, y };
-        let source = self.event_source()?;
         let started = Instant::now();
-        let event = CGEvent::new_mouse_event(Some(&source), event_type, point, button)
+        let event = CGEvent::new_mouse_event(Some(&self.event_source.0), event_type, point, button)
             .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create mouse event"))?;
         log_core_graphics_timing("CGEventCreateMouseEvent", started);
         self.post_event(&event);
@@ -375,9 +371,8 @@ impl MacOSInjector {
     }
 
     fn current_position(&self) -> Result<(i32, i32)> {
-        let source = self.event_source()?;
         let started = Instant::now();
-        let event = CGEvent::new(Some(&source))
+        let event = CGEvent::new(Some(&self.event_source.0))
             .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEvent"))?;
         log_core_graphics_timing("CGEventCreate", started);
         let started = Instant::now();
@@ -457,10 +452,13 @@ impl InputInjector for MacOSInjector {
                     x: cx as f64,
                     y: cy as f64,
                 };
-                let source = self.event_source()?;
-                let event =
-                    CGEvent::new_mouse_event(Some(&source), event_type, point, cg_button)
-                        .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create mouse event"))?;
+                let event = CGEvent::new_mouse_event(
+                    Some(&self.event_source.0),
+                    event_type,
+                    point,
+                    cg_button,
+                )
+                .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create mouse event"))?;
                 CGEvent::set_integer_value_field(
                     Some(&event),
                     CGEventField::MouseEventClickState,
@@ -476,7 +474,6 @@ impl InputInjector for MacOSInjector {
                     return Ok(());
                 }
 
-                let source = self.event_source()?;
                 let (pixel_x, fixed_x) = scroll_delta_fields(*dx);
                 let (pixel_y, fixed_y) = scroll_delta_fields(*dy);
                 let continuous = *phase != ScrollPhase::None;
@@ -494,7 +491,7 @@ impl InputInjector for MacOSInjector {
                 // be truncated and make slow gestures feel stepped.
                 let wheel_count = if *dx != 0.0 || continuous { 2 } else { 1 };
                 let event = CGEvent::new_scroll_wheel_event2(
-                    Some(&source),
+                    Some(&self.event_source.0),
                     CGScrollEventUnit::Pixel,
                     wheel_count,
                     pixel_y,
@@ -552,8 +549,6 @@ impl InputInjector for MacOSInjector {
                         return Ok(());
                     }
                 };
-                let source = self.event_source()?;
-
                 if self.post_mode == PostMode::LegacyQuartz {
                     self.update_modifier_flags(*keycode, *pressed);
                     self.post_legacy_key(mac_keycode, *pressed);
@@ -566,9 +561,12 @@ impl InputInjector for MacOSInjector {
                 // disconnect races with the key release.
                 if Self::modifier_flag(*keycode).is_some() {
                     self.update_modifier_flags(*keycode, *pressed);
-                    let event =
-                        CGEvent::new_keyboard_event(Some(&source), mac_keycode, *pressed)
-                            .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create key event"))?;
+                    let event = CGEvent::new_keyboard_event(
+                        Some(&self.event_source.0),
+                        mac_keycode,
+                        *pressed,
+                    )
+                    .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create key event"))?;
                     // kCGEventFlagsChanged = 12
                     CGEvent::set_type(Some(&event), CGEventType(12));
                     CGEvent::set_flags(Some(&event), self.modifier_flags);
@@ -576,8 +574,9 @@ impl InputInjector for MacOSInjector {
                     return Ok(());
                 }
 
-                let event = CGEvent::new_keyboard_event(Some(&source), mac_keycode, *pressed)
-                    .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create key event"))?;
+                let event =
+                    CGEvent::new_keyboard_event(Some(&self.event_source.0), mac_keycode, *pressed)
+                        .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create key event"))?;
                 CGEvent::set_flags(Some(&event), self.modifier_flags);
                 self.post_event(&event);
             }
