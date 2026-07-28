@@ -145,7 +145,7 @@ pub enum Message {
 }
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Build version string burned in at compile time (e.g. "v0.1.2" or "v0.1.2-3-gabcdef").
 pub const BUILD_VERSION: &str = env!("NEXDESK_VERSION");

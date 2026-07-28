@@ -55,6 +55,7 @@ const SCROLL_MOMENTUM_START_MIN_DELTA: f64 = 1.5;
 const SCROLL_MOMENTUM_STOP_DELTA: f64 = 0.05;
 const SCROLL_MOMENTUM_MAX_INITIAL_DELTA: f64 = 48.0;
 const SCROLL_MOMENTUM_DECAY_PER_FRAME: f64 = 0.92;
+const SCROLL_MOMENTUM_STALL_WARN_THRESHOLD: Duration = Duration::from_millis(22);
 const USER_ACTIVITY_INTERVAL: Duration = Duration::from_secs(20);
 const LOCAL_LOCK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const SCREEN_SIZE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -416,9 +417,60 @@ impl ScrollMomentum {
     }
 
     fn cancel(&mut self) -> bool {
-        let was_active = self.active;
+        // Only close a stream that has posted MomentumBegan. A direct Ended
+        // frame can arm local momentum just before native source momentum
+        // arrives, in which case no synthetic phase needs closing.
+        let needs_ended = self.active && self.began;
         self.reset();
-        was_active
+        needs_ended
+    }
+
+    fn prepare_incoming(&mut self, message: &Message, now: Instant) -> Option<Message> {
+        use protocol::ScrollPhase;
+
+        let Message::MouseScroll { dx, dy, phase } = message else {
+            return None;
+        };
+        let interrupted = match phase {
+            ScrollPhase::Began => {
+                let interrupted = self.cancel();
+                self.record_direct_frame(now, *dx, *dy);
+                interrupted
+            }
+            ScrollPhase::Changed => {
+                let interrupted = self.active && self.cancel();
+                self.record_direct_frame(now, *dx, *dy);
+                interrupted
+            }
+            ScrollPhase::Ended => false,
+            ScrollPhase::None
+            | ScrollPhase::MomentumBegan
+            | ScrollPhase::MomentumChanged
+            | ScrollPhase::MomentumEnded => self.cancel(),
+        };
+        interrupted.then_some(Message::MouseScroll {
+            dx: 0.0,
+            dy: 0.0,
+            phase: ScrollPhase::MomentumEnded,
+        })
+    }
+
+    fn finish_incoming(&mut self, message: &Message, now: Instant) -> bool {
+        matches!(
+            message,
+            Message::MouseScroll {
+                phase: protocol::ScrollPhase::Ended,
+                ..
+            }
+        ) && self.start(now)
+    }
+
+    fn cancel_message(&mut self) -> Option<Message> {
+        self.cancel().then_some(Message::MouseScroll {
+            dx: 0.0,
+            dy: 0.0,
+            phase: protocol::ScrollPhase::MomentumEnded,
+        })
     }
 
     fn next_message(&mut self) -> Option<Message> {
@@ -1869,8 +1921,6 @@ async fn handle_server_connection(
     layer_shell_key_poll_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut scroll_contact_poll_interval = time::interval(MOUSE_POLL_INTERVAL);
     scroll_contact_poll_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    let mut scroll_momentum_interval = time::interval(SCROLL_MOMENTUM_FRAME_INTERVAL);
-    scroll_momentum_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut pointer_send_interval = time::interval(POINTER_FRAME_INTERVAL);
     pointer_send_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut event_loop_tick_interval = time::interval(MOUSE_POLL_INTERVAL);
@@ -1892,7 +1942,6 @@ async fn handle_server_connection(
     // Track direct-touch and compositor momentum portions of finger scrolling.
     let mut scroll_gesture = ScrollGestureState::Idle;
     let mut scroll_contact = None;
-    let mut scroll_momentum = ScrollMomentum::default();
     let mut layer_shell_keyboard_grabbed = false;
     let mut layer_shell_recreate_requested = false;
 
@@ -1944,7 +1993,6 @@ async fn handle_server_connection(
                         pending_layer_shell_motion = (0.0, 0.0);
                         scroll_gesture = ScrollGestureState::Idle;
                         scroll_contact = None;
-                        scroll_momentum.reset();
                         activation_started = Some(Instant::now());
                         activation_started_unix_ms = unix_millis();
                         diagnostic_window_unix_ms = activation_started_unix_ms;
@@ -2206,34 +2254,6 @@ async fn handle_server_connection(
                     }
                 }
             }
-            // Continue a released trackpad flick with a bounded, decaying
-            // momentum stream. CoreGraphics receives native momentum phases;
-            // a new physical gesture cancels this stream immediately.
-            _ = scroll_momentum_interval.tick(), if transition.is_active() && scroll_momentum.active => {
-                if let Some(message) = scroll_momentum.next_message() {
-                    if matches!(
-                        message,
-                        Message::MouseScroll {
-                            phase: protocol::ScrollPhase::MomentumEnded,
-                            ..
-                        }
-                    ) {
-                        scroll_gesture = ScrollGestureState::Idle;
-                    }
-                    let mut sender = input_send.lock().await;
-                    let diagnostics = activation_started
-                        .is_some()
-                        .then_some(&mut activation_diagnostics);
-                    send_accumulated_motion(
-                        &mut sender,
-                        &mut pending_layer_shell_motion,
-                        diagnostics,
-                    )
-                    .await
-                    .ok();
-                    send_message_uni(&mut sender, &message).await.ok();
-                }
-            }
             // Branch: Layer-shell events (only when layer-shell is active)
             event = async {
                 match &mut capture_rx {
@@ -2275,7 +2295,6 @@ async fn handle_server_connection(
                         pending_layer_shell_motion = (0.0, 0.0);
                         scroll_gesture = ScrollGestureState::Idle;
                         scroll_contact = None;
-                        scroll_momentum.reset();
                         activation_started = Some(Instant::now());
                         activation_started_unix_ms = unix_millis();
                         diagnostic_window_unix_ms = activation_started_unix_ms;
@@ -2367,36 +2386,14 @@ async fn handle_server_connection(
                         if transition.is_active() {
                             use crate::input::wayland_layer_shell::LayerShellScrollSource;
                             let messages = if source == LayerShellScrollSource::Finger {
-                                // A real finger frame interrupts synthesized inertia even if
-                                // the contact-state poll has not observed the new touch yet.
-                                let contact = if scroll_momentum.active {
-                                    scroll_momentum.cancel();
-                                    Some(true)
-                                } else {
-                                    scroll_contact
-                                };
-                                let messages =
-                                    finger_scroll_messages(&mut scroll_gesture, dx, dy, contact);
-                                if scroll_gesture == ScrollGestureState::Direct {
-                                    scroll_momentum.record_direct_frame(Instant::now(), dx, dy);
-                                }
-                                messages
+                                finger_scroll_messages(&mut scroll_gesture, dx, dy, scroll_contact)
                             } else {
-                                let mut messages = Vec::with_capacity(2);
-                                if scroll_momentum.cancel() {
-                                    messages.push(Message::MouseScroll {
-                                        dx: 0.0,
-                                        dy: 0.0,
-                                        phase: crate::net::protocol::ScrollPhase::MomentumEnded,
-                                    });
-                                }
                                 scroll_gesture = ScrollGestureState::Idle;
-                                messages.push(Message::MouseScroll {
+                                vec![Message::MouseScroll {
                                     dx,
                                     dy,
                                     phase: crate::net::protocol::ScrollPhase::None,
-                                });
-                                messages
+                                }]
                             };
                             let mut sender = input_send.lock().await;
                             let diagnostics = activation_started
@@ -2416,7 +2413,6 @@ async fn handle_server_connection(
                     }
                     LayerShellEvent::ScrollEnd => {
                         if transition.is_active() {
-                            let ended_direct = scroll_gesture == ScrollGestureState::Direct;
                             if let Some(message) = finish_finger_scroll(&mut scroll_gesture) {
                                 let mut sender = input_send.lock().await;
                                 let diagnostics = activation_started
@@ -2430,10 +2426,6 @@ async fn handle_server_connection(
                                 .await
                                 .ok();
                                 send_message_uni(&mut sender, &message).await.ok();
-                            }
-                            if ended_direct && scroll_momentum.start(Instant::now()) {
-                                scroll_gesture = ScrollGestureState::Momentum;
-                                scroll_momentum_interval.reset();
                             }
                         }
                     }
@@ -2533,7 +2525,6 @@ async fn handle_server_connection(
                         pending_layer_shell_motion = (0.0, 0.0);
                         scroll_gesture = ScrollGestureState::Idle;
                         scroll_contact = None;
-                        scroll_momentum.reset();
                         info!("Client requested switch back: {:?}", direction);
                         let messages = transition.on_switch_back();
                         if !messages.is_empty() {
@@ -3376,6 +3367,8 @@ async fn run_client_session(
     let mut latency_check = time::interval(CLIENT_LATENCY_CHECK_INTERVAL);
     let mut pointer_injection_interval = time::interval(POINTER_FRAME_INTERVAL);
     pointer_injection_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut scroll_momentum_interval = time::interval(SCROLL_MOMENTUM_FRAME_INTERVAL);
+    scroll_momentum_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut latency_watchdog = ClientLatencyWatchdog::default();
     let mut last_latency_check_unix_ms = unix_millis();
     let mut last_heartbeat_ack_unix_ms: Option<u64> = None;
@@ -3388,6 +3381,7 @@ async fn run_client_session(
     let mut activation_diagnostics = ClientActivationDiagnostics::default();
     let mut activation_first_inject_logged = false;
     let mut pending_mouse_move: Option<(i32, i32)> = None;
+    let mut scroll_momentum = ScrollMomentum::default();
     let mut file_send_tasks = Vec::new();
 
     loop {
@@ -3432,6 +3426,7 @@ async fn run_client_session(
                             ClientOutput::Activate => {
                                 info!("Server sharing mouse");
                                 pending_mouse_move = None;
+                                scroll_momentum.reset();
                                 activation_started = Some(Instant::now());
                                 activation_started_unix_ms = unix_millis();
                                 activation_diagnostics = ClientActivationDiagnostics::default();
@@ -3452,6 +3447,24 @@ async fn run_client_session(
                                     &mut activation_first_inject_logged,
                                     "before discrete input",
                                 );
+                                // Momentum is paced on the destination clock. A new
+                                // physical gesture closes any local inertial stream
+                                // before its first direct frame is posted.
+                                if let Some(ended) =
+                                    scroll_momentum.prepare_incoming(&msg, Instant::now())
+                                {
+                                    let timings = activation_started
+                                        .is_some()
+                                        .then_some(&mut activation_diagnostics.injection_latency);
+                                    if let Err(error) = inject_with_timing(
+                                        &mut *injector,
+                                        &ended,
+                                        "cancel local scroll momentum",
+                                        timings,
+                                    ) {
+                                        warn!("Inject scroll momentum cancellation error: {}", error);
+                                    }
+                                }
                                 let timings = activation_started
                                     .is_some()
                                     .then_some(&mut activation_diagnostics.injection_latency);
@@ -3459,6 +3472,9 @@ async fn run_client_session(
                                     warn!("Inject error: {}", e);
                                 } else {
                                     track_injected_input(&msg, &mut injected_keys, &mut injected_buttons);
+                                    if scroll_momentum.finish_incoming(&msg, Instant::now()) {
+                                        scroll_momentum_interval.reset();
+                                    }
                                 }
                             }
                             ClientOutput::SwitchBack { direction, inject } => {
@@ -3471,6 +3487,15 @@ async fn run_client_session(
                                         .is_some()
                                         .then_some(&mut activation_diagnostics.injection_latency);
                                     inject_with_timing(&mut *injector, &msg, "switch back", timings).ok();
+                                }
+                                if let Some(ended) = scroll_momentum.cancel_message() {
+                                    inject_with_timing(
+                                        &mut *injector,
+                                        &ended,
+                                        "switch-back scroll momentum cleanup",
+                                        None,
+                                    )
+                                    .ok();
                                 }
                                 // Release any remote-held keys immediately on switch-back. The
                                 // server also sends cleanup releases, but those can arrive after
@@ -3529,6 +3554,32 @@ async fn run_client_session(
                     "pointer frame",
                 );
             }
+            // Unlike direct finger frames, inertia does not need another
+            // network sample. Pace it beside CoreGraphics so transport jitter
+            // cannot turn delayed frames into a burst.
+            scheduled = scroll_momentum_interval.tick(), if scroll_momentum.active => {
+                let lateness = Instant::now().saturating_duration_since(scheduled);
+                if lateness >= SCROLL_MOMENTUM_STALL_WARN_THRESHOLD {
+                    warn!(
+                        "Client scroll momentum tick late: lateness_us={}",
+                        lateness.as_micros()
+                    );
+                }
+                if let Some(message) = scroll_momentum.next_message() {
+                    let timings = activation_started
+                        .is_some()
+                        .then_some(&mut activation_diagnostics.injection_latency);
+                    if let Err(error) = inject_with_timing(
+                        &mut *injector,
+                        &message,
+                        "local scroll momentum",
+                        timings,
+                    ) {
+                        warn!("Inject local scroll momentum error: {}", error);
+                        scroll_momentum.reset();
+                    }
+                }
+            }
             event = peer_events.recv() => {
                 match event {
                     Some(ClientTransportEvent::Control(ClientControlEvent::Heartbeat { timestamp })) => {
@@ -3586,6 +3637,15 @@ async fn run_client_session(
                     Some(ClientTransportEvent::Control(ClientControlEvent::ReleaseControl)) => {
                         info!("Server reclaimed input control");
                         pending_mouse_move = None;
+                        if let Some(ended) = scroll_momentum.cancel_message() {
+                            inject_with_timing(
+                                &mut *injector,
+                                &ended,
+                                "release-control scroll momentum cleanup",
+                                None,
+                            )
+                            .ok();
+                        }
                         activation_started = None;
                         release_client_control(
                             &mut transition,
@@ -3778,6 +3838,15 @@ async fn run_client_session(
         connection.close_reason()
     );
 
+    if let Some(ended) = scroll_momentum.cancel_message() {
+        inject_with_timing(
+            &mut *injector,
+            &ended,
+            "disconnect scroll momentum cleanup",
+            None,
+        )
+        .ok();
+    }
     // Release any synthetic input that may still be down if the stream ended
     // before key-up/button-up events were processed (for example during display sleep).
     restore_client_input_state(
@@ -4210,6 +4279,70 @@ mod input_coalescing_tests {
             }
         }
         assert!(!momentum.active);
+    }
+
+    #[test]
+    fn client_starts_and_interrupts_momentum_from_incoming_direct_frames() {
+        use protocol::ScrollPhase;
+
+        let started = Instant::now();
+        let mut momentum = ScrollMomentum::default();
+        let began = Message::MouseScroll {
+            dx: 2.0,
+            dy: 8.0,
+            phase: ScrollPhase::Began,
+        };
+        let changed = Message::MouseScroll {
+            dx: 3.0,
+            dy: 12.0,
+            phase: ScrollPhase::Changed,
+        };
+        let ended = Message::MouseScroll {
+            dx: 0.0,
+            dy: 0.0,
+            phase: ScrollPhase::Ended,
+        };
+
+        assert!(momentum.prepare_incoming(&began, started).is_none());
+        assert!(momentum
+            .prepare_incoming(&changed, started + Duration::from_millis(11))
+            .is_none());
+        assert!(momentum.finish_incoming(&ended, started + Duration::from_millis(20)));
+        assert!(matches!(
+            momentum.next_message(),
+            Some(Message::MouseScroll {
+                phase: ScrollPhase::MomentumBegan,
+                ..
+            })
+        ));
+
+        let next_began = Message::MouseScroll {
+            dx: -1.0,
+            dy: -5.0,
+            phase: ScrollPhase::Began,
+        };
+        assert!(matches!(
+            momentum.prepare_incoming(&next_began, started + Duration::from_millis(30)),
+            Some(Message::MouseScroll {
+                phase: ScrollPhase::MomentumEnded,
+                ..
+            })
+        ));
+        assert!(!momentum.active);
+
+        let mut native_momentum = ScrollMomentum::default();
+        native_momentum.prepare_incoming(&began, started);
+        native_momentum.prepare_incoming(&changed, started + Duration::from_millis(11));
+        assert!(native_momentum.finish_incoming(&ended, started + Duration::from_millis(20)));
+        let native_began = Message::MouseScroll {
+            dx: 3.0,
+            dy: 10.0,
+            phase: ScrollPhase::MomentumBegan,
+        };
+        assert!(native_momentum
+            .prepare_incoming(&native_began, started + Duration::from_millis(21))
+            .is_none());
+        assert!(!native_momentum.active);
     }
 
     #[test]
