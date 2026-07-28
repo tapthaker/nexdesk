@@ -238,6 +238,9 @@ pub struct MacOSInjector {
     tap_location: CGEventTapLocation,
     /// Posting API used for ordinary mouse/keyboard/scroll events.
     post_mode: PostMode,
+    /// Compatibility fallback for systems where posting a mouse event alone
+    /// does not update the visible cursor.
+    warp_mouse_cursor: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -274,9 +277,16 @@ impl MacOSInjector {
         let event_source = CGEventSource::new(source_state)
             .ok_or_else(|| color_eyre::eyre::eyre!("Failed to create CGEventSource"))?;
         CGEventSource::set_local_events_suppression_interval(Some(&event_source), 0.0);
+        let warp_mouse_cursor = std::env::var("NEXDESK_MACOS_CURSOR_WARP")
+            .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
         info!(
-            "macOS injector: screen {}x{}, source_state={}, tap_location={}, post_mode={:?}",
-            screen_width, screen_height, source_state.0, tap_location.0, post_mode
+            "macOS injector: screen {}x{}, source_state={}, tap_location={}, post_mode={:?}, cursor_warp={}",
+            screen_width,
+            screen_height,
+            source_state.0,
+            tap_location.0,
+            post_mode,
+            warp_mouse_cursor
         );
 
         Ok(Self {
@@ -288,6 +298,7 @@ impl MacOSInjector {
             event_source: SendableEventSource(event_source),
             tap_location,
             post_mode,
+            warp_mouse_cursor,
         })
     }
 
@@ -607,7 +618,11 @@ impl InputInjector for MacOSInjector {
             self.post_legacy_mouse_state(x, y);
             return Ok(());
         }
-        if matches!(event_type, CGEventType::MouseMoved) {
+        // A posted MouseMoved event already carries the absolute cursor
+        // position. Warping first doubles synchronous WindowServer work and
+        // can turn contention into visible pointer lag. Keep an opt-in fallback
+        // for macOS versions or sessions that require the older behavior.
+        if self.warp_mouse_cursor && matches!(event_type, CGEventType::MouseMoved) {
             let started = Instant::now();
             let ret = unsafe { CGWarpMouseCursorPosition(CGPoint { x, y }) };
             log_core_graphics_timing("CGWarpMouseCursorPosition", started);
