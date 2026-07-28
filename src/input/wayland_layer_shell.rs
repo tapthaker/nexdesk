@@ -37,17 +37,68 @@ use crate::net::protocol::Direction;
 
 // --- Public API ---
 
+/// Physical source reported for a Wayland scroll frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LayerShellScrollSource {
+    Wheel,
+    Finger,
+    Continuous,
+    WheelTilt,
+    Unknown,
+}
+
 /// Events sent from the Wayland capture task to the server loop.
 #[derive(Debug)]
 pub enum LayerShellEvent {
     OutputTopologyChanged,
-    EdgeEnter { direction: Direction },
-    MouseMove { dx: f64, dy: f64 },
-    MouseButton { button: u32, pressed: bool },
-    MouseScroll { dx: f64, dy: f64 },
+    EdgeEnter {
+        direction: Direction,
+    },
+    MouseMove {
+        dx: f64,
+        dy: f64,
+    },
+    MouseButton {
+        button: u32,
+        pressed: bool,
+    },
+    MouseScroll {
+        dx: f64,
+        dy: f64,
+        source: LayerShellScrollSource,
+    },
     ScrollEnd,
-    KeyEvent { keycode: u32, pressed: bool },
+    KeyEvent {
+        keycode: u32,
+        pressed: bool,
+    },
     KeyModifiers,
+}
+
+#[derive(Debug, Default)]
+struct PendingScrollFrame {
+    dx: f64,
+    dy: f64,
+    source: Option<LayerShellScrollSource>,
+    stopped: bool,
+}
+
+impl PendingScrollFrame {
+    fn finish(&mut self) -> Vec<LayerShellEvent> {
+        let frame = std::mem::take(self);
+        let mut events = Vec::with_capacity(2);
+        if frame.dx != 0.0 || frame.dy != 0.0 {
+            events.push(LayerShellEvent::MouseScroll {
+                dx: frame.dx,
+                dy: frame.dy,
+                source: frame.source.unwrap_or(LayerShellScrollSource::Unknown),
+            });
+        }
+        if frame.stopped {
+            events.push(LayerShellEvent::ScrollEnd);
+        }
+        events
+    }
 }
 
 /// Commands from the server loop to the Wayland capture task.
@@ -471,6 +522,9 @@ struct WaylandState {
     // Pointer enter serial (needed for set_cursor and lock)
     pointer_serial: u32,
 
+    // Axis events in one wl_pointer frame belong to one physical scroll update.
+    pending_scroll_frame: PendingScrollFrame,
+
     // Key repeat
     repeat_rate: i32,  // keys per second (0 = no repeat)
     repeat_delay: i32, // ms before first repeat
@@ -497,6 +551,7 @@ impl WaylandState {
             grabbed: false,
             event_tx: None,
             pointer_serial: 0,
+            pending_scroll_frame: PendingScrollFrame::default(),
             repeat_rate: 25,
             repeat_delay: 600,
             held_keys: Vec::new(),
@@ -595,6 +650,7 @@ impl WaylandState {
             }
         }
         self.grabbed = false;
+        self.pending_scroll_frame = PendingScrollFrame::default();
         self.held_keys.clear();
         debug!("Layer-shell: pointer released");
     }
@@ -784,18 +840,35 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 let pressed = btn_state == WEnum::Value(wl_pointer::ButtonState::Pressed);
                 state.send_event(LayerShellEvent::MouseButton { button, pressed });
             }
-            wl_pointer::Event::Axis { axis, value, .. } if state.grabbed => {
-                let (dx, dy) = match axis {
-                    WEnum::Value(wl_pointer::Axis::HorizontalScroll) => (value, 0.0),
-                    WEnum::Value(wl_pointer::Axis::VerticalScroll) => (0.0, value),
-                    _ => (0.0, 0.0),
-                };
-                if dx != 0.0 || dy != 0.0 {
-                    state.send_event(LayerShellEvent::MouseScroll { dx, dy });
+            wl_pointer::Event::Axis { axis, value, .. } if state.grabbed => match axis {
+                WEnum::Value(wl_pointer::Axis::HorizontalScroll) => {
+                    state.pending_scroll_frame.dx += value;
                 }
+                WEnum::Value(wl_pointer::Axis::VerticalScroll) => {
+                    state.pending_scroll_frame.dy += value;
+                }
+                _ => {}
+            },
+            wl_pointer::Event::AxisSource { axis_source } if state.grabbed => {
+                state.pending_scroll_frame.source = Some(match axis_source {
+                    WEnum::Value(wl_pointer::AxisSource::Wheel) => LayerShellScrollSource::Wheel,
+                    WEnum::Value(wl_pointer::AxisSource::Finger) => LayerShellScrollSource::Finger,
+                    WEnum::Value(wl_pointer::AxisSource::Continuous) => {
+                        LayerShellScrollSource::Continuous
+                    }
+                    WEnum::Value(wl_pointer::AxisSource::WheelTilt) => {
+                        LayerShellScrollSource::WheelTilt
+                    }
+                    _ => LayerShellScrollSource::Unknown,
+                });
             }
             wl_pointer::Event::AxisStop { .. } if state.grabbed => {
-                state.send_event(LayerShellEvent::ScrollEnd);
+                state.pending_scroll_frame.stopped = true;
+            }
+            wl_pointer::Event::Frame if state.grabbed => {
+                for event in state.pending_scroll_frame.finish() {
+                    state.send_event(event);
+                }
             }
             _ => {}
         }
@@ -1115,6 +1188,34 @@ mod tests {
         assert!(!logical_output_size_changed((0, 0), (1280, 800)));
         assert!(!logical_output_size_changed((1280, 800), (1280, 800)));
         assert!(logical_output_size_changed((1280, 800), (2560, 1440)));
+    }
+
+    #[test]
+    fn scroll_frame_preserves_paired_axes_source_and_stop_order() {
+        let mut frame = PendingScrollFrame {
+            dx: -2.5,
+            dy: 4.25,
+            source: Some(LayerShellScrollSource::Finger),
+            stopped: true,
+        };
+
+        let events = frame.finish();
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                LayerShellEvent::MouseScroll {
+                    dx: -2.5,
+                    dy: 4.25,
+                    source: LayerShellScrollSource::Finger,
+                },
+                LayerShellEvent::ScrollEnd,
+            ]
+        ));
+        assert_eq!(frame.dx, 0.0);
+        assert_eq!(frame.dy, 0.0);
+        assert_eq!(frame.source, None);
+        assert!(!frame.stopped);
     }
 
     #[tokio::test]

@@ -2128,13 +2128,18 @@ async fn handle_server_connection(
                             send_message_uni(&mut sender, &msg).await.ok();
                         }
                     }
-                    LayerShellEvent::MouseScroll { dx, dy } => {
+                    LayerShellEvent::MouseScroll { dx, dy, source } => {
                         if transition.is_active() {
-                            let phase = if scroll_active {
-                                crate::net::protocol::ScrollPhase::Changed
+                            use crate::input::wayland_layer_shell::LayerShellScrollSource;
+                            let phase = if source == LayerShellScrollSource::Finger {
+                                if scroll_active {
+                                    crate::net::protocol::ScrollPhase::Changed
+                                } else {
+                                    scroll_active = true;
+                                    crate::net::protocol::ScrollPhase::Began
+                                }
                             } else {
-                                scroll_active = true;
-                                crate::net::protocol::ScrollPhase::Began
+                                crate::net::protocol::ScrollPhase::None
                             };
                             let msg = Message::MouseScroll { dx, dy, phase };
                             let mut sender = input_send.lock().await;
