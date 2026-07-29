@@ -56,6 +56,7 @@ const SCROLL_MOMENTUM_STOP_DELTA: f64 = 0.05;
 const SCROLL_MOMENTUM_INITIAL_GAIN: f64 = 14.4;
 const SCROLL_MOMENTUM_MAX_INITIAL_DELTA: f64 = 768.0;
 const SCROLL_MOMENTUM_DECAY_PER_FRAME: f64 = 0.95;
+const SCROLL_MOMENTUM_MAX_INTERRUPT_WINDOW: Duration = Duration::from_secs(3);
 const SCROLL_MOMENTUM_STALL_WARN_THRESHOLD: Duration = Duration::from_millis(22);
 const USER_ACTIVITY_INTERVAL: Duration = Duration::from_secs(20);
 const LOCAL_LOCK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -338,6 +339,43 @@ fn finger_scroll_messages(
     messages
 }
 
+#[derive(Debug, Default)]
+struct ScrollMomentumInterrupt {
+    until: Option<Instant>,
+}
+
+impl ScrollMomentumInterrupt {
+    fn arm(&mut self, now: Instant) {
+        self.until = Some(now + SCROLL_MOMENTUM_MAX_INTERRUPT_WINDOW);
+    }
+
+    fn clear(&mut self) {
+        self.until = None;
+    }
+
+    fn contact_changed(
+        &mut self,
+        previous: Option<bool>,
+        current: Option<bool>,
+        gesture: ScrollGestureState,
+        now: Instant,
+    ) -> Option<Message> {
+        if previous == Some(true) || current != Some(true) {
+            return None;
+        }
+        if gesture == ScrollGestureState::Direct {
+            self.clear();
+            return None;
+        }
+        let interrupt = self.until.take().is_some_and(|until| now <= until);
+        interrupt.then_some(Message::MouseScroll {
+            dx: 0.0,
+            dy: 0.0,
+            phase: protocol::ScrollPhase::MomentumEnded,
+        })
+    }
+}
+
 fn finish_finger_scroll(state: &mut ScrollGestureState) -> Option<Message> {
     use protocol::ScrollPhase;
 
@@ -447,10 +485,15 @@ impl ScrollMomentum {
                 interrupted
             }
             ScrollPhase::Ended => false,
-            ScrollPhase::None
-            | ScrollPhase::MomentumBegan
-            | ScrollPhase::MomentumChanged
-            | ScrollPhase::MomentumEnded => self.cancel(),
+            ScrollPhase::MomentumEnded => {
+                // The incoming frame itself closes the posted momentum stream.
+                // Do not synthesize a duplicate MomentumEnded before it.
+                self.cancel();
+                false
+            }
+            ScrollPhase::None | ScrollPhase::MomentumBegan | ScrollPhase::MomentumChanged => {
+                self.cancel()
+            }
         };
         interrupted.then_some(Message::MouseScroll {
             dx: 0.0,
@@ -1946,6 +1989,7 @@ async fn handle_server_connection(
     // Track direct-touch and compositor momentum portions of finger scrolling.
     let mut scroll_gesture = ScrollGestureState::Idle;
     let mut scroll_contact = None;
+    let mut scroll_momentum_interrupt = ScrollMomentumInterrupt::default();
     let mut layer_shell_keyboard_grabbed = false;
     let mut layer_shell_recreate_requested = false;
 
@@ -1997,6 +2041,7 @@ async fn handle_server_connection(
                         pending_layer_shell_motion = (0.0, 0.0);
                         scroll_gesture = ScrollGestureState::Idle;
                         scroll_contact = None;
+                        scroll_momentum_interrupt.clear();
                         activation_started = Some(Instant::now());
                         activation_started_unix_ms = unix_millis();
                         diagnostic_window_unix_ms = activation_started_unix_ms;
@@ -2102,9 +2147,31 @@ async fn handle_server_connection(
             // The evdev queue is finite, so waiting until a gesture starts could
             // replay stale contact transitions and misclassify momentum.
             _ = scroll_contact_poll_interval.tick(), if use_layer_shell => {
-                let mut cap = capturer.lock().unwrap();
-                match cap.poll_scroll_contact() {
-                    Ok(contact) => scroll_contact = contact,
+                let contact = {
+                    let mut cap = capturer.lock().unwrap();
+                    cap.poll_scroll_contact()
+                };
+                match contact {
+                    Ok(contact) => {
+                        let previous = scroll_contact;
+                        scroll_contact = contact;
+                        if transition.is_active() {
+                            if let Some(message) = scroll_momentum_interrupt.contact_changed(
+                                previous,
+                                contact,
+                                scroll_gesture,
+                                Instant::now(),
+                            ) {
+                                // A stationary two-finger touch produces no Wayland
+                                // axis frame, so explicitly stop destination momentum.
+                                scroll_gesture = ScrollGestureState::Idle;
+                                let mut sender = input_send.lock().await;
+                                if let Err(error) = send_message_uni(&mut sender, &message).await {
+                                    warn!("Failed to send scroll momentum interruption: {}", error);
+                                }
+                            }
+                        }
+                    }
                     Err(error) => warn!("Failed to poll touchpad contact state: {}", error),
                 }
             }
@@ -2299,6 +2366,7 @@ async fn handle_server_connection(
                         pending_layer_shell_motion = (0.0, 0.0);
                         scroll_gesture = ScrollGestureState::Idle;
                         scroll_contact = None;
+                        scroll_momentum_interrupt.clear();
                         activation_started = Some(Instant::now());
                         activation_started_unix_ms = unix_millis();
                         diagnostic_window_unix_ms = activation_started_unix_ms;
@@ -2390,9 +2458,15 @@ async fn handle_server_connection(
                         if transition.is_active() {
                             use crate::input::wayland_layer_shell::LayerShellScrollSource;
                             let messages = if source == LayerShellScrollSource::Finger {
+                                if scroll_contact == Some(true) {
+                                    // A moving direct gesture already interrupts local
+                                    // momentum through its Began/Changed phase.
+                                    scroll_momentum_interrupt.clear();
+                                }
                                 finger_scroll_messages(&mut scroll_gesture, dx, dy, scroll_contact)
                             } else {
                                 scroll_gesture = ScrollGestureState::Idle;
+                                scroll_momentum_interrupt.clear();
                                 vec![Message::MouseScroll {
                                     dx,
                                     dy,
@@ -2417,7 +2491,13 @@ async fn handle_server_connection(
                     }
                     LayerShellEvent::ScrollEnd => {
                         if transition.is_active() {
+                            let ended_direct = scroll_gesture == ScrollGestureState::Direct;
                             if let Some(message) = finish_finger_scroll(&mut scroll_gesture) {
+                                if ended_direct {
+                                    scroll_momentum_interrupt.arm(Instant::now());
+                                } else {
+                                    scroll_momentum_interrupt.clear();
+                                }
                                 let mut sender = input_send.lock().await;
                                 let diagnostics = activation_started
                                     .is_some()
@@ -2529,6 +2609,7 @@ async fn handle_server_connection(
                         pending_layer_shell_motion = (0.0, 0.0);
                         scroll_gesture = ScrollGestureState::Idle;
                         scroll_contact = None;
+                        scroll_momentum_interrupt.clear();
                         info!("Client requested switch back: {:?}", direction);
                         let messages = transition.on_switch_back();
                         if !messages.is_empty() {
@@ -4240,6 +4321,69 @@ mod input_coalescing_tests {
     }
 
     #[test]
+    fn two_finger_contact_interrupts_armed_momentum_without_motion() {
+        use protocol::ScrollPhase;
+
+        let started = Instant::now();
+        let mut interrupt = ScrollMomentumInterrupt::default();
+        assert!(interrupt
+            .contact_changed(Some(false), Some(true), ScrollGestureState::Idle, started,)
+            .is_none());
+
+        interrupt.arm(started);
+        assert!(interrupt
+            .contact_changed(
+                Some(false),
+                Some(false),
+                ScrollGestureState::Idle,
+                started + Duration::from_millis(10),
+            )
+            .is_none());
+        assert!(matches!(
+            interrupt.contact_changed(
+                Some(false),
+                Some(true),
+                ScrollGestureState::Idle,
+                started + Duration::from_millis(20),
+            ),
+            Some(Message::MouseScroll {
+                dx: 0.0,
+                dy: 0.0,
+                phase: ScrollPhase::MomentumEnded,
+            })
+        ));
+        assert!(interrupt
+            .contact_changed(
+                Some(false),
+                Some(true),
+                ScrollGestureState::Idle,
+                started + Duration::from_millis(30),
+            )
+            .is_none());
+
+        interrupt.arm(started);
+        assert!(interrupt
+            .contact_changed(
+                Some(false),
+                Some(true),
+                ScrollGestureState::Idle,
+                started + SCROLL_MOMENTUM_MAX_INTERRUPT_WINDOW + Duration::from_millis(1),
+            )
+            .is_none());
+
+        interrupt.arm(started);
+        assert!(interrupt
+            .contact_changed(
+                Some(false),
+                Some(true),
+                ScrollGestureState::Direct,
+                started + Duration::from_millis(20),
+            )
+            .is_none());
+        assert!(interrupt.until.is_none());
+    }
+
+    #[test]
     fn scroll_momentum_decays_and_finishes_with_native_phases() {
         use protocol::ScrollPhase;
 
@@ -4336,6 +4480,21 @@ mod input_coalescing_tests {
             })
         ));
         assert!(!momentum.active);
+
+        let mut touched_momentum = ScrollMomentum::default();
+        touched_momentum.prepare_incoming(&began, started);
+        touched_momentum.prepare_incoming(&changed, started + Duration::from_millis(11));
+        assert!(touched_momentum.finish_incoming(&ended, started + Duration::from_millis(20)));
+        assert!(touched_momentum.next_message().is_some());
+        let touched = Message::MouseScroll {
+            dx: 0.0,
+            dy: 0.0,
+            phase: ScrollPhase::MomentumEnded,
+        };
+        assert!(touched_momentum
+            .prepare_incoming(&touched, started + Duration::from_millis(30))
+            .is_none());
+        assert!(!touched_momentum.active);
 
         let mut native_momentum = ScrollMomentum::default();
         native_momentum.prepare_incoming(&began, started);
