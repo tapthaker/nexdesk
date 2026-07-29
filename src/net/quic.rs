@@ -53,8 +53,8 @@ const SCROLL_MOMENTUM_FRAME_INTERVAL: Duration = Duration::from_micros(11_111); 
 const SCROLL_MOMENTUM_SAMPLE_WINDOW: Duration = Duration::from_millis(50);
 const SCROLL_MOMENTUM_START_MIN_DELTA: f64 = 1.5;
 const SCROLL_MOMENTUM_STOP_DELTA: f64 = 0.05;
-const SCROLL_MOMENTUM_INITIAL_GAIN: f64 = 1.2;
-const SCROLL_MOMENTUM_MAX_INITIAL_DELTA: f64 = 64.0;
+const SCROLL_MOMENTUM_INITIAL_GAIN: f64 = 4.8;
+const SCROLL_MOMENTUM_MAX_INITIAL_DELTA: f64 = 256.0;
 const SCROLL_MOMENTUM_DECAY_PER_FRAME: f64 = 0.95;
 const SCROLL_MOMENTUM_STALL_WARN_THRESHOLD: Duration = Duration::from_millis(22);
 const USER_ACTIVITY_INTERVAL: Duration = Duration::from_secs(20);
@@ -4257,10 +4257,10 @@ mod input_coalescing_tests {
                 dy,
                 phase: ScrollPhase::MomentumBegan,
                 ..
-            } if (dy - 11.4).abs() < 0.001
+            } if (dy - 45.6).abs() < 0.001
         ));
 
-        let mut previous = 11.4;
+        let mut previous = 45.6;
         let mut total_distance = previous;
         let mut changed = 0;
         loop {
@@ -4285,7 +4285,7 @@ mod input_coalescing_tests {
             }
         }
         assert!(!momentum.active);
-        assert!((226.0..228.0).contains(&total_distance));
+        assert!((910.0..912.0).contains(&total_distance));
     }
 
     #[test]
