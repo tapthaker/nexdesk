@@ -53,8 +53,9 @@ const SCROLL_MOMENTUM_FRAME_INTERVAL: Duration = Duration::from_micros(11_111); 
 const SCROLL_MOMENTUM_SAMPLE_WINDOW: Duration = Duration::from_millis(50);
 const SCROLL_MOMENTUM_START_MIN_DELTA: f64 = 1.5;
 const SCROLL_MOMENTUM_STOP_DELTA: f64 = 0.05;
-const SCROLL_MOMENTUM_MAX_INITIAL_DELTA: f64 = 48.0;
-const SCROLL_MOMENTUM_DECAY_PER_FRAME: f64 = 0.92;
+const SCROLL_MOMENTUM_INITIAL_GAIN: f64 = 1.2;
+const SCROLL_MOMENTUM_MAX_INITIAL_DELTA: f64 = 64.0;
+const SCROLL_MOMENTUM_DECAY_PER_FRAME: f64 = 0.95;
 const SCROLL_MOMENTUM_STALL_WARN_THRESHOLD: Duration = Duration::from_millis(22);
 const USER_ACTIVITY_INTERVAL: Duration = Duration::from_secs(20);
 const LOCAL_LOCK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -404,8 +405,11 @@ impl ScrollMomentum {
         if magnitude < SCROLL_MOMENTUM_START_MIN_DELTA {
             return false;
         }
-        if magnitude > SCROLL_MOMENTUM_MAX_INITIAL_DELTA {
-            let scale = SCROLL_MOMENTUM_MAX_INITIAL_DELTA / magnitude;
+        dx *= SCROLL_MOMENTUM_INITIAL_GAIN;
+        dy *= SCROLL_MOMENTUM_INITIAL_GAIN;
+        let boosted_magnitude = dx.abs().max(dy.abs());
+        if boosted_magnitude > SCROLL_MOMENTUM_MAX_INITIAL_DELTA {
+            let scale = SCROLL_MOMENTUM_MAX_INITIAL_DELTA / boosted_magnitude;
             dx *= scale;
             dy *= scale;
         }
@@ -4253,10 +4257,11 @@ mod input_coalescing_tests {
                 dy,
                 phase: ScrollPhase::MomentumBegan,
                 ..
-            } if (dy - 9.2).abs() < 0.001
+            } if (dy - 11.4).abs() < 0.001
         ));
 
-        let mut previous = 9.2;
+        let mut previous = 11.4;
+        let mut total_distance = previous;
         let mut changed = 0;
         loop {
             let message = momentum.next_message().unwrap();
@@ -4268,6 +4273,7 @@ mod input_coalescing_tests {
                 } => {
                     assert!(dy.abs() < previous);
                     previous = dy.abs();
+                    total_distance += previous;
                     changed += 1;
                     assert!(changed < 200);
                 }
@@ -4279,6 +4285,7 @@ mod input_coalescing_tests {
             }
         }
         assert!(!momentum.active);
+        assert!((226.0..228.0).contains(&total_distance));
     }
 
     #[test]
