@@ -5862,7 +5862,7 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn held_server_key_repeats_over_the_peer_input_channel() {
+    async fn source_key_repeats_traverse_the_peer_input_channel() {
         let rig = crate::testing::ServerRig::new();
         let mut transition = ServerTransition::new(
             None,
@@ -5873,29 +5873,24 @@ mod lifecycle_tests {
         );
         transition.activate_instant(protocol::Direction::Right);
 
-        let mut key_messages = Vec::new();
-        if let ServerOutput::Forward { messages } =
-            transition.poll_active_keys(vec![Message::KeyEvent {
+        let source_events = vec![
+            Message::KeyEvent {
                 keycode: 30,
                 pressed: true,
                 modifiers: 0,
-            }])
-        {
-            key_messages.extend(messages);
-        }
-        for _ in 0..300 {
-            if let ServerOutput::Forward { messages } = transition.poll_active_keys(Vec::new()) {
-                key_messages.extend(messages);
-            }
-            if key_messages.len() >= 2 {
-                break;
-            }
-        }
-        assert_eq!(
-            key_messages.len(),
-            2,
-            "expected initial and repeat key-downs"
-        );
+            },
+            Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            },
+        ];
+        let ServerOutput::Forward {
+            messages: key_messages,
+        } = transition.poll_active_keys(source_events)
+        else {
+            panic!("active source key events should be forwarded");
+        };
 
         for _ in &key_messages {
             rig.peer
