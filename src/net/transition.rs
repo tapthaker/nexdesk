@@ -144,6 +144,13 @@ impl ServerTransition {
         }
     }
 
+    fn reset_inputs_for_activation(&mut self) {
+        // Input pressed before the handoff belongs to the local desktop. It
+        // must not become remote held state or be released on the peer.
+        self.pressed_keys.clear();
+        self.pressed_buttons.clear();
+    }
+
     pub fn release_remote_inputs(&mut self) -> Vec<Message> {
         let mut keys: Vec<u32> = self.pressed_keys.drain().collect();
         keys.sort_unstable();
@@ -173,7 +180,7 @@ impl ServerTransition {
         self.last_y = 0;
         self.edge_dwell = 0;
         self.edge_cooldown = 0;
-        self.pressed_buttons.clear();
+        self.reset_inputs_for_activation();
 
         let pw = self.peer_screen.width as i32;
         let ph = self.peer_screen.height as i32;
@@ -260,7 +267,7 @@ impl ServerTransition {
             if self.edge_cooldown == 0 {
                 self.active = true;
                 self.last_buttons = buttons;
-                self.pressed_buttons.clear();
+                self.reset_inputs_for_activation();
                 self.last_x = mx;
                 self.last_y = my;
                 self.edge_dwell = 0;
@@ -305,7 +312,7 @@ impl ServerTransition {
                 self.edge_dwell = 0;
                 self.active = true;
                 self.last_buttons = buttons;
-                self.pressed_buttons.clear();
+                self.reset_inputs_for_activation();
                 self.last_x = mx;
                 self.last_y = my;
 
@@ -1749,12 +1756,13 @@ mod tests {
     #[test]
     fn server_activate_instant_resets_state() {
         let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
-        // Simulate some accumulated state
+        // Simulate some accumulated state, including a locally pressed key.
         st.edge_dwell = 25;
         st.edge_cooldown = 50;
         st.last_x = 500;
         st.last_y = 300;
         st.last_buttons = 3;
+        st.update_key(30, true);
 
         st.activate_instant(Direction::Right);
         assert_eq!(st.edge_dwell, 0);
@@ -1762,6 +1770,29 @@ mod tests {
         assert_eq!(st.last_x, 0);
         assert_eq!(st.last_y, 0);
         assert_eq!(st.last_buttons, 0);
+        assert!(st.pressed_keys.is_empty());
+    }
+
+    #[test]
+    fn server_edge_activation_does_not_carry_local_key_state() {
+        let mut st = ServerTransition::new(Some(Direction::Right), peer_screen());
+        st.poll(
+            500,
+            500,
+            1920,
+            1080,
+            0,
+            vec![Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                modifiers: 0,
+            }],
+        );
+
+        activate_server(&mut st);
+
+        assert!(st.pressed_keys.is_empty());
+        assert!(st.on_switch_back().is_empty());
     }
 
     // ===== update_key Tests =====

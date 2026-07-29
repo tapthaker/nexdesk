@@ -1525,6 +1525,24 @@ fn poll_layer_shell_keys(capturer: &mut dyn InputCapture) -> Result<Vec<Message>
     })
 }
 
+fn begin_server_input_handoff(capturer: &mut dyn InputCapture, keyboard_only: bool) -> Result<()> {
+    if keyboard_only {
+        capturer.set_keyboard_grab(true)?;
+    } else {
+        capturer.set_grab(true)?;
+    }
+
+    if let Err(error) = capturer.discard_pending_key_events() {
+        if keyboard_only {
+            capturer.set_keyboard_grab(false).ok();
+        } else {
+            capturer.set_grab(false).ok();
+        }
+        return Err(error).wrap_err("Failed to establish keyboard handoff boundary");
+    }
+    Ok(())
+}
+
 fn validate_listen_port(port: u16) -> Result<()> {
     if port == 0 {
         return Err(eyre!(
@@ -2050,7 +2068,15 @@ async fn handle_server_connection(
                         *sender_diagnostics.lock().unwrap() = ServerSenderDiagnostics::default();
                         pointer_send_interval.reset();
                         event_loop_tick_interval.reset();
-                        capturer.lock().unwrap().set_grab(grab).ok();
+                        if grab {
+                            let result = {
+                                let mut cap = capturer.lock().unwrap();
+                                begin_server_input_handoff(&mut **cap, false)
+                            };
+                            if let Err(error) = result {
+                                warn!("Failed to prepare input handoff: {}", error);
+                            }
+                        }
                         let mut sender = input_send.lock().await;
                         for msg in messages {
                             send_message_uni(&mut sender, &msg).await.ok();
@@ -2377,12 +2403,14 @@ async fn handle_server_connection(
                         event_loop_tick_interval.reset();
                         let messages = transition.activate_instant(direction);
                         info!("Layer-shell edge enter ({:?}) — switching to remote", direction);
-                        match capturer.lock().unwrap().set_keyboard_grab(true) {
-                            Ok(()) => {
-                                layer_shell_keyboard_grabbed = true;
-                            }
-                            Err(e) => {
-                                warn!("Failed to grab keyboard devices for layer-shell capture: {}", e);
+                        let handoff = {
+                            let mut cap = capturer.lock().unwrap();
+                            begin_server_input_handoff(&mut **cap, true)
+                        };
+                        match handoff {
+                            Ok(()) => layer_shell_keyboard_grabbed = true,
+                            Err(error) => {
+                                warn!("Failed to prepare keyboard devices for layer-shell capture: {}", error);
                                 layer_shell_keyboard_grabbed = false;
                             }
                         }
@@ -4607,6 +4635,46 @@ mod input_coalescing_tests {
         assert_eq!(capture.keyboard_only_polls, 1);
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], Message::KeyEvent { keycode: 30, .. }));
+    }
+
+    #[test]
+    fn server_handoff_discards_keys_queued_before_the_grab() {
+        let mut capture = crate::testing::ScriptedCapturer::new();
+        capture.push_key_events(vec![Message::KeyEvent {
+            keycode: 30,
+            pressed: true,
+            modifiers: 0,
+        }]);
+
+        begin_server_input_handoff(&mut capture, true).unwrap();
+
+        assert_eq!(capture.remaining_key_polls(), 0);
+        assert_eq!(
+            capture.grab_history(),
+            vec![crate::testing::GrabChange::Keyboard(true)]
+        );
+    }
+
+    #[test]
+    fn failed_handoff_releases_the_local_keyboard_grab() {
+        let mut capture = crate::testing::ScriptedCapturer::new();
+        capture.fail_next(
+            crate::testing::CaptureOperation::PollKeyEvents,
+            "keyboard unavailable",
+        );
+
+        let error = begin_server_input_handoff(&mut capture, true).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Failed to establish keyboard handoff boundary"));
+        assert_eq!(
+            capture.grab_history(),
+            vec![
+                crate::testing::GrabChange::Keyboard(true),
+                crate::testing::GrabChange::Keyboard(false),
+            ]
+        );
     }
 
     #[tokio::test]

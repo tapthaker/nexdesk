@@ -12,6 +12,11 @@ use crate::input::capture::InputCapture;
 use crate::input::inject::InputInjector;
 use crate::net::protocol::{Message, MAX_KEYCODE};
 
+fn clear_keyboard_handoff_state(pressed_keys: &mut HashSet<u32>, pending: &mut Vec<Message>) {
+    pressed_keys.clear();
+    pending.clear();
+}
+
 fn record_key_event(
     pressed_keys: &mut HashSet<u32>,
     pending: &mut Vec<Message>,
@@ -23,14 +28,11 @@ fn record_key_event(
     }
 
     match value {
-        0 => {
-            pressed_keys.remove(&code);
-            pending.push(Message::KeyEvent {
-                keycode: code,
-                pressed: false,
-                modifiers: 0,
-            });
-        }
+        0 if pressed_keys.remove(&code) => pending.push(Message::KeyEvent {
+            keycode: code,
+            pressed: false,
+            modifiers: 0,
+        }),
         1 => {
             pressed_keys.insert(code);
             pending.push(Message::KeyEvent {
@@ -101,6 +103,31 @@ mod tests {
 
         assert!(pressed.is_empty());
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn cleared_handoff_state_suppresses_a_previously_held_key() {
+        let mut pressed = HashSet::from([30]);
+        let mut events = vec![Message::KeyEvent {
+            keycode: 30,
+            pressed: true,
+            modifiers: 0,
+        }];
+
+        clear_keyboard_handoff_state(&mut pressed, &mut events);
+        record_key_event(&mut pressed, &mut events, 30, 2);
+        record_key_event(&mut pressed, &mut events, 30, 0);
+        assert!(events.is_empty());
+
+        record_key_event(&mut pressed, &mut events, 30, 1);
+        assert!(matches!(
+            events.as_slice(),
+            [Message::KeyEvent {
+                keycode: 30,
+                pressed: true,
+                ..
+            }]
+        ));
     }
 
     #[test]
@@ -593,6 +620,37 @@ impl WaylandCapturer {
         }))
     }
 
+    /// Drain the keyboard queues after grabbing them so the handoff starts at
+    /// a well-defined boundary rather than replaying locally typed input.
+    fn discard_queued_keyboard_events(&mut self) -> Result<()> {
+        for keyboard in &mut self.keyboard_devices {
+            loop {
+                match keyboard.device.fetch_events() {
+                    Ok(events) => {
+                        let discarded = events.count();
+                        if discarded == 0 {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => {
+                        return Err(error).wrap_err_with(|| {
+                            format!(
+                                "Failed to discard queued keyboard events from {}",
+                                keyboard.path.display()
+                            )
+                        });
+                    }
+                }
+            }
+        }
+
+        // Keys already held at the boundary remain local. Clearing this state
+        // suppresses their repeat and release events until the next fresh press.
+        clear_keyboard_handoff_state(&mut self.pressed_keys, &mut self.pending_key_events);
+        Ok(())
+    }
+
     /// Read one currently available batch from each keyboard. Avoid looping
     /// until WouldBlock: a high-rate device can keep refilling its queue and
     /// monopolize the async connection task.
@@ -901,6 +959,10 @@ impl InputCapture for WaylandCapturer {
     fn poll_key_events_only(&mut self) -> Result<Vec<Message>> {
         self.drain_keyboard_events()?;
         Ok(std::mem::take(&mut self.pending_key_events))
+    }
+
+    fn discard_pending_key_events(&mut self) -> Result<()> {
+        self.discard_queued_keyboard_events()
     }
 
     fn poll_scroll_contact(&mut self) -> Result<Option<bool>> {

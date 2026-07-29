@@ -43,6 +43,12 @@ pub trait InputCapture: Send {
         self.poll_key_events()
     }
 
+    /// Establish a clean keyboard handoff boundary after input has been
+    /// grabbed. Events queued before the grab must not reach the remote screen.
+    fn discard_pending_key_events(&mut self) -> Result<()> {
+        self.poll_key_events_only().map(drop)
+    }
+
     /// Poll whether a touchpad currently has at least two fingers in contact.
     /// Backends that cannot observe contact state return `None`.
     fn poll_scroll_contact(&mut self) -> Result<Option<bool>> {
