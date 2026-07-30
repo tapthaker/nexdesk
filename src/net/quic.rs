@@ -1525,6 +1525,23 @@ fn poll_layer_shell_keys(capturer: &mut dyn InputCapture) -> Result<Vec<Message>
     })
 }
 
+fn poll_layer_shell_keyboard(
+    capturer: &mut dyn InputCapture,
+    transition: &mut ServerTransition,
+    forward_to_peer: bool,
+) -> Result<(bool, ServerOutput)> {
+    let key_events = poll_layer_shell_keys(capturer)?;
+    let had_events = !key_events.is_empty();
+    let output = if forward_to_peer {
+        transition.poll_active_keys(key_events)
+    } else {
+        // Keep the finite evdev queue drained while input belongs to the local
+        // desktop. Otherwise locally typed text can be replayed at activation.
+        ServerOutput::Idle
+    };
+    Ok((had_events, output))
+}
+
 fn begin_server_input_handoff(capturer: &mut dyn InputCapture, keyboard_only: bool) -> Result<()> {
     if keyboard_only {
         capturer.set_keyboard_grab(true)?;
@@ -2201,33 +2218,41 @@ async fn handle_server_connection(
                     Err(error) => warn!("Failed to poll touchpad contact state: {}", error),
                 }
             }
-            // Branch: keyboard polling for layer-shell mode. Wayland compositors
-            // can consume global shortcuts and media keys before wl_keyboard sees
-            // them, so use evdev while the remote screen is active.
-            _ = layer_shell_key_poll_interval.tick(), if use_layer_shell && layer_shell_keyboard_grabbed && transition.is_active() => {
+            // Branch: keyboard polling for layer-shell mode. Drain evdev even
+            // while sharing is idle so locally typed text cannot accumulate and
+            // replay on the peer at the next handoff. While active, evdev also
+            // preserves global shortcuts and media keys that wl_keyboard may miss.
+            _ = layer_shell_key_poll_interval.tick(), if use_layer_shell => {
                 let poll_started = Instant::now();
-                let key_events = {
+                let forward_to_peer = layer_shell_keyboard_grabbed && transition.is_active();
+                let polled = {
                     let mut cap = capturer.lock().unwrap();
-                    poll_layer_shell_keys(&mut **cap)
+                    poll_layer_shell_keyboard(
+                        &mut **cap,
+                        &mut transition,
+                        forward_to_peer,
+                    )
                 };
-                record_server_input_stage(
-                    "keyboard_only_poll",
-                    poll_started.elapsed(),
-                    &mut activation_diagnostics.keyboard_poll_latency,
-                );
-                let key_events = match key_events {
-                    Ok(events) => events,
+                if forward_to_peer {
+                    record_server_input_stage(
+                        "keyboard_only_poll",
+                        poll_started.elapsed(),
+                        &mut activation_diagnostics.keyboard_poll_latency,
+                    );
+                }
+                let (had_key_events, output) = match polled {
+                    Ok(polled) => polled,
                     Err(error) => {
                         warn!("Input key capture failed: {}", error);
                         break;
                     }
                 };
 
-                if !key_events.is_empty() {
+                if forward_to_peer && had_key_events {
                     send_user_activity(&control_send, &mut last_user_activity_sent);
                 }
 
-                match transition.poll_active_keys(key_events) {
+                match output {
                     ServerOutput::Idle => {}
                     ServerOutput::Activate { .. } => {}
                     ServerOutput::ShortcutRelease { messages } => {
@@ -4635,6 +4660,47 @@ mod input_coalescing_tests {
         assert_eq!(capture.keyboard_only_polls, 1);
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], Message::KeyEvent { keycode: 30, .. }));
+    }
+
+    #[test]
+    fn inactive_layer_shell_poll_discards_locally_typed_keys() {
+        let mut capture = crate::testing::ScriptedCapturer::new();
+        capture.push_key_events(vec![
+            Message::KeyEvent {
+                keycode: 36,
+                pressed: true,
+                modifiers: 0,
+            },
+            Message::KeyEvent {
+                keycode: 36,
+                pressed: false,
+                modifiers: 0,
+            },
+            Message::KeyEvent {
+                keycode: 31,
+                pressed: true,
+                modifiers: 0,
+            },
+            Message::KeyEvent {
+                keycode: 31,
+                pressed: false,
+                modifiers: 0,
+            },
+        ]);
+        let mut transition = ServerTransition::new(
+            None,
+            ScreenLayout {
+                width: 2560,
+                height: 1440,
+            },
+        );
+
+        let (had_events, output) =
+            poll_layer_shell_keyboard(&mut capture, &mut transition, false).unwrap();
+
+        assert!(had_events);
+        assert!(matches!(output, ServerOutput::Idle));
+        assert_eq!(capture.remaining_key_polls(), 0);
     }
 
     #[test]
